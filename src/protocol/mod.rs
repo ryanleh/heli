@@ -1,4 +1,4 @@
-use rand_core::RngCore; // TODO: Eventually go over RNGs
+use rand_core::{CryptoRng, RngCore};
 
 pub mod dl;
 pub use dl::DiscreteLog;
@@ -11,21 +11,29 @@ pub trait Aggregation {
     type Input;
     type Output;
     type Encoding;
+    type Proof;
 
-    fn setup<R: RngCore>(
+    fn setup<R: RngCore + CryptoRng>(
         num_clients: usize,
         length: usize,
         rng: &mut R,
     ) -> (Self::Params, Self::DecryptorKey, Vec<Self::ClientKey>);
 
-    fn encode<R: RngCore>(
+    fn encode<R: RngCore + CryptoRng>(
         params: &Self::Params,
         key: &Self::ClientKey,
         val: &[Self::Input],
         rng: &mut R,
-    ) -> Self::Encoding;
+    ) -> Result<(Self::Encoding, Self::Proof), ()>;
 
-    fn aggregate(encodings: Vec<Self::Encoding>) -> Self::Encoding;
+    fn aggregate(
+        params: &Self::Params,
+        encodings: Vec<Self::Encoding>,
+        proofs: Vec<Self::Proof>
+    ) -> Result<Self::Encoding, ()>;
 
-    fn decode(key: &Self::DecryptorKey, aggregate: Self::Encoding) -> Result<Vec<Self::Output>, ()>;
+    fn decode(
+        key: &Self::DecryptorKey,
+        aggregate: Self::Encoding
+    ) -> Result<Vec<Self::Output>, ()>;
 }
