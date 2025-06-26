@@ -3,15 +3,21 @@ use rand_core::{CryptoRng, RngCore};
 pub mod dl;
 pub use dl::DiscreteLog;
 
+pub mod serialization;
+pub use serialization::{FromBytes, ToBytes};
+
+#[cfg(test)]
+mod tests;
+
 // todo: Rename
 pub trait Aggregation {
-    type Params;
+    type Params: ToBytes + FromBytes;
     type DecryptorKey;
-    type ClientKey;
+    type ClientKey: ToBytes + FromBytes;
     type Input;
     type Output;
-    type Encoding;
-    type Proof;
+    type Encoding: ToBytes + FromBytes;
+    type Proof: ToBytes + FromBytes;
 
     fn setup<R: RngCore + CryptoRng>(
         num_clients: usize,
@@ -20,7 +26,6 @@ pub trait Aggregation {
     ) -> (Self::Params, Self::DecryptorKey, Vec<Self::ClientKey>);
 
     fn encode<R: RngCore + CryptoRng>(
-        params: &Self::Params,
         key: &Self::ClientKey,
         val: &[Self::Input],
         rng: &mut R,
@@ -29,11 +34,9 @@ pub trait Aggregation {
     fn aggregate(
         params: &Self::Params,
         encodings: Vec<Self::Encoding>,
-        proofs: Vec<Self::Proof>
+        proofs: Vec<Self::Proof>,
     ) -> Result<Self::Encoding, ()>;
 
-    fn decode(
-        key: &Self::DecryptorKey,
-        aggregate: Self::Encoding
-    ) -> Result<Vec<Self::Output>, ()>;
+    fn decode(key: &Self::DecryptorKey, aggregate: Self::Encoding)
+    -> Result<Vec<Self::Output>, ()>;
 }
