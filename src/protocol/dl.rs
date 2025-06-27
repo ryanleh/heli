@@ -1,4 +1,6 @@
 use super::{Aggregation, serialization::*};
+
+use anyhow::{Result, anyhow};
 use ff::Field;
 use group::{Group, GroupEncoding};
 use rand_core::{CryptoRng, RngCore};
@@ -142,7 +144,7 @@ impl<G: Group + GroupEncoding> Aggregation for DiscreteLog<G> {
         key: &Self::ClientKey,
         val: &[Self::Input],
         rng: &mut R,
-    ) -> Result<(Self::Encoding, Self::Proof), ()> {
+    ) -> Result<(Self::Encoding, Self::Proof)> {
         assert_eq!(key.pks.len() - 1, val.len());
         let g = G::generator();
 
@@ -165,7 +167,7 @@ impl<G: Group + GroupEncoding> Aggregation for DiscreteLog<G> {
             false => ProtocolWitness::Or(1, vec![ProtocolWitness::Simple(vec![r, key.secret])]),
         };
         let nizk = NISigmaProtocol::<_, ShakeCodec<G>>::new(b"dl_agg_enc", relation);
-        let proof = nizk.prove_batchable(&witness, rng).unwrap(); // TODO
+        let proof = nizk.prove_batchable(&witness, rng)?;
         Ok((encoding, proof))
     }
 
@@ -173,7 +175,7 @@ impl<G: Group + GroupEncoding> Aggregation for DiscreteLog<G> {
         params: &Self::Params,
         encodings: Vec<Self::Encoding>,
         proofs: Vec<Self::Proof>,
-    ) -> Result<Self::Encoding, ()> {
+    ) -> Result<Self::Encoding> {
         let one = G::identity();
         let mut agg = Encoding {
             rand: one,
@@ -186,7 +188,7 @@ impl<G: Group + GroupEncoding> Aggregation for DiscreteLog<G> {
             let ck = params.client_key_comms[i];
             let relation = Self::create_relation(params.g, params.h, &params.pks, ck, &enc);
             let nizk = NISigmaProtocol::<_, ShakeCodec<G>>::new(b"dl_agg_enc", relation);
-            nizk.verify_batchable(&proof).unwrap(); // todo
+            nizk.verify_batchable(&proof)?;
 
             // Aggregate
             agg.rand += enc.rand;
@@ -199,7 +201,7 @@ impl<G: Group + GroupEncoding> Aggregation for DiscreteLog<G> {
     fn decode(
         key: &Self::DecryptorKey,
         aggregate: Self::Encoding,
-    ) -> Result<Vec<Self::Output>, ()> {
+    ) -> Result<Vec<Self::Output>> {
         let g = G::generator();
         let c_lifted_share = aggregate.secret - aggregate.rand * key.0[0];
         if c_lifted_share == g * key.1 {
@@ -210,7 +212,7 @@ impl<G: Group + GroupEncoding> Aggregation for DiscreteLog<G> {
                 .map(|(i, x)| x - aggregate.rand * key.0[i + 1])
                 .collect::<Vec<_>>())
         } else {
-            Err(())
+            Err(anyhow!("Verification failure"))
         }
     }
 }
@@ -227,7 +229,7 @@ impl<G: Group + GroupEncoding> ToBytes for Params<G> {
 }
 
 impl<G: Group + GroupEncoding> FromBytes for Params<G> {
-    fn from_bytes(bytes: &[u8]) -> Result<Self, ()> {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let elem_len = element_len::<G>();
 
         let (buf, rest) = bytes.split_at(elem_len);
@@ -268,7 +270,7 @@ impl<G: Group + GroupEncoding> ToBytes for ClientKey<G> {
 }
 
 impl<G: Group + GroupEncoding> FromBytes for ClientKey<G> {
-    fn from_bytes(bytes: &[u8]) -> Result<Self, ()> {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let elem_len = element_len::<G>();
 
         let (buf, rest) = bytes.split_at(elem_len);
@@ -300,7 +302,7 @@ impl<G: Group + GroupEncoding> ToBytes for Encoding<G> {
 }
 
 impl<G: Group + GroupEncoding> FromBytes for Encoding<G> {
-    fn from_bytes(bytes: &[u8]) -> Result<Self, ()> {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let elem_len = element_len::<G>();
 
         let (buf, rest) = bytes.split_at(elem_len);
