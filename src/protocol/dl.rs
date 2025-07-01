@@ -1,7 +1,7 @@
 use super::{Aggregation, serialization::*};
 
 use anyhow::{Result, anyhow};
-use ff::Field;
+use ff::{Field, PrimeField};
 use group::{Group, GroupEncoding};
 use rand_core::{CryptoRng, RngCore};
 use sigma_rs::{
@@ -37,6 +37,9 @@ pub struct Encoding<G: Group + GroupEncoding> {
     secret: G,
     vals: Vec<G>,
 }
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PartialOutput<G: Group + GroupEncoding>(Vec<G>);
 
 impl<G: Group + GroupEncoding> DiscreteLog<G> {
     /// Prove that the encoding is well-formed with inputs either 0 or 1.
@@ -94,15 +97,14 @@ impl<G: Group + GroupEncoding> DiscreteLog<G> {
     }
 }
 
-// todo: Eventually abstract out the encryption scheme
+// TODO: Consider abstracting out the encryption scheme
 impl<G: Group + GroupEncoding> Aggregation for DiscreteLog<G> {
     type Params = Params<G>;
     type DecryptorKey = (Vec<G::Scalar>, G::Scalar);
     type ClientKey = ClientKey<G>;
-    type Input = G::Scalar;
-    type Output = G; // protocol outputs `g^X` where X is the aggregated sum. 
     type Encoding = Encoding<G>;
     type Proof = Vec<u8>;
+    type PartialOutput = PartialOutput<G>;
 
     fn setup<R: RngCore + CryptoRng>(
         num_clients: usize,
@@ -110,7 +112,7 @@ impl<G: Group + GroupEncoding> Aggregation for DiscreteLog<G> {
         rng: &mut R,
     ) -> (Self::Params, Self::DecryptorKey, Vec<Self::ClientKey>) {
         let g = G::generator();
-        let h = G::random(&mut *rng); // todo: generate correctly
+        let h = G::random(&mut *rng); // TODO: generate correctly
         let secret_keys: Vec<_> = (0..=length).map(|_| G::Scalar::random(&mut *rng)).collect();
         let pks: Vec<_> = secret_keys.iter().map(|ski| g * ski).collect();
 
@@ -142,9 +144,14 @@ impl<G: Group + GroupEncoding> Aggregation for DiscreteLog<G> {
 
     fn encode<R: RngCore + CryptoRng>(
         key: &Self::ClientKey,
-        val: &[Self::Input],
+        val: &[u32],
         rng: &mut R,
     ) -> Result<(Self::Encoding, Self::Proof)> {
+        assert!(
+            val.iter().all(|v| *v == 0 || *v == 1),
+            "Only support inputs of 0 or 1"
+        );
+        assert!(val.len() == 1, "TODO: support multiple inputs");
         assert_eq!(key.pks.len() - 1, val.len());
         let g = G::generator();
 
@@ -156,13 +163,13 @@ impl<G: Group + GroupEncoding> Aggregation for DiscreteLog<G> {
             vals: val
                 .iter()
                 .enumerate()
-                .map(|(i, v)| key.pks[i + 1] * r + g * v)
+                .map(|(i, v)| key.pks[i + 1] * r + g * G::Scalar::from(*v as u64))
                 .collect::<Vec<_>>(),
         };
 
         // Prove ciphertext is well-formed
         let relation = Self::create_relation(key.g, key.h, &key.pks, key.h * key.secret, &encoding);
-        let witness = match val[0] == G::Scalar::ZERO {
+        let witness = match val[0] == 0 {
             true => ProtocolWitness::Or(0, vec![ProtocolWitness::Simple(vec![r, key.secret])]),
             false => ProtocolWitness::Or(1, vec![ProtocolWitness::Simple(vec![r, key.secret])]),
         };
@@ -171,10 +178,41 @@ impl<G: Group + GroupEncoding> Aggregation for DiscreteLog<G> {
         Ok((encoding, proof))
     }
 
-    fn aggregate(
+    fn verify_encodings(
         params: &Self::Params,
-        encodings: Vec<Self::Encoding>,
-        proofs: Vec<Self::Proof>,
+        client_indices: Option<&[u32]>,
+        encodings: &[Self::Encoding],
+        proofs: &[Self::Proof],
+    ) -> Result<()> {
+        assert!(encodings.len() == proofs.len());
+        match client_indices {
+            Some(indices) => {
+                // TODO: Batch verification
+                assert!(indices.len() == encodings.len());
+                for ((encoding, proof), &client_index) in encodings.iter().zip(proofs.iter()).zip(indices.iter()) {
+                    let ck = params.client_key_comms[client_index as usize];
+                    let relation = Self::create_relation(params.g, params.h, &params.pks, ck, encoding);
+                    let nizk = NISigmaProtocol::<_, ShakeCodec<G>>::new(b"dl_agg_enc", relation);
+                    nizk.verify_batchable(proof).map_err(|e| anyhow!("Proof verification failed: {}", e))?;
+                }
+            }
+            None => {
+                // If `client_indices` is `None`, we assume that the encodings are in the same order
+                // as the client keys
+                for (i, (encoding, proof)) in encodings.iter().zip(proofs.iter()).enumerate() {
+                    let ck = params.client_key_comms[i];
+                    let relation = Self::create_relation(params.g, params.h, &params.pks, ck, encoding);
+                    let nizk = NISigmaProtocol::<_, ShakeCodec<G>>::new(b"dl_agg_enc", relation);
+                    nizk.verify_batchable(proof).map_err(|e| anyhow!("Proof verification failed: {}", e))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn aggregate(
+        _params: &Self::Params,
+        encodings: &[Self::Encoding],
     ) -> Result<Self::Encoding> {
         let one = G::identity();
         let mut agg = Encoding {
@@ -183,42 +221,67 @@ impl<G: Group + GroupEncoding> Aggregation for DiscreteLog<G> {
             vals: vec![one; encodings[0].vals.len()],
         };
 
-        for (i, (enc, proof)) in encodings.into_iter().zip(proofs).enumerate() {
-            // Verify proofs (todo: batch verify)
-            let ck = params.client_key_comms[i];
-            let relation = Self::create_relation(params.g, params.h, &params.pks, ck, &enc);
-            let nizk = NISigmaProtocol::<_, ShakeCodec<G>>::new(b"dl_agg_enc", relation);
-            nizk.verify_batchable(&proof)?;
-
-            // Aggregate
+        for enc in encodings {
             agg.rand += enc.rand;
             agg.secret += enc.secret;
-            agg.vals.iter_mut().zip(enc.vals).for_each(|(a, e)| *a += e);
+            agg.vals.iter_mut().zip(enc.vals.iter()).for_each(|(a, e)| *a += e);
         }
         Ok(agg)
     }
 
-    fn decode(
-        key: &Self::DecryptorKey,
-        aggregate: Self::Encoding,
-    ) -> Result<Vec<Self::Output>> {
+    fn decode(key: &Self::DecryptorKey, aggregate: Self::Encoding) -> Result<Self::PartialOutput> {
         let g = G::generator();
         let c_lifted_share = aggregate.secret - aggregate.rand * key.0[0];
         if c_lifted_share == g * key.1 {
-            Ok(aggregate
-                .vals
-                .into_iter()
-                .enumerate()
-                .map(|(i, x)| x - aggregate.rand * key.0[i + 1])
-                .collect::<Vec<_>>())
+            Ok(PartialOutput(
+                aggregate
+                    .vals
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, x)| x - aggregate.rand * key.0[i + 1])
+                    .collect::<Vec<_>>(),
+            ))
         } else {
             Err(anyhow!("Verification failure"))
         }
     }
+
+    fn post_process(
+        params: &Self::Params,
+        partial_outputs: Self::PartialOutput,
+    ) -> Result<Vec<u32>> {
+        let g = G::generator();
+        let mut results = Vec::with_capacity(partial_outputs.0.len());
+
+        for output in partial_outputs.0 {
+            // Bruteforce discrete log
+            // TODO: use a more efficient method
+            let mut guess = G::Scalar::ZERO;
+            for _ in 0..=Self::num_clients(params) {
+                if g * guess == output {
+                    results.push(u32::from_le_bytes(
+                        guess.to_repr().as_ref()[0..4].try_into().unwrap(),
+                    ));
+                    break;
+                }
+                guess += G::Scalar::ONE;
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn num_clients(params: &Self::Params) -> usize {
+        params.client_key_comms.len()
+    }
+
+    fn length(params: &Self::Params) -> usize {
+        params.pks.len() - 1
+    }
 }
 
 impl<G: Group + GroupEncoding> ToBytes for Params<G> {
-    fn to_bytes(self) -> Vec<u8> {
+    fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         serialize_element(&mut out, self.g);
         serialize_element(&mut out, self.h);
@@ -259,7 +322,7 @@ impl<G: Group + GroupEncoding> FromBytes for Params<G> {
 }
 
 impl<G: Group + GroupEncoding> ToBytes for ClientKey<G> {
-    fn to_bytes(self) -> Vec<u8> {
+    fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         serialize_element(&mut out, self.g);
         serialize_element(&mut out, self.h);
@@ -292,7 +355,7 @@ impl<G: Group + GroupEncoding> FromBytes for ClientKey<G> {
 }
 
 impl<G: Group + GroupEncoding> ToBytes for Encoding<G> {
-    fn to_bytes(self) -> Vec<u8> {
+    fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         serialize_element(&mut out, self.rand);
         serialize_element(&mut out, self.secret);
@@ -319,12 +382,27 @@ impl<G: Group + GroupEncoding> FromBytes for Encoding<G> {
     }
 }
 
+impl<G: Group + GroupEncoding> ToBytes for PartialOutput<G> {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        serialize_elements(&mut out, &self.0);
+        out
+    }
+}
+
+impl<G: Group + GroupEncoding> FromBytes for PartialOutput<G> {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let (buf, rest) = bytes.split_at(4);
+        let vals_len = deserialize_len(buf);
+        Ok(PartialOutput(deserialize_elements(rest, vals_len)?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use curve25519_dalek::RistrettoPoint;
-    use group::Group;
     use rand::rngs::OsRng;
 
     type G = RistrettoPoint;
@@ -336,27 +414,35 @@ mod tests {
         let length = 1;
         let (params, sk, cks) = Agg::setup(num_clients, length, &mut OsRng);
 
-        let params_bytes = params.clone().to_bytes();
+        let params_bytes = params.to_bytes();
         let new_params = <Agg as Aggregation>::Params::from_bytes(&params_bytes).unwrap();
         assert_eq!(params, new_params);
 
-        let ck_bytes = cks[0].clone().to_bytes();
+        let ck_bytes = cks[0].to_bytes();
         let new_ck = <Agg as Aggregation>::ClientKey::from_bytes(&ck_bytes).unwrap();
         assert_eq!(cks[0], new_ck);
 
-        let (encoding, proof) =
-            Agg::encode(&cks[0], &[<G as Group>::Scalar::ONE], &mut OsRng).unwrap();
+        let (encoding, proof) = Agg::encode(&cks[0], &[1], &mut OsRng).unwrap();
 
-        let enc_bytes = encoding.clone().to_bytes();
+        let enc_bytes = encoding.to_bytes();
         let new_enc = <Agg as Aggregation>::Encoding::from_bytes(&enc_bytes).unwrap();
         assert_eq!(encoding, new_enc);
 
-        let proof_bytes = proof.clone().to_bytes();
+        let proof_bytes = proof.to_bytes();
         let new_proof = <Agg as Aggregation>::Proof::from_bytes(&proof_bytes).unwrap();
         assert_eq!(proof, new_proof);
 
-        let agg = Agg::aggregate(&params, vec![encoding], vec![proof]).unwrap();
-        let results = Agg::decode(&sk, agg).unwrap();
-        assert_eq!(results[0], G::generator());
+        let enc = &[encoding];
+        Agg::verify_encodings(&params, None, enc, &[proof]).unwrap();
+        let agg = Agg::aggregate(&params, enc).unwrap();
+        let partial_results = Agg::decode(&sk, agg).unwrap();
+
+        let partial_result_bytes = partial_results.to_bytes();
+        let new_partial_results =
+            <Agg as Aggregation>::PartialOutput::from_bytes(&partial_result_bytes).unwrap();
+        assert_eq!(partial_results, new_partial_results);
+
+        let results = Agg::post_process(&params, partial_results).unwrap();
+        assert_eq!(results[0], 1);
     }
 }

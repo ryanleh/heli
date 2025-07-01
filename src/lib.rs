@@ -8,4 +8,5 @@
 #![deny(unused_comparisons, bare_trait_objects, unused_must_use)]
 #![forbid(unsafe_code)]
 
+pub mod net;
 pub mod protocol;

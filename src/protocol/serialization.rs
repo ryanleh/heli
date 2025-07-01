@@ -1,10 +1,10 @@
 // TODO: Credit library
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use ff::PrimeField;
 use group::{Group, GroupEncoding};
 
 pub trait ToBytes {
-    fn to_bytes(self) -> Vec<u8>;
+    fn to_bytes(&self) -> Vec<u8>;
 }
 
 pub trait FromBytes: Sized {
@@ -12,8 +12,8 @@ pub trait FromBytes: Sized {
 }
 
 impl ToBytes for Vec<u8> {
-    fn to_bytes(self) -> Vec<u8> {
-        self
+    fn to_bytes(&self) -> Vec<u8> {
+        self.clone()
     }
 }
 
@@ -84,4 +84,24 @@ pub(super) fn deserialize_elements<G: Group + GroupEncoding>(
         out.push(elem.ok_or(anyhow!("Deserialization error"))?);
     }
     Ok(out)
+}
+
+pub(crate) mod serde_derive {
+    use super::{FromBytes, ToBytes};
+    use serde::{Deserializer, Serializer};
+
+    pub(crate) fn serialize<T: ToBytes, S: Serializer>(
+        value: &T,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let bytes = value.to_bytes();
+        serializer.serialize_bytes(&bytes)
+    }
+
+    pub(crate) fn deserialize<'de, T: FromBytes, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<T, D::Error> {
+        let bytes: &[u8] = serde::Deserialize::deserialize(deserializer)?;
+        T::from_bytes(bytes).map_err(serde::de::Error::custom)
+    }
 }

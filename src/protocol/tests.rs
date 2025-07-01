@@ -9,6 +9,7 @@ type Agg = DiscreteLog<G>;
 
 #[test]
 fn basic_aggregation() {
+    //let num_clients = 1000;
     let num_clients = 1000;
     let length = 1;
     let (params, sk, cks) = Agg::setup(num_clients, length, &mut OsRng);
@@ -22,30 +23,20 @@ fn basic_aggregation() {
         for j in 0..length {
             let val = OsRng.gen_bool(0.5);
             sums[j] += val as u32;
-            inputs.push(match val {
-                true => Scalar::ONE,
-                false => Scalar::ZERO,
-            });
+            inputs.push(val as u32);
         }
         let (encoding, proof) = Agg::encode(&cks[i], &inputs, &mut OsRng).unwrap();
         encodings.push(encoding);
         proofs.push(proof);
     }
 
-    // Aggregate and decode
-    let agg = Agg::aggregate(&params, encodings, proofs).unwrap();
-    let results = Agg::decode(&sk, agg).unwrap();
+    // Check proofs and combine encodings
+    Agg::verify_encodings(&params, None, &encodings, &proofs).unwrap();
+    let agg = Agg::aggregate(&params, &encodings).unwrap();
+    let partial_results = Agg::decode(&sk, agg).unwrap();
+    let results = Agg::post_process(&params, partial_results).unwrap();
 
-    // Solve discrete-log for each result
-    let g = G::generator();
     for (i, result) in results.into_iter().enumerate() {
-        let mut guess = Scalar::ZERO;
-        for _ in 0..num_clients {
-            if guess * g == result {
-                break;
-            }
-            guess += Scalar::ONE;
-        }
-        assert_eq!(guess, Scalar::from(sums[i]));
+        assert_eq!(result, sums[i]);
     }
 }
