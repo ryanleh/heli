@@ -30,7 +30,6 @@ criterion = { version = "0.5", features = ["html_reports"] }
 opt-level = 3
 lto = "thin"
 incremental = true
-debug = true
 
 [profile.test]
 opt-level = 3

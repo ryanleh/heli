@@ -32,17 +32,17 @@ impl Default for TestConfig {
     }
 }
 
-async fn run_protocol(config: TestConfig) -> Result<()> {
-    // Initialize tracing for tests
-    tracing_subscriber::fmt()
+fn init_tracing() {
+    // Use stdout, so output suppressed by default
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stdout)
         .with_max_level(Level::DEBUG)
-        .try_init()
-        .ok();
+        .with_test_writer()
+        .try_init();
+}
 
-    info!(
-        "Starting protocol test with {} clients, length {}",
-        config.num_clients, config.length
-    );
+async fn run_protocol(config: TestConfig) -> Result<()> {
+    init_tracing();
 
     // Start the decryptor
     let decryptor = Decryptor::<Agg>::new(
@@ -70,7 +70,6 @@ async fn run_protocol(config: TestConfig) -> Result<()> {
 
     // Give the servers time to start up
     sleep(Duration::from_millis(100)).await;
-    info!("Servers started");
 
     let mut clients = Vec::new();
     let mut expected_sums = vec![0u32; config.length];
@@ -120,18 +119,13 @@ async fn test_protocol() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_race_condition_error_handling() -> Result<()> {
-    // Initialize tracing for tests
-    tracing_subscriber::fmt()
-        .with_max_level(Level::DEBUG)
-        .try_init()
-        .ok();
+async fn test_aggregator_waits_for_params() -> Result<()> {
+    init_tracing();
 
     // Make sure ports are different from above test
     let mut config = TestConfig::default();
     config.decryptor_addr = "127.0.0.1:8098".to_string();
     config.aggregator_addr = "127.0.0.1:8099".to_string();
-    info!("Testing race condition error handling");
 
     // Start the aggregator first (without decryptor)
     let (sender, _receiver) = tokio::sync::mpsc::channel(1);
@@ -160,10 +154,6 @@ async fn test_race_condition_error_handling() -> Result<()> {
         "Expected error when sending encoding before parameters"
     );
 
-    info!("Race condition test completed - error properly handled");
-
-    // Clean up
     aggregator_handle.abort();
-
     Ok(())
 }

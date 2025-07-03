@@ -41,7 +41,7 @@ pub enum Message<A: Aggregation> {
     Success(),
 }
 
-/// Read a framed message from a TCP stream
+/// Reads a framed message from a TCP stream.
 /// Format: [4-byte length][message data]
 pub async fn read_message<A: Aggregation>(socket: &mut TcpStream) -> Result<Message<A>> {
     // Read message length (4 bytes, big-endian)
@@ -58,7 +58,7 @@ pub async fn read_message<A: Aggregation>(socket: &mut TcpStream) -> Result<Mess
     Ok(message)
 }
 
-/// Write a framed message to a TCP stream
+/// Writes a framed message to a TCP stream.
 /// Format: [4-byte length][message data]
 pub async fn write_message<A: Aggregation>(
     socket: &mut TcpStream,
@@ -78,7 +78,7 @@ pub async fn write_message<A: Aggregation>(
     Ok(())
 }
 
-/// Send a message and wait for a response, handling errors
+/// Sends a message and waits for a response, handling errors.
 pub async fn make_request<A: Aggregation>(
     socket: &mut TcpStream,
     message: &Message<A>,
@@ -100,7 +100,7 @@ pub async fn make_request<A: Aggregation>(
     }
 }
 
-/// Send an error message to a client
+/// Sends an error message to a client.
 pub async fn send_error_message<A: Aggregation>(socket: &mut TcpStream, msg: &str) -> Result<()> {
     let error_message = Message::<A>::Error(msg.to_string());
     write_message(socket, &error_message).await?;

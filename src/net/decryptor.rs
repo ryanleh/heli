@@ -27,9 +27,7 @@ struct DecryptorState<A: Aggregation> {
 
 impl<A: Aggregation> Decryptor<A> {
     pub fn new(addr: &str, aggregator_addr: &str, num_clients: usize, length: usize) -> Self {
-        // Setup aggregation
         let (params, key, client_keys) = A::setup(num_clients, length, &mut OsRng);
-
         let state = DecryptorState {
             aggregator_addr: aggregator_addr.to_string(),
             params: Mutex::new(Some(params)),
@@ -73,7 +71,6 @@ impl<A: Aggregation> Decryptor<A> {
             }
         };
 
-        // Handle request
         let response = match message {
             Message::<A>::RegisterRequest {} => Self::handle_register_request(state).await,
             Message::<A>::AggregationResponse { aggregate } => {
@@ -94,6 +91,7 @@ impl<A: Aggregation> Decryptor<A> {
         }
     }
 
+    /// Register a client
     async fn handle_register_request(state: Arc<DecryptorState<A>>) -> Result<Message<A>> {
         let mut client_guard = state.registered_clients.lock().await;
         let key = client_guard
@@ -105,8 +103,7 @@ impl<A: Aggregation> Decryptor<A> {
         *id_guard -= 1;
 
         if *id_guard == 0 {
-            let mut params_lock = state.params.lock().await;
-            let params = params_lock.take().unwrap();
+            let params = state.params.lock().await.take().unwrap();
 
             // Send initialization information to the aggregator
             let mut agg_conn = TcpStream::connect(&state.aggregator_addr).await?;
@@ -118,11 +115,11 @@ impl<A: Aggregation> Decryptor<A> {
             }
         }
 
-        // Give id and key to client
         debug!("Client {} registered", id);
         Ok(Message::<A>::RegisterResponse { id, key })
     }
 
+    /// Decode the aggregate result and send to aggregator for post-processing
     async fn handle_aggregation_response(
         socket: &mut TcpStream,
         state: Arc<DecryptorState<A>>,

@@ -5,14 +5,12 @@ use crate::{
 
 use anyhow::{Result, anyhow};
 use std::collections::HashSet;
-use std::{any, sync::Arc};
+use std::sync::Arc;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Mutex, OnceCell, mpsc},
 };
 use tracing::{debug, error, info};
-
-const BATCH_SIZE: usize = 1024;
 
 pub struct Aggregator<A: Aggregation> {
     addr: String,

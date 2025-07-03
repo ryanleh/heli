@@ -1,5 +1,5 @@
 use crate::{
-    net::messages::{Message, make_request, read_message, write_message},
+    net::messages::{Message, make_request},
     protocol::Aggregation,
 };
 use anyhow::{Result, anyhow};
@@ -7,6 +7,7 @@ use rand_core::OsRng;
 use tokio::net::TcpStream;
 use tracing::{debug, error, info};
 
+/// Client for registering and sending encodings.
 pub struct Client<A: Aggregation> {
     decryptor_addr: String,
     aggregator_addr: String,
@@ -25,11 +26,10 @@ impl<A: Aggregation> Client<A> {
         }
     }
 
+    /// Register the client with the decryptor.
     pub async fn register(&mut self) -> Result<()> {
         debug!("Registering with decryptor");
         let mut socket = TcpStream::connect(&self.decryptor_addr).await?;
-
-        // Register with decryptor
         let registration = Message::<A>::RegisterRequest {};
         let response = make_request::<A>(&mut socket, &registration)
             .await
@@ -46,6 +46,7 @@ impl<A: Aggregation> Client<A> {
         Ok(())
     }
 
+    /// Sends an encoding and proof to the aggregator.
     pub async fn send_encoding(&self, input: &[u32]) -> Result<()> {
         let id = self.id.unwrap();
         let key = self.key.as_ref().unwrap();
