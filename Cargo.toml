@@ -24,7 +24,7 @@ sha3 = "0.10"
 
 [dev-dependencies]
 rand = "0.8.5"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = "0.6"
 
 [profile.release]
 opt-level = 3
@@ -36,6 +36,10 @@ opt-level = 3
 debug-assertions = true
 incremental = true
 debug = true
+
+[[bench]]
+name = "aggregation"
+harness = false
 
 [[bin]]
 name = "decryptor"
