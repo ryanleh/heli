@@ -59,7 +59,8 @@ async fn run_protocol(config: TestConfig) -> Result<()> {
 
     // Start the aggregator first (without decryptor)
     let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-    let aggregator = Aggregator::<Agg>::new(&config.aggregator_addr, &config.decryptor_addr, sender);
+    let aggregator =
+        Aggregator::<Agg>::new(&config.aggregator_addr, &config.decryptor_addr, sender);
 
     let aggregator_handle = tokio::spawn(async move {
         if let Err(e) = aggregator.run().await {
@@ -134,7 +135,8 @@ async fn test_race_condition_error_handling() -> Result<()> {
 
     // Start the aggregator first (without decryptor)
     let (sender, _receiver) = tokio::sync::mpsc::channel(1);
-    let aggregator = Aggregator::<Agg>::new(&config.aggregator_addr, &config.decryptor_addr, sender);
+    let aggregator =
+        Aggregator::<Agg>::new(&config.aggregator_addr, &config.decryptor_addr, sender);
     let aggregator_handle = tokio::spawn(async move {
         if let Err(e) = aggregator.run().await {
             panic!("Aggregator error: {}", e);
@@ -146,19 +148,22 @@ async fn test_race_condition_error_handling() -> Result<()> {
 
     // Try to send an encoding before the aggregator has parameters
     let mut client = Client::<Agg>::new(&config.decryptor_addr, &config.aggregator_addr);
-    
+
     // Manually set client ID and key (simulating registration)
     client.id = Some(1);
     client.key = Some(DiscreteLog::<G>::setup(1, 1, &mut OsRng).2[0].clone());
-    
+
     // This should fail with an error message
     let result = client.send_encoding(&[1]).await;
-    assert!(result.is_err(), "Expected error when sending encoding before parameters");
-    
+    assert!(
+        result.is_err(),
+        "Expected error when sending encoding before parameters"
+    );
+
     info!("Race condition test completed - error properly handled");
-    
+
     // Clean up
     aggregator_handle.abort();
-    
+
     Ok(())
 }

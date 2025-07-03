@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
     // Send encoding to aggregator with retry logic
     let start_time = std::time::Instant::now();
     let timeout_duration = std::time::Duration::from_secs(10);
-    
+
     loop {
         match client.send_encoding(&inputs).await {
             Ok(()) => {

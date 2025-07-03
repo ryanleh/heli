@@ -1,16 +1,16 @@
 use crate::{
-    net::messages::{make_request, read_message, send_error_message, write_message, Message},
+    net::messages::{Message, make_request, read_message, send_error_message, write_message},
     protocol::*,
 };
 
 use anyhow::{Result, anyhow};
+use std::collections::HashSet;
 use std::{any, sync::Arc};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{OnceCell, mpsc, Mutex},
+    sync::{Mutex, OnceCell, mpsc},
 };
 use tracing::{debug, error, info};
-use std::collections::HashSet;
 
 const BATCH_SIZE: usize = 1024;
 
@@ -65,7 +65,9 @@ impl<A: Aggregation> Aggregator<A> {
         let message = match read_message::<A>(&mut socket).await {
             Ok(msg) => msg,
             Err(e) => {
-                let _ = send_error_message::<A>(&mut socket, &format!("Failed to read message: {}", e)).await;
+                let _ =
+                    send_error_message::<A>(&mut socket, &format!("Failed to read message: {}", e))
+                        .await;
                 return;
             }
         };
@@ -75,19 +77,22 @@ impl<A: Aggregation> Aggregator<A> {
             Message::<A>::AggregationRequest { params } => {
                 Self::handle_aggregation_request(state, params).await
             }
-            Message::<A>::ClientEncoding { id, encoding, proof, } => {
-                Self::handle_client_encoding(state, id, encoding, proof).await
-            }
+            Message::<A>::ClientEncoding {
+                id,
+                encoding,
+                proof,
+            } => Self::handle_client_encoding(state, id, encoding, proof).await,
             _ => Err(anyhow!("Invalid message type")),
         };
 
         // Inform caller of success or error
         match result {
             Ok(()) => {
-                let _ = write_message(&mut socket, &Message::<A>::Success{}).await;
+                let _ = write_message(&mut socket, &Message::<A>::Success {}).await;
             }
             Err(e) => {
-                let _ = send_error_message::<A>(&mut socket, &format!("Request failed: {}", e)).await;
+                let _ =
+                    send_error_message::<A>(&mut socket, &format!("Request failed: {}", e)).await;
             }
         }
     }
@@ -132,14 +137,15 @@ impl<A: Aggregation> Aggregator<A> {
             if encodings.len() == A::num_clients(state.params.get().unwrap()) {
                 // Sort encodings and proofs by client ID
                 encodings.sort_by_key(|(id, _, _)| *id);
-                let (encodings, proofs): (Vec<A::Encoding>, Vec<A::Proof>) = encodings.drain(..).map(|(_, e, p)| (e, p)).unzip();
+                let (encodings, proofs): (Vec<A::Encoding>, Vec<A::Proof>) =
+                    encodings.drain(..).map(|(_, e, p)| (e, p)).unzip();
 
                 // Verify encodings
                 let params = state.params.get().unwrap();
                 if let Err(e) = A::verify_encodings(params, None, &encodings, &proofs) {
                     // TODO: Actually do something here
                     error!("Failed to verify encodings: {}", e);
-                    return Ok(())
+                    return Ok(());
                 }
 
                 let aggregate = match A::aggregate(params, &encodings) {
@@ -152,18 +158,14 @@ impl<A: Aggregation> Aggregator<A> {
 
                 // Send aggregate to decryptor
                 tokio::spawn(Self::send_aggregation_response(state.clone(), aggregate));
-
             }
         }
         Ok(())
     }
 
-    async fn send_aggregation_response(
-        state: Arc<AggregatorState<A>>,
-        aggregate: A::Encoding,
-    )  {
+    async fn send_aggregation_response(state: Arc<AggregatorState<A>>, aggregate: A::Encoding) {
         // Send aggregate to decryptor
-        let mut socket = match TcpStream::connect(&state.decryptor_addr).await{
+        let mut socket = match TcpStream::connect(&state.decryptor_addr).await {
             Ok(s) => s,
             Err(e) => {
                 error!("Failed to connect to decryptor: {}", e);
@@ -185,11 +187,12 @@ impl<A: Aggregation> Aggregator<A> {
                         Ok(results) => {
                             // Send result to channel
                             state.results_channel.send(results).await.unwrap();
-                            let _ = write_message(&mut socket, &Message::<A>::Success{}).await;
+                            let _ = write_message(&mut socket, &Message::<A>::Success {}).await;
                         }
                         Err(e) => {
                             error!("Failed to post-process: {}", e);
-                            let _ = send_error_message::<A>(&mut socket, "Post-processing failed").await;
+                            let _ = send_error_message::<A>(&mut socket, "Post-processing failed")
+                                .await;
                         }
                     }
                 }

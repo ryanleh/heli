@@ -1,8 +1,8 @@
 use crate::{
-    net::messages::{Message, read_message, write_message, make_request},
+    net::messages::{Message, make_request, read_message, write_message},
     protocol::Aggregation,
 };
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use rand_core::OsRng;
 use tokio::net::TcpStream;
 use tracing::{debug, error, info};
@@ -34,13 +34,13 @@ impl<A: Aggregation> Client<A> {
         let response = make_request::<A>(&mut socket, &registration)
             .await
             .inspect_err(|e| error!("Registration failed: {}", e))?;
-        
+
         match response {
             Message::RegisterResponse { id, key } => {
                 self.id = Some(id as usize);
                 self.key = Some(key);
                 info!("Successfully registered with ID {}", id);
-            },
+            }
             _ => unreachable!(),
         };
         Ok(())
@@ -60,7 +60,7 @@ impl<A: Aggregation> Client<A> {
             encoding,
             proof,
         };
-        
+
         // Send message and handle potential error responses
         match make_request::<A>(&mut socket, &encoding_message).await {
             Ok(_) => info!("Client {} successfully sent encoding to aggregator", id),

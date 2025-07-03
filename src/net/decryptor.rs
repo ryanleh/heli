@@ -66,16 +66,16 @@ impl<A: Aggregation> Decryptor<A> {
         let message = match read_message::<A>(&mut socket).await {
             Ok(msg) => msg,
             Err(e) => {
-                let _ = send_error_message::<A>(&mut socket, &format!("Failed to read message: {}", e)).await;
+                let _ =
+                    send_error_message::<A>(&mut socket, &format!("Failed to read message: {}", e))
+                        .await;
                 return;
             }
         };
 
         // Handle request
         let response = match message {
-            Message::<A>::RegisterRequest {} => {
-                Self::handle_register_request(state).await
-            }
+            Message::<A>::RegisterRequest {} => Self::handle_register_request(state).await,
             Message::<A>::AggregationResponse { aggregate } => {
                 Self::handle_aggregation_response(&mut socket, state, aggregate).await
             }
@@ -88,13 +88,13 @@ impl<A: Aggregation> Decryptor<A> {
                 let _ = write_message(&mut socket, &msg).await;
             }
             Err(e) => {
-                let _ = send_error_message::<A>(&mut socket, &format!("Request failed: {}", e)).await;
+                let _ =
+                    send_error_message::<A>(&mut socket, &format!("Request failed: {}", e)).await;
             }
         }
     }
 
-
-    async fn handle_register_request(state: Arc<DecryptorState<A>>) -> Result<Message::<A>> {
+    async fn handle_register_request(state: Arc<DecryptorState<A>>) -> Result<Message<A>> {
         let mut client_guard = state.registered_clients.lock().await;
         let key = client_guard
             .pop()
@@ -117,7 +117,7 @@ impl<A: Aggregation> Decryptor<A> {
                 error!("Aggregation request failed");
             }
         }
-        
+
         // Give id and key to client
         debug!("Client {} registered", id);
         Ok(Message::<A>::RegisterResponse { id, key })
@@ -127,17 +127,22 @@ impl<A: Aggregation> Decryptor<A> {
         socket: &mut TcpStream,
         state: Arc<DecryptorState<A>>,
         aggregate: A::Encoding,
-    ) -> Result<Message::<A>> {
+    ) -> Result<Message<A>> {
         debug!("Processing aggregation response");
 
         // Decode the aggregate result
         let partial_outputs = A::decode(&state.key, aggregate)?;
 
         // Give the partial output to the aggregator for post-processing
-        if let Err(e) = make_request::<A>(socket, &Message::<A>::PostProcessRequest { partial_outputs }).await {
+        if let Err(e) = make_request::<A>(
+            socket,
+            &Message::<A>::PostProcessRequest { partial_outputs },
+        )
+        .await
+        {
             error!("Post-processing request failed: {}", e);
         };
 
-        Ok(Message::<A>::Success{})
+        Ok(Message::<A>::Success {})
     }
 }

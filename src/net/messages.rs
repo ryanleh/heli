@@ -85,13 +85,13 @@ pub async fn make_request<A: Aggregation>(
 ) -> Result<Message<A>> {
     // Send message
     write_message(socket, message).await?;
-    
+
     // Wait for response
     match read_message::<A>(socket).await {
         Ok(Message::Error(e)) => {
             tracing::error!("Server returned error: {}", e);
             Err(anyhow::anyhow!("Server error: {}", e))
-        },
+        }
         Ok(response) => Ok(response),
         Err(e) => {
             tracing::error!("Failed to read response: {}", e);
@@ -101,10 +101,7 @@ pub async fn make_request<A: Aggregation>(
 }
 
 /// Send an error message to a client
-pub async fn send_error_message<A: Aggregation>(
-    socket: &mut TcpStream,
-    msg: &str,
-) -> Result<()> {
+pub async fn send_error_message<A: Aggregation>(socket: &mut TcpStream, msg: &str) -> Result<()> {
     let error_message = Message::<A>::Error(msg.to_string());
     write_message(socket, &error_message).await?;
     Ok(())

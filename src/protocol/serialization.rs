@@ -11,18 +11,6 @@ pub trait FromBytes: Sized {
     fn from_bytes(bytes: &[u8]) -> Result<Self>;
 }
 
-impl ToBytes for Vec<u8> {
-    fn to_bytes(&self) -> Vec<u8> {
-        self.clone()
-    }
-}
-
-impl FromBytes for Vec<u8> {
-    fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        Ok(bytes.to_vec())
-    }
-}
-
 pub(super) fn element_len<G: Group + GroupEncoding>() -> usize {
     G::Repr::default().as_ref().len()
 }
@@ -104,4 +92,88 @@ pub(crate) mod serde_derive {
         let bytes: &[u8] = serde::Deserialize::deserialize(deserializer)?;
         T::from_bytes(bytes).map_err(serde::de::Error::custom)
     }
+}
+
+// macro to generate tobytes and frombytes implementations for simple structs
+#[macro_export]
+macro_rules! impl_serialization {
+    (
+        $struct_name:ident<$generic:ident> {
+            $($field:ident: $field_type:tt),* $(,)?
+        }
+    ) => {
+        impl<$generic: Group + GroupEncoding> ToBytes for $struct_name<$generic> {
+            fn to_bytes(&self) -> Vec<u8> {
+                let mut out = Vec::new();
+                $(
+                    impl_serialization!(@serialize out, self.$field, $field_type);
+                )*
+                out
+            }
+        }
+
+        impl<$generic: Group + GroupEncoding> FromBytes for $struct_name<$generic> {
+            fn from_bytes(bytes: &[u8]) -> Result<Self> {
+                let elem_len = element_len::<$generic>();
+                let _scalar_len = <<$generic as Group>::Scalar as PrimeField>::Repr::default().as_ref().len();
+                let mut pos = 0;
+
+                $(
+                    let $field = impl_serialization!(@deserialize bytes, pos, $field_type, elem_len, _scalar_len);
+                )*
+
+                Ok($struct_name {
+                    $($field),*
+                })
+            }
+        }
+    };
+
+    // Serialize based on field type
+    (@serialize $out:expr, $field:expr, group) => {
+        serialize_element(&mut $out, $field);
+    };
+    (@serialize $out:expr, $field:expr, scalar) => {
+        serialize_scalar(&mut $out, $field);
+    };
+    (@serialize $out:expr, $field:expr, group_vec) => {
+        serialize_elements(&mut $out, &$field);
+    };
+    (@serialize $out:expr, $field:expr, scalar_vec) => {
+        $out.extend_from_slice(&($field.len() as u32).to_be_bytes());
+        for scalar in $field.iter() {
+            serialize_scalar(&mut $out, *scalar);
+        }
+    };
+
+    // Deserialize based on field type
+    (@deserialize $bytes:expr, $pos:expr, group, $elem_len:expr, $scalar_len:expr) => {{
+        let field = deserialize_element(&$bytes[$pos..$pos + $elem_len])?;
+        $pos += $elem_len;
+        field
+    }};
+    (@deserialize $bytes:expr, $pos:expr, scalar, $elem_len:expr, $scalar_len:expr) => {{
+        let field = deserialize_scalar(&$bytes[$pos..$pos + $scalar_len])?;
+        $pos += $scalar_len;
+        field
+    }};
+    (@deserialize $bytes:expr, $pos:expr, group_vec, $elem_len:expr, $scalar_len:expr) => {{
+        let (buf, _) = $bytes[$pos..].split_at(4);
+        let len = deserialize_len(buf);
+        $pos += 4;
+        let field = deserialize_elements(&$bytes[$pos..$pos + $elem_len * len], len)?;
+        $pos += $elem_len * len;
+        field
+    }};
+    (@deserialize $bytes:expr, $pos:expr, scalar_vec, $elem_len:expr, $scalar_len:expr) => {{
+        let (buf, _) = $bytes[$pos..].split_at(4);
+        let len = deserialize_len(buf);
+        $pos += 4;
+        let mut field = Vec::with_capacity(len);
+        for _ in 0..len {
+            field.push(deserialize_scalar(&$bytes[$pos..$pos + $scalar_len])?);
+            $pos += $scalar_len;
+        }
+        field
+    }};
 }

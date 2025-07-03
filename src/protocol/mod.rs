@@ -5,8 +5,13 @@ use std::fmt::Debug;
 pub mod dl;
 pub use dl::DiscreteLog;
 
+#[macro_use]
 pub mod serialization;
 pub use serialization::{FromBytes, ToBytes};
+
+pub(crate) use crate::impl_serialization;
+
+pub mod messages;
 
 #[cfg(test)]
 mod tests;
@@ -38,10 +43,7 @@ pub trait Aggregation: Send + Sync + 'static {
         proof: &[Self::Proof],
     ) -> Result<()>;
 
-    fn aggregate(
-        params: &Self::Params,
-        encodings: &[Self::Encoding],
-    ) -> Result<Self::Encoding>;
+    fn aggregate(params: &Self::Params, encodings: &[Self::Encoding]) -> Result<Self::Encoding>;
 
     fn decode(key: &Self::DecryptorKey, aggregate: Self::Encoding) -> Result<Self::PartialOutput>;
 
