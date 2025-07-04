@@ -1,7 +1,7 @@
-use super::{Aggregation, messages::*, proofs::*};
+use super::{Aggregation, dlog::*, messages::*, proofs::*};
 
 use anyhow::{Result, anyhow};
-use ff::{Field, PrimeField};
+use ff::Field;
 use group::{Group, GroupEncoding};
 use rand_core::{CryptoRng, RngCore};
 use std::marker::PhantomData;
@@ -141,19 +141,14 @@ impl<G: Group + GroupEncoding> Aggregation for DiscreteLog<G> {
         let g = G::generator();
         let mut results = Vec::with_capacity(partial_outputs.vals.len());
 
-        for output in partial_outputs.vals {
+        for (i, output) in partial_outputs.vals.iter().enumerate() {
             // Bruteforce discrete log
-            //
-            // TODO: do this more efficiently
-            let mut guess = G::Scalar::ZERO;
-            for _ in 0..=Self::num_clients(params) {
-                if g * guess == output {
-                    results.push(u32::from_le_bytes(
-                        guess.to_repr().as_ref()[0..4].try_into().unwrap(),
-                    ));
-                    break;
-                }
-                guess += G::Scalar::ONE;
+            let max_dlog = Self::num_clients(params);
+            let found = compute_dlog(&g, output, max_dlog as u32, &mut results[i]);
+            
+            if !found {
+                // Handle error case where discrete log not found
+                return Err(anyhow!("Could not find discrete log"));
             }
         }
 

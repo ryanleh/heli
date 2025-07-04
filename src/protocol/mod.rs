@@ -3,6 +3,7 @@ use rand_core::{CryptoRng, RngCore};
 use std::fmt::Debug;
 
 pub mod dl;
+pub mod dlog;
 pub mod messages;
 pub mod proofs;
 pub use dl::DiscreteLog;
