@@ -1,5 +1,6 @@
 pub mod dl;
 pub use dl::DiscreteLog;
+pub mod dlog;
 pub mod messages;
 mod msm;
 pub mod proofs;

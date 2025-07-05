@@ -1,6 +1,6 @@
-use super::{MSM, messages::*, proofs::*};
+use super::{MSM, dlog::*, messages::*, proofs::*};
 use anyhow::{Result, anyhow};
-use ff::{Field, PrimeField};
+use ff::Field;
 use group::{Group, GroupEncoding};
 use rand_core::{CryptoRng, RngCore};
 use std::marker::PhantomData;
@@ -168,24 +168,12 @@ where
         partial_outputs: PartialOutput<G>,
     ) -> Result<Vec<u32>> {
         let g = G::generator();
-        let mut results = Vec::with_capacity(partial_outputs.vals.len());
-
-        for output in partial_outputs.vals {
-            // Bruteforce discrete log
-            //
-            // TODO: do this more efficiently
-            let mut guess = <G as Group>::Scalar::ZERO;
-            for _ in 0..=Self::num_clients(params) {
-                if g * guess == output {
-                    results.push(u32::from_le_bytes(
-                        guess.to_repr().as_ref()[0..4].try_into().unwrap(),
-                    ));
-                    break;
-                }
-                guess += G::Scalar::ONE;
-            }
-        }
-
+        let max_dlog = Self::num_clients(params) as u32 + 1;
+        let results = partial_outputs
+            .vals
+            .into_iter()
+            .map(|partial| compute_dlog(&g, &partial, max_dlog))
+            .collect::<Result<Vec<_>>>()?;
         Ok(results)
     }
 
