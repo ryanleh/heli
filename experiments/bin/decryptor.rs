@@ -1,6 +1,6 @@
 use clap::Parser;
-use curve25519_dalek::RistrettoPoint;
-use hlagg::{net::decryptor::Decryptor, protocol::DiscreteLog};
+use hlagg::net::decryptor::Decryptor;
+use hlagg::protocol::Ristretto;
 use std::path::PathBuf;
 
 mod config;
@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     config.log_startup("decryptor", &args.config);
 
     // Create and run decryptor
-    let decryptor = Decryptor::<DiscreteLog<RistrettoPoint>>::new(
+    let decryptor = Decryptor::<Ristretto>::new(
         &config.network.decryptor_addr,
         &config.network.aggregator_addr,
         config.protocol.num_clients,

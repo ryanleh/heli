@@ -1,6 +1,6 @@
 use clap::Parser;
-use curve25519_dalek::RistrettoPoint;
-use hlagg::{net::aggregator::Aggregator, protocol::DiscreteLog};
+use hlagg::net::aggregator::Aggregator;
+use hlagg::protocol::Ristretto;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
     let (result_sender, mut result_receiver) = mpsc::channel(1);
 
     // Create and run aggregator
-    let aggregator = Aggregator::<DiscreteLog<RistrettoPoint>>::new(
+    let aggregator = Aggregator::<Ristretto>::new(
         &config.network.aggregator_addr,
         &config.network.decryptor_addr,
         result_sender,

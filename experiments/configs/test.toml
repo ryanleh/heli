@@ -4,7 +4,7 @@ aggregator_addr = "127.0.0.1:8081"
 
 [protocol]
 num_clients = 2
-length = 1
+length = 5
 
 [logging]
 name = "test"

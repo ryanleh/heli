@@ -1,9 +1,10 @@
 use crate::{
     net::messages::{Message, make_request, read_message, send_error_message, write_message},
-    protocol::*,
+    protocol::{DiscreteLog, MSM, messages::*, proofs::*},
 };
 
 use anyhow::{Result, anyhow};
+use group::{Group, GroupEncoding};
 use rand_core::OsRng;
 use std::sync::Arc;
 use tokio::{
@@ -12,22 +13,26 @@ use tokio::{
 };
 use tracing::{debug, error, info};
 
-pub struct Decryptor<A: Aggregation> {
+pub struct Decryptor<G: Group + GroupEncoding> {
     addr: String,
-    state: Arc<DecryptorState<A>>,
+    state: Arc<DecryptorState<G>>,
 }
 
-struct DecryptorState<A: Aggregation> {
+struct DecryptorState<G: Group + GroupEncoding> {
     aggregator_addr: String,
-    params: Mutex<Option<A::Params>>,
-    key: A::DecryptorKey,
+    params: Mutex<Option<AggParams<G>>>,
+    key: DecKey<G>,
     last_client_id: Mutex<u32>,
-    registered_clients: Mutex<Vec<A::ClientKey>>,
+    registered_clients: Mutex<Vec<ClientKey<G>>>,
 }
 
-impl<A: Aggregation> Decryptor<A> {
+impl<G: Group + GroupEncoding> Decryptor<G>
+where
+    G: MSM<Coeff = G::Scalar, Point = G> + Send + Sync,
+{
     pub fn new(addr: &str, aggregator_addr: &str, num_clients: usize, length: usize) -> Self {
-        let (params, key, client_keys) = A::setup(num_clients, length, &mut OsRng);
+        let (params, key, client_keys) =
+            DiscreteLog::<G, BinarySchnorr<G>>::setup(num_clients, length, &mut OsRng);
         let state = DecryptorState {
             aggregator_addr: aggregator_addr.to_string(),
             params: Mutex::new(Some(params)),
@@ -60,20 +65,20 @@ impl<A: Aggregation> Decryptor<A> {
         }
     }
 
-    async fn handle_connection(mut socket: TcpStream, state: Arc<DecryptorState<A>>) {
-        let message = match read_message::<A>(&mut socket).await {
+    async fn handle_connection(mut socket: TcpStream, state: Arc<DecryptorState<G>>) {
+        let message = match read_message::<G>(&mut socket).await {
             Ok(msg) => msg,
             Err(e) => {
                 let _ =
-                    send_error_message::<A>(&mut socket, &format!("Failed to read message: {}", e))
+                    send_error_message::<G>(&mut socket, &format!("Failed to read message: {}", e))
                         .await;
                 return;
             }
         };
 
         let response = match message {
-            Message::<A>::RegisterRequest {} => Self::handle_register_request(state).await,
-            Message::<A>::AggregationResponse { aggregate } => {
+            Message::<G>::RegisterRequest {} => Self::handle_register_request(state).await,
+            Message::<G>::AggregationResponse { aggregate } => {
                 Self::handle_aggregation_response(&mut socket, state, aggregate).await
             }
             _ => Err(anyhow!("Invalid message type")),
@@ -86,13 +91,13 @@ impl<A: Aggregation> Decryptor<A> {
             }
             Err(e) => {
                 let _ =
-                    send_error_message::<A>(&mut socket, &format!("Request failed: {}", e)).await;
+                    send_error_message::<G>(&mut socket, &format!("Request failed: {}", e)).await;
             }
         }
     }
 
     /// Register a client
-    async fn handle_register_request(state: Arc<DecryptorState<A>>) -> Result<Message<A>> {
+    async fn handle_register_request(state: Arc<DecryptorState<G>>) -> Result<Message<G>> {
         let mut client_guard = state.registered_clients.lock().await;
         let key = client_guard
             .pop()
@@ -107,8 +112,8 @@ impl<A: Aggregation> Decryptor<A> {
 
             // Send initialization information to the aggregator
             let mut agg_conn = TcpStream::connect(&state.aggregator_addr).await?;
-            let message = Message::<A>::AggregationRequest { params };
-            if let Ok(_) = make_request::<A>(&mut agg_conn, &message).await {
+            let message = Message::<G>::AggregationRequest { params };
+            if let Ok(_) = make_request::<G>(&mut agg_conn, &message).await {
                 info!("Sent aggregation request to aggregator");
             } else {
                 error!("Aggregation request failed");
@@ -116,30 +121,30 @@ impl<A: Aggregation> Decryptor<A> {
         }
 
         debug!("Client {} registered", id);
-        Ok(Message::<A>::RegisterResponse { id, key })
+        Ok(Message::<G>::RegisterResponse { id, key })
     }
 
     /// Decode the aggregate result and send to aggregator for post-processing
     async fn handle_aggregation_response(
         socket: &mut TcpStream,
-        state: Arc<DecryptorState<A>>,
-        aggregate: A::Encoding,
-    ) -> Result<Message<A>> {
+        state: Arc<DecryptorState<G>>,
+        aggregate: Encoding<G>,
+    ) -> Result<Message<G>> {
         debug!("Processing aggregation response");
 
         // Decode the aggregate result
-        let partial_outputs = A::decode(&state.key, aggregate)?;
+        let partial_outputs = DiscreteLog::<G, BinarySchnorr<G>>::decode(&state.key, aggregate)?;
 
         // Give the partial output to the aggregator for post-processing
-        if let Err(e) = make_request::<A>(
+        if let Err(e) = make_request::<G>(
             socket,
-            &Message::<A>::PostProcessRequest { partial_outputs },
+            &Message::<G>::PostProcessRequest { partial_outputs },
         )
         .await
         {
             error!("Post-processing request failed: {}", e);
         };
 
-        Ok(Message::<A>::Success {})
+        Ok(Message::<G>::Success {})
     }
 }

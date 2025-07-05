@@ -1,18 +1,17 @@
 use crate::{
     net::{aggregator::Aggregator, client::Client, decryptor::Decryptor},
-    protocol::*,
+    protocol::{DiscreteLog, Ristretto, proofs::BinarySchnorr},
 };
 
 use anyhow::{Result, anyhow};
-use curve25519_dalek::RistrettoPoint;
 use rand::{Rng, rngs::OsRng};
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{Level, info};
 use tracing_subscriber;
 
-type G = RistrettoPoint;
-type Agg = DiscreteLog<G>;
+type G = Ristretto;
+type Agg = DiscreteLog<G, BinarySchnorr<G>>;
 
 struct TestConfig {
     num_clients: usize,
@@ -45,7 +44,7 @@ async fn run_protocol(config: TestConfig) -> Result<()> {
     init_tracing();
 
     // Start the decryptor
-    let decryptor = Decryptor::<Agg>::new(
+    let decryptor = Decryptor::<G>::new(
         &config.decryptor_addr,
         &config.aggregator_addr,
         config.num_clients,
@@ -59,8 +58,7 @@ async fn run_protocol(config: TestConfig) -> Result<()> {
 
     // Start the aggregator first (without decryptor)
     let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-    let aggregator =
-        Aggregator::<Agg>::new(&config.aggregator_addr, &config.decryptor_addr, sender);
+    let aggregator = Aggregator::<G>::new(&config.aggregator_addr, &config.decryptor_addr, sender);
 
     let aggregator_handle = tokio::spawn(async move {
         if let Err(e) = aggregator.run().await {
@@ -76,7 +74,7 @@ async fn run_protocol(config: TestConfig) -> Result<()> {
     let mut client_inputs = Vec::new();
     for _ in 0..config.num_clients {
         // Register client
-        let mut client = Client::<Agg>::new(&config.decryptor_addr, &config.aggregator_addr);
+        let mut client = Client::<G>::new(&config.decryptor_addr, &config.aggregator_addr);
         client.register().await?;
 
         assert!(client.id.is_some());
@@ -129,8 +127,7 @@ async fn test_aggregator_waits_for_params() -> Result<()> {
 
     // Start the aggregator first (without decryptor)
     let (sender, _receiver) = tokio::sync::mpsc::channel(1);
-    let aggregator =
-        Aggregator::<Agg>::new(&config.aggregator_addr, &config.decryptor_addr, sender);
+    let aggregator = Aggregator::<G>::new(&config.aggregator_addr, &config.decryptor_addr, sender);
     let aggregator_handle = tokio::spawn(async move {
         if let Err(e) = aggregator.run().await {
             panic!("Aggregator error: {}", e);
@@ -141,11 +138,11 @@ async fn test_aggregator_waits_for_params() -> Result<()> {
     sleep(Duration::from_millis(50)).await;
 
     // Try to send an encoding before the aggregator has parameters
-    let mut client = Client::<Agg>::new(&config.decryptor_addr, &config.aggregator_addr);
+    let mut client = Client::<G>::new(&config.decryptor_addr, &config.aggregator_addr);
 
     // Manually set client ID and key (simulating registration)
     client.id = Some(1);
-    client.key = Some(DiscreteLog::<G>::setup(1, 1, &mut OsRng).2[0].clone());
+    client.key = Some(Agg::setup(1, 1, &mut OsRng).2[0].clone());
 
     // This should fail with an error message
     let result = client.send_encoding(&[1]).await;

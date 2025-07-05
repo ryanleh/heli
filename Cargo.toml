@@ -21,6 +21,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 toml = "0.8"
 sha3 = "0.10"
+subtle = "2.6.1"
 
 [dev-dependencies]
 rand = "0.8.5"
@@ -52,3 +53,4 @@ path = "experiments/bin/aggregator.rs"
 [[bin]]
 name = "client"
 path = "experiments/bin/client.rs"
+

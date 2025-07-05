@@ -1,6 +1,6 @@
 use clap::Parser;
-use curve25519_dalek::RistrettoPoint;
-use hlagg::{net::client::Client, protocol::DiscreteLog};
+use hlagg::net::client::Client;
+use hlagg::protocol::Ristretto;
 use rand::Rng;
 use std::path::PathBuf;
 
@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
     config.log_startup("client", &args.config);
 
     // Create client
-    let mut client = Client::<DiscreteLog<RistrettoPoint>>::new(
+    let mut client = Client::<Ristretto>::new(
         &config.network.decryptor_addr,
         &config.network.aggregator_addr,
     );

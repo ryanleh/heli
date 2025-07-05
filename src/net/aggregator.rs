@@ -1,9 +1,10 @@
 use crate::{
     net::messages::{Message, make_request, read_message, send_error_message, write_message},
-    protocol::*,
+    protocol::{DiscreteLog, MSM, messages::*, proofs::*},
 };
 
 use anyhow::{Result, anyhow};
+use group::{Group, GroupEncoding};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::{
@@ -12,20 +13,23 @@ use tokio::{
 };
 use tracing::{debug, error, info};
 
-pub struct Aggregator<A: Aggregation> {
+pub struct Aggregator<G: Group + GroupEncoding> {
     addr: String,
-    state: Arc<AggregatorState<A>>,
+    state: Arc<AggregatorState<G>>,
 }
 
-pub struct AggregatorState<A: Aggregation> {
+pub struct AggregatorState<G: Group + GroupEncoding> {
     decryptor_addr: String,
-    params: OnceCell<A::Params>,
+    params: OnceCell<AggParams<G>>,
     seen_clients: Mutex<HashSet<u32>>,
-    encodings: Mutex<Vec<(u32, A::Encoding, A::Proof)>>,
+    encodings: Mutex<Vec<(u32, Encoding<G>, BinarySchnorrProof<G>)>>,
     results_channel: mpsc::Sender<Vec<u32>>,
 }
 
-impl<A: Aggregation> Aggregator<A> {
+impl<G: Group + GroupEncoding> Aggregator<G>
+where
+    G: MSM<Coeff = G::Scalar, Point = G> + Send + Sync,
+{
     pub fn new(addr: &str, decryptor_addr: &str, results_channel: mpsc::Sender<Vec<u32>>) -> Self {
         let state = Arc::new(AggregatorState {
             decryptor_addr: decryptor_addr.to_string(),
@@ -59,12 +63,12 @@ impl<A: Aggregation> Aggregator<A> {
         }
     }
 
-    async fn handle_connection(mut socket: TcpStream, state: Arc<AggregatorState<A>>) {
-        let message = match read_message::<A>(&mut socket).await {
+    async fn handle_connection(mut socket: TcpStream, state: Arc<AggregatorState<G>>) {
+        let message = match read_message::<G>(&mut socket).await {
             Ok(msg) => msg,
             Err(e) => {
                 let _ =
-                    send_error_message::<A>(&mut socket, &format!("Failed to read message: {}", e))
+                    send_error_message::<G>(&mut socket, &format!("Failed to read message: {}", e))
                         .await;
                 return;
             }
@@ -72,10 +76,10 @@ impl<A: Aggregation> Aggregator<A> {
 
         // Handle request
         let result = match message {
-            Message::<A>::AggregationRequest { params } => {
+            Message::<G>::AggregationRequest { params } => {
                 Self::handle_aggregation_request(state, params).await
             }
-            Message::<A>::ClientEncoding {
+            Message::<G>::ClientEncoding {
                 id,
                 encoding,
                 proof,
@@ -86,28 +90,28 @@ impl<A: Aggregation> Aggregator<A> {
         // Inform caller of success or error
         match result {
             Ok(()) => {
-                let _ = write_message(&mut socket, &Message::<A>::Success {}).await;
+                let _ = write_message(&mut socket, &Message::<G>::Success {}).await;
             }
             Err(e) => {
                 let _ =
-                    send_error_message::<A>(&mut socket, &format!("Request failed: {}", e)).await;
+                    send_error_message::<G>(&mut socket, &format!("Request failed: {}", e)).await;
             }
         }
     }
 
     async fn handle_aggregation_request(
-        state: Arc<AggregatorState<A>>,
-        params: A::Params,
+        state: Arc<AggregatorState<G>>,
+        params: AggParams<G>,
     ) -> Result<()> {
         // TODO: If want to allow a full reset, need to clear things here
         Ok(state.params.set(params)?)
     }
 
     async fn handle_client_encoding(
-        state: Arc<AggregatorState<A>>,
+        state: Arc<AggregatorState<G>>,
         id: u32,
-        encoding: A::Encoding,
-        proof: A::Proof,
+        encoding: Encoding<G>,
+        proof: BinarySchnorrProof<G>,
     ) -> Result<()> {
         // Check if parameters are set
         if state.params.get().is_none() {
@@ -132,27 +136,37 @@ impl<A: Aggregation> Aggregator<A> {
             // If we have all of the encodings, verify and aggregate them
             //
             // TODO: Have a separate thread that handles this in a streaming fashion
-            if encodings.len() == A::num_clients(state.params.get().unwrap()) {
+            if encodings.len()
+                == DiscreteLog::<G, BinarySchnorr<G>>::num_clients(state.params.get().unwrap())
+            {
                 // Sort encodings and proofs by client ID
                 encodings.sort_by_key(|(id, _, _)| *id);
-                let (encodings, proofs): (Vec<A::Encoding>, Vec<A::Proof>) =
+                let (encodings, proofs): (Vec<Encoding<G>>, Vec<BinarySchnorrProof<G>>) =
                     encodings.drain(..).map(|(_, e, p)| (e, p)).unzip();
 
                 // Verify encodings
                 let params = state.params.get().unwrap();
-                if let Err(e) = A::verify_encodings(params, None, &encodings, &proofs) {
+                let (_, verifier_key) = BinarySchnorr::<G>::setup();
+                if let Err(e) = DiscreteLog::<G, BinarySchnorr<G>>::verify_encodings(
+                    params,
+                    &verifier_key,
+                    None,
+                    &encodings,
+                    &proofs,
+                ) {
                     // TODO: Actually do something here
                     error!("Failed to verify encodings: {}", e);
                     return Ok(());
                 }
 
-                let aggregate = match A::aggregate(params, &encodings) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        error!("Failed to aggregate encodings: {}", e);
-                        return Ok(());
-                    }
-                };
+                let aggregate =
+                    match DiscreteLog::<G, BinarySchnorr<G>>::aggregate(params, &encodings) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            error!("Failed to aggregate encodings: {}", e);
+                            return Ok(());
+                        }
+                    };
 
                 // Send aggregate to decryptor
                 tokio::spawn(Self::send_aggregation_response(state.clone(), aggregate));
@@ -161,7 +175,7 @@ impl<A: Aggregation> Aggregator<A> {
         Ok(())
     }
 
-    async fn send_aggregation_response(state: Arc<AggregatorState<A>>, aggregate: A::Encoding) {
+    async fn send_aggregation_response(state: Arc<AggregatorState<G>>, aggregate: Encoding<G>) {
         // Send aggregate to decryptor
         let mut socket = match TcpStream::connect(&state.decryptor_addr).await {
             Ok(s) => s,
@@ -170,36 +184,37 @@ impl<A: Aggregation> Aggregator<A> {
                 return;
             }
         };
-        let message = Message::<A>::AggregationResponse { aggregate };
-        let response = make_request::<A>(&mut socket, &message).await;
+        let message = Message::<G>::AggregationResponse { aggregate };
+        let response = make_request::<G>(&mut socket, &message).await;
 
         // Decryptor sends back a partial output
         if let Ok(partial_outputs) = response {
             match partial_outputs {
-                Message::<A>::PostProcessRequest { partial_outputs } => {
+                Message::<G>::PostProcessRequest { partial_outputs } => {
                     // Perform post-processing
                     //
                     // TODO: Spawn in separate task
                     let params = state.params.get().unwrap();
-                    match A::post_process(params, partial_outputs) {
+                    match DiscreteLog::<G, BinarySchnorr<G>>::post_process(params, partial_outputs)
+                    {
                         Ok(results) => {
                             // Send result to channel
                             state.results_channel.send(results).await.unwrap();
-                            let _ = write_message(&mut socket, &Message::<A>::Success {}).await;
+                            let _ = write_message(&mut socket, &Message::<G>::Success {}).await;
                         }
                         Err(e) => {
                             error!("Failed to post-process: {}", e);
-                            let _ = send_error_message::<A>(&mut socket, "Post-processing failed")
+                            let _ = send_error_message::<G>(&mut socket, "Post-processing failed")
                                 .await;
                         }
                     }
                 }
                 _ => {
-                    let _ = send_error_message::<A>(&mut socket, "Invalid message type").await;
+                    let _ = send_error_message::<G>(&mut socket, "Invalid message type").await;
                 }
             }
         } else {
-            error!("Failed to retrieve partial outputs");
+            error!("Failed to send aggregation response to decryptor");
         }
     }
 }

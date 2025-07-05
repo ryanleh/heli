@@ -17,6 +17,11 @@ pub(super) fn element_len<G: Group + GroupEncoding>() -> usize {
     G::Repr::default().as_ref().len()
 }
 
+/// Returns the length in bytes of a scalar element.
+pub(super) fn scalar_len<F: PrimeField>() -> usize {
+    F::Repr::default().as_ref().len()
+}
+
 /// Serializes a group element to a byte vector.
 pub(super) fn serialize_element<G: Group + GroupEncoding>(out: &mut Vec<u8>, elem: G) {
     out.extend_from_slice(elem.to_bytes().as_ref());
@@ -135,6 +140,8 @@ pub(crate) mod serde_derive {
 }
 
 /// Macro to generate ToBytes and FromBytes implementations for simple structs.
+///
+/// TODO: Add a size field to ToBytes / FromBytes so we can avoid sending length headers
 #[macro_export]
 macro_rules! impl_serialization {
     (
@@ -212,16 +219,32 @@ macro_rules! impl_serialization {
     }};
 }
 
+impl ToBytes for () {
+    fn to_bytes(&self) -> Vec<u8> {
+        vec![]
+    }
+}
+
+impl FromBytes for () {
+    fn from_bytes(_bytes: &[u8]) -> Result<Self> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Aggregation, dl::DiscreteLog};
+    use crate::protocol::{
+        DiscreteLog, Ristretto,
+        messages::*,
+        proofs::{BinarySchnorr, Prover},
+    };
 
-    use curve25519_dalek::RistrettoPoint;
     use rand::rngs::OsRng;
 
-    type G = RistrettoPoint;
-    type Agg = DiscreteLog<G>;
+    type G = Ristretto;
+    type P = BinarySchnorr<G>;
+    type Agg = DiscreteLog<G, P>;
 
     /// Tests serialization and deserialization of all protocol types.
     #[test]
@@ -229,33 +252,33 @@ mod tests {
         let num_clients = 1;
         let length = 1;
         let (params, sk, cks) = Agg::setup(num_clients, length, &mut OsRng);
+        let (prover_key, verifier_key) = P::setup();
 
         let params_bytes = params.to_bytes();
-        let new_params = <Agg as Aggregation>::Params::from_bytes(&params_bytes).unwrap();
+        let new_params = AggParams::from_bytes(&params_bytes).unwrap();
         assert_eq!(params, new_params);
 
         let ck_bytes = cks[0].to_bytes();
-        let new_ck = <Agg as Aggregation>::ClientKey::from_bytes(&ck_bytes).unwrap();
+        let new_ck = ClientKey::from_bytes(&ck_bytes).unwrap();
         assert_eq!(cks[0], new_ck);
 
-        let (encoding, proof) = Agg::encode(&cks[0], &[1], &mut OsRng).unwrap();
+        let (encoding, proof) = Agg::encode(&cks[0], &prover_key, &[1], &mut OsRng).unwrap();
 
         let enc_bytes = encoding.to_bytes();
-        let new_enc = <Agg as Aggregation>::Encoding::from_bytes(&enc_bytes).unwrap();
+        let new_enc = Encoding::from_bytes(&enc_bytes).unwrap();
         assert_eq!(encoding, new_enc);
 
         let proof_bytes = proof.to_bytes();
-        let new_proof = <Agg as Aggregation>::Proof::from_bytes(&proof_bytes).unwrap();
+        let new_proof = <P as Prover<G>>::Proof::from_bytes(&proof_bytes).unwrap();
         assert_eq!(proof, new_proof);
 
         let enc = &[encoding];
-        Agg::verify_encodings(&params, None, enc, &[proof]).unwrap();
+        Agg::verify_encodings(&params, &verifier_key, None, enc, &[new_proof]).unwrap();
         let agg = Agg::aggregate(&params, enc).unwrap();
         let partial_results = Agg::decode(&sk, agg).unwrap();
 
         let partial_result_bytes = partial_results.to_bytes();
-        let new_partial_results =
-            <Agg as Aggregation>::PartialOutput::from_bytes(&partial_result_bytes).unwrap();
+        let new_partial_results = PartialOutput::from_bytes(&partial_result_bytes).unwrap();
         assert_eq!(partial_results, new_partial_results);
 
         let results = Agg::post_process(&params, partial_results).unwrap();

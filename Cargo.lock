@@ -528,6 +528,7 @@ dependencies = [
  "rand_core",
  "serde",
  "sha3",
+ "subtle",
  "tokio",
  "toml",
  "tracing",
