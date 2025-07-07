@@ -9,7 +9,7 @@ pub fn compute_dlog<G: Group + GroupEncoding>(g: &G, challenge: &G, max_dlog: u3
 
     let m = ((max_dlog as f64).sqrt().ceil() as u32) + 1;
     let m_scalar = G::Scalar::from(m as u64);
-    
+
     // Compute giant steps table: g^(m*i) for i in 0..m
     let mut giant_steps: HashMap<Vec<u8>, u32> = HashMap::with_capacity(m as usize);
     let giant_step = *g * m_scalar;

@@ -12,12 +12,13 @@ use common::*;
 type G = Ristretto;
 type Agg = DiscreteLog<G, BinarySchnorr<G>>;
 
-// TODO: Tweak
-const NUM_CLIENTS: [usize; 1] = [1000];
-const LENGTHS: [usize; 3] = [1, 5, 10];
+// Reduced sizes for faster benchmarks
+const NUM_CLIENTS: [usize; 3] = [1, 10, 100];
+const LENGTHS: [usize; 3] = [1, 10, 50];
 
 fn bench_setup(c: &mut Criterion) {
     let mut group = c.benchmark_group("setup");
+    group.sample_size(10); // Reduce sample size for expensive setup
     for num_clients in NUM_CLIENTS {
         for length in LENGTHS {
             group.bench_with_input(
@@ -38,6 +39,7 @@ fn bench_encode(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode");
     for num_clients in NUM_CLIENTS {
         for length in LENGTHS {
+            // Setup once outside the benchmark loop
             let (_params, _sk, cks) = Agg::setup(num_clients, length, &mut OsRng);
             let input = random_binary_vec(length);
             let (prover_key, _) = BinarySchnorr::<G>::setup();
@@ -60,6 +62,7 @@ fn bench_verify(c: &mut Criterion) {
     group.sample_size(10);
     for num_clients in NUM_CLIENTS {
         for length in LENGTHS {
+            // Setup once outside the benchmark loop
             let (params, _sk, cks) = Agg::setup(num_clients, length, &mut OsRng);
             let inputs = random_inputs(num_clients, length);
             let (prover_key, verifier_key) = BinarySchnorr::<G>::setup();
@@ -97,6 +100,7 @@ fn bench_batch_verify(c: &mut Criterion) {
     group.sample_size(10);
     for num_clients in NUM_CLIENTS {
         for length in LENGTHS {
+            // Setup once outside the benchmark loop
             let (params, _sk, cks) = Agg::setup(num_clients, length, &mut OsRng);
             let inputs = random_inputs(num_clients, length);
             let (prover_key, verifier_key) = BinarySchnorr::<G>::setup();
@@ -134,6 +138,7 @@ fn bench_aggregate(c: &mut Criterion) {
     let mut group = c.benchmark_group("aggregate");
     for num_clients in NUM_CLIENTS {
         for length in LENGTHS {
+            // Setup once outside the benchmark loop
             let (params, _sk, cks) = Agg::setup(num_clients, length, &mut OsRng);
             let inputs = random_inputs(num_clients, length);
             let (prover_key, _) = BinarySchnorr::<G>::setup();
@@ -160,6 +165,7 @@ fn bench_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode");
     for num_clients in NUM_CLIENTS {
         for length in LENGTHS {
+            // Setup once outside the benchmark loop
             let (params, sk, cks) = Agg::setup(num_clients, length, &mut OsRng);
             let inputs = random_inputs(num_clients, length);
             let (prover_key, _) = BinarySchnorr::<G>::setup();
@@ -187,6 +193,7 @@ fn bench_post_process(c: &mut Criterion) {
     let mut group = c.benchmark_group("post_process");
     for num_clients in NUM_CLIENTS {
         for length in LENGTHS {
+            // Setup once outside the benchmark loop
             let (params, sk, cks) = Agg::setup(num_clients, length, &mut OsRng);
             let inputs = random_inputs(num_clients, length);
             let (prover_key, _) = BinarySchnorr::<G>::setup();

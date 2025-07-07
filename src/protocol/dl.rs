@@ -233,4 +233,39 @@ mod tests {
             assert_eq!(result, sums[i]);
         }
     }
+
+    #[test]
+    fn measure_sizes() {
+        use crate::protocol::serialization::ToBytes;
+        use bytesize::ByteSize;
+
+        let lengths = vec![1, 5, 10, 25, 50, 75, 100];
+
+        println!("\n=== Size Measurements ===");
+        println!("Format: (input_length) -> encoding_size + proof_size = comm_per_client\n");
+
+        for length in lengths.iter() {
+            let (_params, _sk, cks) = Agg::setup(1, *length, &mut OsRng);
+            let (prover_key, _) = P::setup();
+
+            // Generate one encoding and proof for size measurement
+            let input: Vec<u32> = (0..*length)
+                .map(|_| if OsRng.gen_bool(0.5) { 1 } else { 0 })
+                .collect();
+            let (encoding, proof) = Agg::encode(&cks[0], &prover_key, &input, &mut OsRng).unwrap();
+
+            let encoding_size = encoding.to_bytes().len();
+            let proof_size = proof.to_bytes().len();
+            let total_size = encoding_size + proof_size;
+
+            println!(
+                "({:>3}) -> {:>8} + {:>8} = {:>8}",
+                length,
+                ByteSize::b(encoding_size as u64),
+                ByteSize::b(proof_size as u64),
+                ByteSize::b(total_size as u64)
+            );
+        }
+        println!("\n========================\n");
+    }
 }
