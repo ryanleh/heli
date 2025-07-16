@@ -1,61 +1,21 @@
-use crate::protocol::{FromBytes, MSM, ToBytes, messages::*};
-
-use ff::{Field, PrimeField};
-use group::{Group, GroupEncoding};
-use num_bigint::BigUint;
-use num_traits::One;
+use crate::protocol::{G, Scalar, messages::*, provers::Prover};
+use curve25519_dalek::traits::MultiscalarMul;
+use group::Group;
 use rand_core::{CryptoRng, RngCore};
-use sha3::{Digest, Sha3_256};
+use serde::{Deserialize, Serialize};
+use sha3::{Digest, Sha3_512};
 
-pub trait Prover<G: Group + GroupEncoding>: 'static {
-    type ProverKey: Send + Sync + ToBytes + FromBytes;
-    type VerifierKey: Send + Sync + ToBytes + FromBytes;
-    type Proof: Send + Sync + ToBytes + FromBytes;
-
-    fn setup() -> (Self::ProverKey, Self::VerifierKey);
-
-    fn prove<R: RngCore + CryptoRng>(
-        pk: &Self::ProverKey,
-        ck: &ClientKey<G>,
-        input: &[u32],
-        r: G::Scalar,
-        encoding: &Encoding<G>,
-        rng: &mut R,
-    ) -> Self::Proof;
-
-    fn verify(
-        vk: &Self::VerifierKey,
-        params: &AggParams<G>,
-        proof_index: u32,
-        encoding: &Encoding<G>,
-        proof: &Self::Proof,
-    ) -> bool;
-
-    fn batch_verify<R: RngCore + CryptoRng>(
-        vk: &Self::VerifierKey,
-        params: &AggParams<G>,
-        proof_indices: &[u32],
-        encodings: &[Encoding<G>],
-        proofs: &[Self::Proof],
-        rng: &mut R,
-    ) -> bool
-    where
-        G: MSM<Coeff = <G as Group>::Scalar, Point = G>;
-}
-
-pub struct BinarySchnorr<G: Group + GroupEncoding> {
-    _g: std::marker::PhantomData<G>,
-}
+pub struct Binary {}
 
 /// Proof of well-formedness for binary encodings.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct BinarySchnorrProof<G: Group + GroupEncoding> {
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct BinaryProof {
     /// Commitments
-    pub(crate) commitments: Commiments<G>,
+    pub(crate) commitments: Commiments,
     /// Challenges for x = 0 branch.
-    pub(crate) challenges_x: Vec<G::Scalar>,
+    pub(crate) challenges_x: Vec<Scalar>,
     /// Responses
-    pub(crate) responses: Responses<G>,
+    pub(crate) responses: Responses,
 }
 
 // Helper macro for verifying claims
@@ -67,13 +27,13 @@ macro_rules! check_claim {
     };
 }
 
-impl<G: Group + GroupEncoding> Prover<G> for BinarySchnorr<G> {
+impl Prover for Binary {
     type ProverKey = ();
     type VerifierKey = ();
-    type Proof = BinarySchnorrProof<G>;
+    type Proof = BinaryProof;
 
     // TODO: Not sure if we want this
-    fn setup() -> (Self::ProverKey, Self::VerifierKey) {
+    fn setup(_num_inputs: usize, _bitlength: usize) -> (Self::ProverKey, Self::VerifierKey) {
         ((), ())
     }
 
@@ -85,14 +45,18 @@ impl<G: Group + GroupEncoding> Prover<G> for BinarySchnorr<G> {
     ///
     /// This enforces that the ElGamal ciphertext is well-formed, that the secret
     /// key is embedded correctly, and that each input is either 0 or 1.
+    ///
+    /// TODO: Currently this isn't correct for multi-round
     fn prove<R: RngCore + CryptoRng>(
         _pk: &Self::ProverKey,
-        ck: &ClientKey<G>,
-        input: &[u32],
-        r: G::Scalar,
-        encoding: &Encoding<G>,
+        ck: &ClientKey,
+        input: &[u64],
+        r: Scalar,
+        encoding: &Encoding,
         rng: &mut R,
     ) -> Self::Proof {
+        // TODO: Check that input is well-formed
+
         // Generate commitments (and simulated transcripts) for claim 4
         let mut r_x_rand = Vec::with_capacity(input.len()); // Randomness for real branch
         let mut comm_g_x0 = Vec::with_capacity(input.len());
@@ -104,13 +68,13 @@ impl<G: Group + GroupEncoding> Prover<G> for BinarySchnorr<G> {
 
         for i in 0..input.len() {
             // Generate simulated transcripts for false paths in claim 4
-            let challenge = G::Scalar::random(&mut *rng);
-            let response = G::Scalar::random(&mut *rng);
+            let challenge = Scalar::random(&mut *rng);
+            let response = Scalar::random(&mut *rng);
             sim_challenges.push(challenge);
             sim_responses.push(response);
 
             // Generate commitments
-            let rand = <G as Group>::Scalar::random(&mut *rng);
+            let rand = Scalar::random(&mut *rng);
             r_x_rand.push(rand);
             match input[i] {
                 0 => {
@@ -137,8 +101,8 @@ impl<G: Group + GroupEncoding> Prover<G> for BinarySchnorr<G> {
         }
 
         // Generate commitments for claims 1-3
-        let r_rand = <G as Group>::Scalar::random(&mut *rng);
-        let s_rand = <G as Group>::Scalar::random(&mut *rng);
+        let r_rand = Scalar::random(&mut *rng);
+        let s_rand = Scalar::random(&mut *rng);
         let comm_g_r_rand = ck.g * r_rand;
         let comm_g_s_rand = ck.pks[0] * r_rand + ck.g * s_rand;
         let comm_h_s_rand = ck.h * s_rand;
@@ -178,7 +142,7 @@ impl<G: Group + GroupEncoding> Prover<G> for BinarySchnorr<G> {
             }
         }
 
-        BinarySchnorrProof {
+        BinaryProof {
             commitments,
             challenges_x,
             responses: Responses {
@@ -192,9 +156,9 @@ impl<G: Group + GroupEncoding> Prover<G> for BinarySchnorr<G> {
 
     fn verify(
         _vk: &Self::VerifierKey,
-        params: &AggParams<G>,
+        params: &AggParams,
         client_index: u32,
-        encoding: &Encoding<G>,
+        encoding: &Encoding,
         proof: &Self::Proof,
     ) -> bool {
         // Apply fiat-shamir to generate challenge
@@ -256,32 +220,29 @@ impl<G: Group + GroupEncoding> Prover<G> for BinarySchnorr<G> {
 
     fn batch_verify<R: RngCore + CryptoRng>(
         _vk: &Self::VerifierKey,
-        params: &AggParams<G>,
+        params: &AggParams,
         client_indices: &[u32],
-        encodings: &[Encoding<G>],
+        encodings: &[Encoding],
         proofs: &[Self::Proof],
         rng: &mut R,
-    ) -> bool
-    where
-        G: MSM<Coeff = <G as Group>::Scalar, Point = G>,
-    {
+    ) -> bool {
         // We batch by taking a random linear combination over all claims.  Here we
         // generate all the necessary randomnesss upfront.
         let num_proof_claims = 3 + 4 * encodings[0].vals.len();
         let total_claims = client_indices.len() * num_proof_claims;
         let rands: Vec<_> = (0..total_claims)
-            .map(|_| <G as Group>::Scalar::random(&mut *rng))
+            .map(|_| Scalar::random(&mut *rng))
             .collect();
 
         // Many terms share the g, h, and pk bases
-        let mut g_scalar = <G as Group>::Scalar::ZERO;
-        let mut h_scalar = <G as Group>::Scalar::ZERO;
-        let mut pk_scalars = vec![<G as Group>::Scalar::ZERO; params.pks.len()];
+        let mut g_scalar = Scalar::ZERO;
+        let mut h_scalar = Scalar::ZERO;
+        let mut pk_scalars = vec![Scalar::ZERO; params.pks.len()];
         let mut scalars = Vec::new();
         let mut bases = Vec::new();
 
         // Helper closure to add terms to the MSM vectors
-        let mut add_term = |scalar: <G as Group>::Scalar, base: G| {
+        let mut add_term = |scalar: Scalar, base: G| {
             scalars.push(scalar);
             bases.push(base);
         };
@@ -362,13 +323,13 @@ impl<G: Group + GroupEncoding> Prover<G> for BinarySchnorr<G> {
         bases.extend_from_slice(&params.pks);
 
         // If all proofs are valid, the MSM should equal the identity
-        let result = <G as MSM>::msm(&scalars, &bases);
+        let result = G::multiscalar_mul(&scalars, &bases);
         result == G::identity()
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Commiments<G: Group + GroupEncoding> {
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Commiments {
     /// Commitment for for claim 1) c_0 = g^r.
     pub(super) g_r: G,
     /// Commitment for for claim 2) c_1 = pk_0^r * g^s.
@@ -383,82 +344,62 @@ pub struct Commiments<G: Group + GroupEncoding> {
     pub(super) pk_x1: Vec<G>,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Responses<G: Group + GroupEncoding> {
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Responses {
     /// Response for proving knowledge of r.
-    pub(super) r: G::Scalar,
+    pub(super) r: Scalar,
     /// Response for proving knowledge of s.
-    pub(super) s: G::Scalar,
+    pub(super) s: Scalar,
     /// Responses for proving knowledge of x=0 branch.
-    pub(super) x0: Vec<G::Scalar>,
+    pub(super) x0: Vec<Scalar>,
     /// Responses for proving knowledge of x=1 branch.
-    pub(super) x1: Vec<G::Scalar>,
+    pub(super) x1: Vec<Scalar>,
 }
 
-impl<G: Group + GroupEncoding> Commiments<G> {
+impl Commiments {
     /// Apply fiat-shamir to generate challenge
-    fn get_challenge(&self, g: G, h: G, _pks: &[G], ck: G, encoding: &Encoding<G>) -> G::Scalar {
+    fn get_challenge(&self, g: G, h: G, _pks: &[G], ck: G, encoding: &Encoding) -> Scalar {
         // Compute the hash
-        let mut hasher = Sha3_256::new();
+        //
         // TODO: This doesn't include full transcript atm
-        hasher.update(g.to_bytes().as_ref());
-        hasher.update(h.to_bytes().as_ref());
-        hasher.update(ck.to_bytes().as_ref());
-        hasher.update(encoding.rand.to_bytes().as_ref());
-        let bytes = hasher.finalize();
-
-        // Compute the BigUint representation of the modulus
-        let modulus_bytes = (G::Scalar::ZERO - G::Scalar::ONE).to_repr();
-        let modulus = BigUint::from_bytes_le(modulus_bytes.as_ref()) + BigUint::one();
-
-        // Map the hash value to a scalar value
-        let scalar = BigUint::from_bytes_be(&bytes) % modulus;
-
-        // Map the BigUint to a scalar value
-        let scalar_byte_length = (G::Scalar::NUM_BITS as usize + 7) / 8;
-        let mut bytes = vec![0u8; scalar_byte_length];
-        let scalar_bytes = scalar.to_bytes_be();
-        let start = bytes.len() - scalar_bytes.len();
-        bytes[start..].copy_from_slice(&scalar_bytes);
-        bytes.reverse();
-        let mut repr = <<G as Group>::Scalar as PrimeField>::Repr::default();
-        repr.as_mut().copy_from_slice(&bytes);
-        <<G as Group>::Scalar as PrimeField>::from_repr(repr).expect("Error mapping hash to scalar")
+        let mut hasher = Sha3_512::new();
+        hasher.update(g.compress().to_bytes().as_ref());
+        hasher.update(h.compress().to_bytes().as_ref());
+        hasher.update(ck.compress().to_bytes().as_ref());
+        hasher.update(encoding.rand.compress().to_bytes().as_ref());
+        Scalar::from_hash(hasher)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{DiscreteLog, Ristretto, messages::Encoding};
+    use crate::protocol::{ElGamal, Scalar, messages::Encoding};
 
     use rand::{Rng, rngs::OsRng};
 
-    type G = Ristretto;
-    type P = BinarySchnorr<G>;
-    type Agg = DiscreteLog<G, P>;
+    type P = Binary;
+    type Agg = ElGamal<P>;
 
     #[test]
     fn proof_correctness() {
         let length = 5;
         let (params, _sk, cks) = Agg::setup(1, length, &mut OsRng);
-        let (prover_key, verifier_key) = P::setup();
+        let (prover_key, verifier_key) = P::setup(length, 1);
         let mut rng = rand::thread_rng();
 
         for _ in 0..10 {
-            let input: Vec<u32> = (0..length)
+            let input: Vec<u64> = (0..length)
                 .map(|_| if rng.gen_bool(0.5) { 1 } else { 0 })
                 .collect();
-            let r = <G as Group>::Scalar::random(&mut OsRng);
+            let r = Scalar::random(&mut OsRng);
             let encoding = Encoding {
                 rand: params.g * r,
                 secret: params.pks[0] * r + params.g * cks[0].secret,
                 vals: input
                     .iter()
                     .enumerate()
-                    .map(|(i, v)| {
-                        params.pks[i + 1] * r + params.g * <G as Group>::Scalar::from(*v as u64)
-                    })
+                    .map(|(i, v)| params.pks[i + 1] * r + params.g * Scalar::from(*v))
                     .collect(),
             };
             let proof = P::prove(&prover_key, &cks[0], &input, r, &encoding, &mut OsRng);
@@ -475,21 +416,19 @@ mod tests {
     fn proof_soundness_tampering() {
         let length = 5;
         let (params, _sk, cks) = Agg::setup(1, length, &mut OsRng);
-        let (prover_key, verifier_key) = P::setup();
+        let (prover_key, verifier_key) = P::setup(length, 1);
         let mut rng = rand::thread_rng();
-        let input: Vec<u32> = (0..length)
+        let input: Vec<u64> = (0..length)
             .map(|_| if rng.gen_bool(0.5) { 1 } else { 0 })
             .collect();
-        let r = <G as Group>::Scalar::random(&mut OsRng);
+        let r = Scalar::random(&mut OsRng);
         let encoding = Encoding {
             rand: params.g * r,
             secret: params.pks[0] * r + params.g * cks[0].secret,
             vals: input
                 .iter()
                 .enumerate()
-                .map(|(i, v)| {
-                    params.pks[i + 1] * r + params.g * <G as Group>::Scalar::from(*v as u64)
-                })
+                .map(|(i, v)| params.pks[i + 1] * r + params.g * Scalar::from(*v))
                 .collect(),
         };
         let proof = P::prove(&prover_key, &cks[0], &input, r, &encoding, &mut OsRng);
@@ -499,58 +438,58 @@ mod tests {
 
         // Try tampering each location of the proof and assert that it is rejected
         let mut bad_encoding = encoding.clone();
-        bad_encoding.rand = params.g * <G as Group>::Scalar::random(&mut OsRng);
+        bad_encoding.rand = params.g * Scalar::random(&mut OsRng);
         assert!(!P::verify(&verifier_key, &params, 0, &bad_encoding, &proof));
 
         let mut bad_encoding = encoding.clone();
-        bad_encoding.secret = params.g * <G as Group>::Scalar::random(&mut OsRng);
+        bad_encoding.secret = params.g * Scalar::random(&mut OsRng);
         assert!(!P::verify(&verifier_key, &params, 0, &bad_encoding, &proof));
 
         for i in 0..encoding.vals.len() {
             let mut bad_encoding = encoding.clone();
-            bad_encoding.vals[i] = params.g * <G as Group>::Scalar::random(&mut OsRng);
+            bad_encoding.vals[i] = params.g * Scalar::random(&mut OsRng);
             assert!(!P::verify(&verifier_key, &params, 0, &bad_encoding, &proof));
         }
 
         let mut bad_proof = proof.clone();
-        bad_proof.responses.r = <G as Group>::Scalar::random(&mut OsRng);
+        bad_proof.responses.r = Scalar::random(&mut OsRng);
         assert!(!P::verify(&verifier_key, &params, 0, &encoding, &bad_proof));
 
         let mut bad_proof = proof.clone();
-        bad_proof.responses.s = <G as Group>::Scalar::random(&mut OsRng);
+        bad_proof.responses.s = Scalar::random(&mut OsRng);
         assert!(!P::verify(&verifier_key, &params, 0, &encoding, &bad_proof));
 
         for i in 0..proof.responses.x0.len() {
             let mut bad_proof = proof.clone();
-            bad_proof.responses.x0[i] = <G as Group>::Scalar::random(&mut OsRng);
+            bad_proof.responses.x0[i] = Scalar::random(&mut OsRng);
             assert!(!P::verify(&verifier_key, &params, 0, &encoding, &bad_proof));
         }
 
         for i in 0..proof.responses.x1.len() {
             let mut bad_proof = proof.clone();
-            bad_proof.responses.x1[i] = <G as Group>::Scalar::random(&mut OsRng);
+            bad_proof.responses.x1[i] = Scalar::random(&mut OsRng);
             assert!(!P::verify(&verifier_key, &params, 0, &encoding, &bad_proof));
         }
 
         for i in 0..proof.challenges_x.len() {
             let mut bad_proof = proof.clone();
-            bad_proof.challenges_x[i] = <G as Group>::Scalar::random(&mut OsRng);
+            bad_proof.challenges_x[i] = Scalar::random(&mut OsRng);
             assert!(!P::verify(&verifier_key, &params, 0, &encoding, &bad_proof));
         }
 
         let mut bad_proof = proof.clone();
-        bad_proof.commitments.g_r = params.g * <G as Group>::Scalar::random(&mut OsRng);
+        bad_proof.commitments.g_r = params.g * Scalar::random(&mut OsRng);
         assert!(!P::verify(&verifier_key, &params, 0, &encoding, &bad_proof));
 
         for i in 0..proof.commitments.g_x0.len() {
             let mut bad_proof = proof.clone();
-            bad_proof.commitments.g_x0[i] = params.g * <G as Group>::Scalar::random(&mut OsRng);
+            bad_proof.commitments.g_x0[i] = params.g * Scalar::random(&mut OsRng);
             assert!(!P::verify(&verifier_key, &params, 0, &encoding, &bad_proof));
         }
 
         for i in 0..proof.commitments.g_x1.len() {
             let mut bad_proof = proof.clone();
-            bad_proof.commitments.g_x1[i] = params.g * <G as Group>::Scalar::random(&mut OsRng);
+            bad_proof.commitments.g_x1[i] = params.g * Scalar::random(&mut OsRng);
             assert!(!P::verify(&verifier_key, &params, 0, &encoding, &bad_proof));
         }
     }
@@ -561,21 +500,19 @@ mod tests {
         let num_clients = 3;
         let length = 5;
         let (params, _sk, cks) = Agg::setup(num_clients, length, &mut OsRng);
-        let (prover_key, verifier_key) = P::setup();
+        let (prover_key, verifier_key) = P::setup(length, 1);
         let mut rng = rand::thread_rng();
-        let input: Vec<u32> = (0..length)
+        let input: Vec<u64> = (0..length)
             .map(|_| if rng.gen_bool(0.5) { 1 } else { 0 })
             .collect();
-        let r = <G as Group>::Scalar::random(&mut OsRng);
+        let r = Scalar::random(&mut OsRng);
         let encoding = Encoding {
             rand: params.g * r,
             secret: params.pks[0] * r + params.g * cks[0].secret,
             vals: input
                 .iter()
                 .enumerate()
-                .map(|(i, v)| {
-                    params.pks[i + 1] * r + params.g * <G as Group>::Scalar::from(*v as u64)
-                })
+                .map(|(i, v)| params.pks[i + 1] * r + params.g * Scalar::from(*v))
                 .collect(),
         };
         let proof = P::prove(&prover_key, &cks[0], &input, r, &encoding, &mut OsRng);
@@ -594,7 +531,7 @@ mod tests {
         let num_clients = 3;
         let length = 1;
         let (params, _sk, cks) = Agg::setup(num_clients, length, &mut OsRng);
-        let (prover_key, verifier_key) = P::setup();
+        let (prover_key, verifier_key) = P::setup(length, 1);
         let mut rng = rand::thread_rng();
 
         let mut encodings = Vec::with_capacity(num_clients);
@@ -603,7 +540,7 @@ mod tests {
             let input = (0..length)
                 .map(|_| if rng.gen_bool(0.5) { 1 } else { 0 })
                 .collect::<Vec<_>>();
-            let r = <G as Group>::Scalar::random(&mut OsRng);
+            let r = Scalar::random(&mut OsRng);
 
             let encoding = Encoding {
                 rand: params.g * r,
@@ -611,9 +548,7 @@ mod tests {
                 vals: input
                     .iter()
                     .enumerate()
-                    .map(|(i, v)| {
-                        params.pks[i + 1] * r + params.g * <G as Group>::Scalar::from(*v as u64)
-                    })
+                    .map(|(i, v)| params.pks[i + 1] * r + params.g * Scalar::from(*v))
                     .collect(),
             };
             let proof = P::prove(&prover_key, &cks[i], &input, r, &encoding, &mut OsRng);
@@ -638,12 +573,5 @@ mod tests {
             &proofs,
             &mut OsRng
         ));
-
-        //// Verify with correct client index
-        //assert!(verify_proof_binary(&params, 0, &encoding, &proof));
-
-        //// Verify with wrong client index
-        //assert!(!verify_proof_binary(&params, 1, &encoding, &proof));
-        //assert!(!verify_proof_binary(&params, 2, &encoding, &proof));
     }
 }
