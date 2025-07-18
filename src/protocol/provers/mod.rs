@@ -1,13 +1,24 @@
 use crate::protocol::{Scalar, messages::*};
 
+use anyhow::Result;
 use rand_core::{CryptoRng, RngCore};
 use serde::{Serialize, de::DeserializeOwned};
 
 pub mod binary;
 pub use binary::*;
 
-//pub mod range;
-//pub use range::*;
+pub mod range;
+pub use range::*;
+
+// Helper macro for verifying claims - can be used by all provers
+#[macro_export]
+macro_rules! check_claim {
+    ($left:expr, $right:expr, $msg:expr) => {
+        if $left != $right {
+            return Err(anyhow::anyhow!($msg));
+        }
+    };
+}
 
 pub trait Prover: 'static {
     type ProverKey: Send + Sync + Serialize + DeserializeOwned;
@@ -23,22 +34,22 @@ pub trait Prover: 'static {
         r: Scalar,
         encoding: &Encoding,
         rng: &mut R,
-    ) -> Self::Proof;
+    ) -> Result<Self::Proof>;
 
     fn verify(
         vk: &Self::VerifierKey,
         params: &AggParams,
-        proof_index: u32,
+        proof_index: usize,
         encoding: &Encoding,
         proof: &Self::Proof,
-    ) -> bool;
+    ) -> Result<()>;
 
     fn batch_verify<R: RngCore + CryptoRng>(
         vk: &Self::VerifierKey,
         params: &AggParams,
-        proof_indices: &[u32],
+        proof_indices: &[usize],
         encodings: &[Encoding],
         proofs: &[Self::Proof],
         rng: &mut R,
-    ) -> bool;
+    ) -> Result<()>;
 }

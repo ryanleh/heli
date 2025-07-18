@@ -1,15 +1,14 @@
-use super::{G, Scalar, messages::*, provers::Prover};
+use super::{G, Scalar, messages::*};
 use anyhow::{Result, anyhow};
 use group::Group;
 use rand_core::{CryptoRng, RngCore};
-use std::{collections::HashMap, marker::PhantomData};
+use sha3::{Digest, Sha3_512};
+use std::collections::HashMap;
 
-pub struct ElGamal<P: Prover> {
-    _p: PhantomData<P>,
-}
+pub struct ElGamal;
 
-impl<P: Prover> ElGamal<P> {
-    fn compute_dlog(g: &G, challenge: &G, max_dlog: u64) -> Result<u64> {
+impl ElGamal {
+    pub fn compute_dlog(g: &G, challenge: &G, max_dlog: u64) -> Result<u64> {
         if max_dlog > (u64::MAX >> 4) {
             return Err(anyhow!("max_dlog is too large"));
         }
@@ -43,19 +42,19 @@ impl<P: Prover> ElGamal<P> {
         }
         Err(anyhow!("discrete log not found"))
     }
-}
 
-impl<P: Prover> ElGamal<P> {
     pub fn setup<R: RngCore + CryptoRng>(
         num_clients: usize,
         length: usize,
         rng: &mut R,
     ) -> (AggParams, DecKey, Vec<ClientKey>) {
+        // Compute generators
         let g = G::generator();
-        let h = G::random(&mut *rng); // TODO: generate correctly
+        let h = G::from_hash(Sha3_512::new().chain_update(b"h"));
+
+        // Compute keys
         let secret_keys: Vec<_> = (0..=length).map(|_| Scalar::random(&mut *rng)).collect();
         let pks: Vec<_> = secret_keys.iter().map(|ski| g * ski).collect();
-
         let mut client_keys = Vec::with_capacity(num_clients);
         let mut share = Scalar::ZERO;
         for _ in 0..num_clients {
@@ -84,14 +83,9 @@ impl<P: Prover> ElGamal<P> {
 
     pub fn encode<R: RngCore + CryptoRng>(
         key: &ClientKey,
-        prover_key: &P::ProverKey,
         val: &[u64],
         rng: &mut R,
-    ) -> Result<(Encoding, P::Proof)> {
-        debug_assert!(
-            val.iter().all(|v| *v == 0 || *v == 1),
-            "Only binary inputs are currently supported"
-        );
+    ) -> Result<(Encoding, Scalar)> {
         debug_assert_eq!(key.pks.len() - 1, val.len());
         let g = G::generator();
 
@@ -107,56 +101,7 @@ impl<P: Prover> ElGamal<P> {
                 .collect::<Vec<_>>(),
         };
 
-        // Prove ciphertext is well-formed and inputs are binary
-        let proof = P::prove(prover_key, key, val, r, &encoding, rng);
-        Ok((encoding, proof))
-    }
-
-    pub fn verify_encodings(
-        params: &AggParams,
-        verifier_key: &P::VerifierKey,
-        client_indices: Option<&[u32]>,
-        encodings: &[Encoding],
-        proofs: &[P::Proof],
-    ) -> Result<()> {
-        debug_assert_eq!(encodings.len(), proofs.len());
-        let proof_indices = match client_indices {
-            Some(indices) => indices.to_vec(),
-            None => (0..encodings.len() as u32).collect::<Vec<_>>(),
-        };
-        for (i, (enc, pi)) in encodings.iter().zip(proofs.iter()).enumerate() {
-            if !P::verify(verifier_key, params, proof_indices[i], enc, pi) {
-                return Err(anyhow!("Proof verification failed for client {}", i));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn batch_verify_encodings<R: RngCore + CryptoRng>(
-        params: &AggParams,
-        verifier_key: &P::VerifierKey,
-        client_indices: Option<&[u32]>,
-        encodings: &[Encoding],
-        proofs: &[P::Proof],
-        rng: &mut R,
-    ) -> Result<()> {
-        debug_assert_eq!(encodings.len(), proofs.len());
-        let proof_indices = match client_indices {
-            Some(indices) => indices.to_vec(),
-            None => (0..encodings.len() as u32).collect::<Vec<_>>(),
-        };
-
-        if !P::batch_verify(
-            verifier_key,
-            params,
-            proof_indices.as_slice(),
-            encodings,
-            proofs,
-            rng,
-        ) {
-            return Err(anyhow!("Proof verification failed"));
-        }
-        Ok(())
+        Ok((encoding, r))
     }
 
     pub fn aggregate(_params: &AggParams, encodings: &[Encoding]) -> Result<Encoding> {
@@ -195,9 +140,13 @@ impl<P: Prover> ElGamal<P> {
         }
     }
 
-    pub fn post_process(params: &AggParams, partial_outputs: PartialOutput) -> Result<Vec<u64>> {
+    pub fn post_process(
+        params: &AggParams,
+        bitlength: usize,
+        partial_outputs: PartialOutput,
+    ) -> Result<Vec<u64>> {
         let g = G::generator();
-        let max_dlog = Self::num_clients(params) + 1;
+        let max_dlog = (1 << bitlength) * (Self::num_clients(params) + 1);
         let results = partial_outputs
             .vals
             .into_iter()
@@ -218,51 +167,40 @@ impl<P: Prover> ElGamal<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{G, provers::Binary};
     use rand::{Rng, rngs::OsRng};
 
-    type P = Binary;
-    type Agg = ElGamal<P>;
-
     #[test]
-    fn basic_bool_aggregation() {
-        //let num_clients = 1000;
-        let num_clients = 1000;
-        let length = 1;
-        let (params, sk, cks) = Agg::setup(num_clients, length, &mut OsRng);
+    fn basic_enc_correctness() {
+        let num_clients = 5;
+        let length = 8;
+        let bitlength = 8;
+        let (params, sk, cks) = ElGamal::setup(num_clients, length, &mut OsRng);
 
-        // Setup proof system
-        let (prover_key, verifier_key) = P::setup(length, 1);
-
-        // Generate encodings and proofs
-        let mut sums = vec![0; length];
         let mut encodings = Vec::with_capacity(num_clients);
-        let mut proofs = Vec::with_capacity(num_clients);
+        let mut expected_sums = vec![0u64; length];
         for i in 0..num_clients {
-            let mut inputs = Vec::with_capacity(length);
-            for j in 0..length {
-                let val = OsRng.gen_bool(0.5) as u64;
-                sums[j] += val;
-                inputs.push(val);
+            let inputs: Vec<u64> = (0..length)
+                .map(|_| OsRng.gen_range(0..1 << bitlength))
+                .collect();
+
+            // Track expected sums
+            for (j, &val) in inputs.iter().enumerate() {
+                expected_sums[j] += val;
             }
-            let (encoding, proof) = Agg::encode(&cks[i], &prover_key, &inputs, &mut OsRng).unwrap();
+
+            let (encoding, _r) = ElGamal::encode(&cks[i], &inputs, &mut OsRng).unwrap();
             encodings.push(encoding);
-            proofs.push(proof);
         }
 
-        // Check proofs and combine encodings
-        Agg::verify_encodings(&params, &verifier_key, None, &encodings, &proofs).unwrap();
-        let agg = Agg::aggregate(&params, &encodings).unwrap();
-        let partial_results = Agg::decode(&sk, agg).unwrap();
-        let results = Agg::post_process(&params, partial_results).unwrap();
+        let aggregate = ElGamal::aggregate(&params, &encodings).unwrap();
+        let partial_output = ElGamal::decode(&sk, aggregate).unwrap();
+        let result = ElGamal::post_process(&params, bitlength, partial_output).unwrap();
 
-        for (i, result) in results.into_iter().enumerate() {
-            assert_eq!(result, sums[i]);
-        }
+        assert_eq!(result, expected_sums);
     }
 
     #[test]
-    fn test_compute_dlog() {
+    fn compute_dlog() {
         let g = G::generator();
         let n = 1000;
 
@@ -271,59 +209,22 @@ mod tests {
             let scalar = <G as Group>::Scalar::from(*x);
             let output = g * scalar;
 
-            let result = ElGamal::<P>::compute_dlog(&g, &output, n).unwrap();
+            let result = ElGamal::compute_dlog(&g, &output, n).unwrap();
             assert_eq!(result, *x);
         }
 
         // Test value outside range
         let scalar = <G as Group>::Scalar::from(1000u64);
         let output = g * scalar;
-        assert!(ElGamal::<P>::compute_dlog(&g, &output, n).is_err());
+        assert!(ElGamal::compute_dlog(&g, &output, n).is_err());
 
         // Test large value near u32::MAX
         let n_big = u32::MAX as u64;
         let scalar = <G as Group>::Scalar::from(n_big - 1);
         let output = g * scalar;
         assert_eq!(
-            ElGamal::<P>::compute_dlog(&g, &output, n_big).unwrap(),
+            ElGamal::compute_dlog(&g, &output, n_big).unwrap(),
             n_big - 1,
         );
-    }
-
-    #[test]
-    fn measure_sizes() {
-        use bytesize::ByteSize;
-
-        let lengths = vec![1, 5, 10, 25, 50, 75, 100];
-        let bitlength = 1;
-        debug_assert_eq!(bitlength, 1, "Only binary inputs are currently supported");
-
-        println!("\n=== Size Measurements (Serde/Bincode) ===");
-        println!("Format: (input_length) -> encoding_size + proof_size = comm_per_client\n");
-
-        for length in lengths.iter() {
-            let (_params, _sk, cks) = Agg::setup(1, *length, &mut OsRng);
-            let (prover_key, _) = P::setup(*length, bitlength);
-
-            // Generate one encoding and proof for size measurement
-            let input: Vec<u64> = (0..*length)
-                .map(|_| if OsRng.gen_bool(0.5) { 1 } else { 0 })
-                .collect();
-            let (encoding, proof) = Agg::encode(&cks[0], &prover_key, &input, &mut OsRng).unwrap();
-
-            // Serialize using bincode
-            let encoding_size = bincode::serialized_size(&encoding).unwrap() as usize;
-            let proof_size = bincode::serialized_size(&proof).unwrap() as usize;
-            let total_size = encoding_size + proof_size;
-
-            println!(
-                "({:>3}) -> {:>8} + {:>8} = {:>8}",
-                length,
-                ByteSize::b(encoding_size as u64),
-                ByteSize::b(proof_size as u64),
-                ByteSize::b(total_size as u64)
-            );
-        }
-        println!("\n========================\n");
     }
 }

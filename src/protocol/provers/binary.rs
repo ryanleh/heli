@@ -1,4 +1,9 @@
-use crate::protocol::{G, Scalar, messages::*, provers::Prover};
+use crate::{
+    check_claim,
+    protocol::{G, Scalar, messages::*, provers::Prover},
+};
+
+use anyhow::Result;
 use curve25519_dalek::traits::MultiscalarMul;
 use group::Group;
 use rand_core::{CryptoRng, RngCore};
@@ -16,15 +21,6 @@ pub struct BinaryProof {
     pub(crate) challenges_x: Vec<Scalar>,
     /// Responses
     pub(crate) responses: Responses,
-}
-
-// Helper macro for verifying claims
-macro_rules! check_claim {
-    ($left:expr, $right:expr) => {
-        if $left != $right {
-            return false;
-        }
-    };
 }
 
 impl Prover for Binary {
@@ -54,7 +50,7 @@ impl Prover for Binary {
         r: Scalar,
         encoding: &Encoding,
         rng: &mut R,
-    ) -> Self::Proof {
+    ) -> Result<Self::Proof> {
         // TODO: Check that input is well-formed
 
         // Generate commitments (and simulated transcripts) for claim 4
@@ -142,7 +138,7 @@ impl Prover for Binary {
             }
         }
 
-        BinaryProof {
+        Ok(BinaryProof {
             commitments,
             challenges_x,
             responses: Responses {
@@ -151,16 +147,16 @@ impl Prover for Binary {
                 x0: responses_x0,
                 x1: responses_x1,
             },
-        }
+        })
     }
 
     fn verify(
         _vk: &Self::VerifierKey,
         params: &AggParams,
-        client_index: u32,
+        proof_index: usize,
         encoding: &Encoding,
         proof: &Self::Proof,
-    ) -> bool {
+    ) -> Result<()> {
         // Apply fiat-shamir to generate challenge
         //
         // TODO: This doesn't include full transcript atm
@@ -168,26 +164,31 @@ impl Prover for Binary {
             params.g,
             params.h,
             &params.pks,
-            params.client_key_comms[client_index as usize],
+            params.client_key_comms[proof_index],
             encoding,
         );
 
         // Check 1) c_0 = g^r
         check_claim!(
             params.g * proof.responses.r,
-            proof.commitments.g_r + encoding.rand * challenge
+            proof.commitments.g_r + encoding.rand * challenge,
+            "Claim failed: c_0 = g^r"
         );
 
         // Check 2) c_1 = pk_0^r * g^s
         check_claim!(
             params.pks[0] * proof.responses.r + params.g * proof.responses.s,
-            proof.commitments.g_s + encoding.secret * challenge
+            proof.commitments.g_s + encoding.secret * challenge,
+            "Claim failed: c_1 = pk_0^r * g^s"
         );
 
         // Check 3) ck = h^s
+        //
+        // TODO: This is wrong for multi-round
         check_claim!(
             params.h * proof.responses.s,
-            proof.commitments.h_s + params.client_key_comms[client_index as usize] * challenge
+            proof.commitments.h_s + params.client_key_comms[proof_index] * challenge,
+            "Claim failed: ck = h^s"
         );
 
         // Check 4) c_i = DLEQ(c_0, pk_i^r) or DLEQ(c_0, pk_i^r / g) for i > 1
@@ -198,38 +199,42 @@ impl Prover for Binary {
             // X=0, check DLEQ(c_0, pk_i^r)
             check_claim!(
                 params.g * proof.responses.x0[i],
-                proof.commitments.g_x0[i] + encoding.rand * challenge_0
+                proof.commitments.g_x0[i] + encoding.rand * challenge_0,
+                format!("Claim 4 failed: DLEQ(c_0, pk_{}^r) for x=0", i + 1)
             );
             check_claim!(
                 params.pks[i + 1] * proof.responses.x0[i],
-                proof.commitments.pk_x0[i] + encoding.vals[i] * challenge_0
+                proof.commitments.pk_x0[i] + encoding.vals[i] * challenge_0,
+                format!("Claim 4 failed: DLEQ(c_0, pk_{}^r) for x=0", i + 1)
             );
 
             // X=1, check DLEQ(c_0, pk_i^r / g)
             check_claim!(
                 params.g * proof.responses.x1[i],
-                proof.commitments.g_x1[i] + encoding.rand * challenge_1
+                proof.commitments.g_x1[i] + encoding.rand * challenge_1,
+                format!("Claim 4 failed: DLEQ(c_0, pk_{}^r / g) for x=1", i + 1)
             );
             check_claim!(
                 params.pks[i + 1] * proof.responses.x1[i],
-                proof.commitments.pk_x1[i] + (encoding.vals[i] - params.g) * challenge_1
+                proof.commitments.pk_x1[i] + (encoding.vals[i] - params.g) * challenge_1,
+                format!("Claim 4 failed: DLEQ(c_0, pk_{}^r / g) for x=1", i + 1)
             );
         }
-        true
+        Ok(())
     }
 
     fn batch_verify<R: RngCore + CryptoRng>(
         _vk: &Self::VerifierKey,
         params: &AggParams,
-        client_indices: &[u32],
+        proof_indices: &[usize],
         encodings: &[Encoding],
         proofs: &[Self::Proof],
         rng: &mut R,
-    ) -> bool {
+    ) -> Result<()> {
         // We batch by taking a random linear combination over all claims.  Here we
         // generate all the necessary randomnesss upfront.
         let num_proof_claims = 3 + 4 * encodings[0].vals.len();
-        let total_claims = client_indices.len() * num_proof_claims;
+        let total_claims = proof_indices.len() * num_proof_claims;
         let rands: Vec<_> = (0..total_claims)
             .map(|_| Scalar::random(&mut *rng))
             .collect();
@@ -250,8 +255,8 @@ impl Prover for Binary {
         let mut r_idx = 0;
 
         // For each proof, add the relevant terms to the final MSM computation
-        for i in 0..client_indices.len() {
-            let client_idx = client_indices[i];
+        for i in 0..proof_indices.len() {
+            let proof_idx = proof_indices[i];
             let encoding = &encodings[i];
             let proof = &proofs[i];
 
@@ -259,7 +264,7 @@ impl Prover for Binary {
                 params.g,
                 params.h,
                 &params.pks,
-                params.client_key_comms[client_idx as usize],
+                params.client_key_comms[proof_idx],
                 encoding,
             );
 
@@ -281,7 +286,7 @@ impl Prover for Binary {
             add_term(-rands[r_idx], proof.commitments.h_s);
             add_term(
                 -challenge * rands[r_idx],
-                params.client_key_comms[client_idx as usize],
+                params.client_key_comms[proof_idx],
             );
             r_idx += 1;
 
@@ -323,8 +328,11 @@ impl Prover for Binary {
         bases.extend_from_slice(&params.pks);
 
         // If all proofs are valid, the MSM should equal the identity
-        let result = G::multiscalar_mul(&scalars, &bases);
-        result == G::identity()
+        if G::multiscalar_mul(&scalars, &bases) == G::identity() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Batch verification failed"))
+        }
     }
 }
 
@@ -379,7 +387,7 @@ mod tests {
     use rand::{Rng, rngs::OsRng};
 
     type P = Binary;
-    type Agg = ElGamal<P>;
+    type Agg = ElGamal;
 
     #[test]
     fn proof_correctness() {
@@ -402,9 +410,9 @@ mod tests {
                     .map(|(i, v)| params.pks[i + 1] * r + params.g * Scalar::from(*v))
                     .collect(),
             };
-            let proof = P::prove(&prover_key, &cks[0], &input, r, &encoding, &mut OsRng);
+            let proof = P::prove(&prover_key, &cks[0], &input, r, &encoding, &mut OsRng).unwrap();
             assert!(
-                P::verify(&verifier_key, &params, 0, &encoding, &proof),
+                P::verify(&verifier_key, &params, 0, &encoding, &proof).is_ok(),
                 "Proof verification failed for input {:?}",
                 input
             );
@@ -431,66 +439,66 @@ mod tests {
                 .map(|(i, v)| params.pks[i + 1] * r + params.g * Scalar::from(*v))
                 .collect(),
         };
-        let proof = P::prove(&prover_key, &cks[0], &input, r, &encoding, &mut OsRng);
+        let proof = P::prove(&prover_key, &cks[0], &input, r, &encoding, &mut OsRng).unwrap();
 
         // Verify the original proof is valid
-        assert!(P::verify(&verifier_key, &params, 0, &encoding, &proof));
+        assert!(P::verify(&verifier_key, &params, 0, &encoding, &proof).is_ok());
 
         // Try tampering each location of the proof and assert that it is rejected
         let mut bad_encoding = encoding.clone();
         bad_encoding.rand = params.g * Scalar::random(&mut OsRng);
-        assert!(!P::verify(&verifier_key, &params, 0, &bad_encoding, &proof));
+        assert!(P::verify(&verifier_key, &params, 0, &bad_encoding, &proof).is_err());
 
         let mut bad_encoding = encoding.clone();
         bad_encoding.secret = params.g * Scalar::random(&mut OsRng);
-        assert!(!P::verify(&verifier_key, &params, 0, &bad_encoding, &proof));
+        assert!(P::verify(&verifier_key, &params, 0, &bad_encoding, &proof).is_err());
 
         for i in 0..encoding.vals.len() {
             let mut bad_encoding = encoding.clone();
             bad_encoding.vals[i] = params.g * Scalar::random(&mut OsRng);
-            assert!(!P::verify(&verifier_key, &params, 0, &bad_encoding, &proof));
+            assert!(P::verify(&verifier_key, &params, 0, &bad_encoding, &proof).is_err());
         }
 
         let mut bad_proof = proof.clone();
         bad_proof.responses.r = Scalar::random(&mut OsRng);
-        assert!(!P::verify(&verifier_key, &params, 0, &encoding, &bad_proof));
+        assert!(P::verify(&verifier_key, &params, 0, &encoding, &bad_proof).is_err());
 
         let mut bad_proof = proof.clone();
         bad_proof.responses.s = Scalar::random(&mut OsRng);
-        assert!(!P::verify(&verifier_key, &params, 0, &encoding, &bad_proof));
+        assert!(P::verify(&verifier_key, &params, 0, &encoding, &bad_proof).is_err());
 
         for i in 0..proof.responses.x0.len() {
             let mut bad_proof = proof.clone();
             bad_proof.responses.x0[i] = Scalar::random(&mut OsRng);
-            assert!(!P::verify(&verifier_key, &params, 0, &encoding, &bad_proof));
+            assert!(P::verify(&verifier_key, &params, 0, &encoding, &bad_proof).is_err());
         }
 
         for i in 0..proof.responses.x1.len() {
             let mut bad_proof = proof.clone();
             bad_proof.responses.x1[i] = Scalar::random(&mut OsRng);
-            assert!(!P::verify(&verifier_key, &params, 0, &encoding, &bad_proof));
+            assert!(P::verify(&verifier_key, &params, 0, &encoding, &bad_proof).is_err());
         }
 
         for i in 0..proof.challenges_x.len() {
             let mut bad_proof = proof.clone();
             bad_proof.challenges_x[i] = Scalar::random(&mut OsRng);
-            assert!(!P::verify(&verifier_key, &params, 0, &encoding, &bad_proof));
+            assert!(P::verify(&verifier_key, &params, 0, &encoding, &bad_proof).is_err());
         }
 
         let mut bad_proof = proof.clone();
         bad_proof.commitments.g_r = params.g * Scalar::random(&mut OsRng);
-        assert!(!P::verify(&verifier_key, &params, 0, &encoding, &bad_proof));
+        assert!(P::verify(&verifier_key, &params, 0, &encoding, &bad_proof).is_err());
 
         for i in 0..proof.commitments.g_x0.len() {
             let mut bad_proof = proof.clone();
             bad_proof.commitments.g_x0[i] = params.g * Scalar::random(&mut OsRng);
-            assert!(!P::verify(&verifier_key, &params, 0, &encoding, &bad_proof));
+            assert!(P::verify(&verifier_key, &params, 0, &encoding, &bad_proof).is_err());
         }
 
         for i in 0..proof.commitments.g_x1.len() {
             let mut bad_proof = proof.clone();
             bad_proof.commitments.g_x1[i] = params.g * Scalar::random(&mut OsRng);
-            assert!(!P::verify(&verifier_key, &params, 0, &encoding, &bad_proof));
+            assert!(P::verify(&verifier_key, &params, 0, &encoding, &bad_proof).is_err());
         }
     }
 
@@ -515,14 +523,14 @@ mod tests {
                 .map(|(i, v)| params.pks[i + 1] * r + params.g * Scalar::from(*v))
                 .collect(),
         };
-        let proof = P::prove(&prover_key, &cks[0], &input, r, &encoding, &mut OsRng);
+        let proof = P::prove(&prover_key, &cks[0], &input, r, &encoding, &mut OsRng).unwrap();
 
         // Verify with correct client index
-        assert!(P::verify(&verifier_key, &params, 0, &encoding, &proof));
+        assert!(P::verify(&verifier_key, &params, 0, &encoding, &proof).is_ok());
 
         // Verify with wrong client index
-        assert!(!P::verify(&verifier_key, &params, 1, &encoding, &proof));
-        assert!(!P::verify(&verifier_key, &params, 2, &encoding, &proof));
+        assert!(P::verify(&verifier_key, &params, 1, &encoding, &proof).is_err());
+        assert!(P::verify(&verifier_key, &params, 2, &encoding, &proof).is_err());
     }
 
     /// Tests batch verification
@@ -551,7 +559,7 @@ mod tests {
                     .map(|(i, v)| params.pks[i + 1] * r + params.g * Scalar::from(*v))
                     .collect(),
             };
-            let proof = P::prove(&prover_key, &cks[i], &input, r, &encoding, &mut OsRng);
+            let proof = P::prove(&prover_key, &cks[i], &input, r, &encoding, &mut OsRng).unwrap();
             encodings.push(encoding);
             proofs.push(proof);
         }
@@ -559,19 +567,22 @@ mod tests {
         // First verify each proof individually
         for i in 0..num_clients {
             assert!(
-                P::verify(&verifier_key, &params, i as u32, &encodings[i], &proofs[i]),
+                P::verify(&verifier_key, &params, i, &encodings[i], &proofs[i]).is_ok(),
                 "Individual proof verification failed for client {}",
                 i
             );
         }
 
-        assert!(P::batch_verify(
-            &verifier_key,
-            &params,
-            &[0, 1, 2],
-            &encodings,
-            &proofs,
-            &mut OsRng
-        ));
+        assert!(
+            P::batch_verify(
+                &verifier_key,
+                &params,
+                &[0, 1, 2],
+                &encodings,
+                &proofs,
+                &mut OsRng
+            )
+            .is_ok()
+        );
     }
 }

@@ -5,40 +5,41 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct AggParams {
     // Generators
-    pub(crate) g: G,
-    pub(crate) h: G,
+    pub g: G,
+    pub h: G,
     /// Public keys for each ciphertext slot.
-    pub(crate) pks: Vec<G>,
+    pub pks: Vec<G>,
     /// Commitments to client secret key shares.
-    pub(crate) client_key_comms: Vec<G>,
+    pub client_key_comms: Vec<G>,
 }
 
 /// Secret key material given to the client.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct ClientKey {
     /// Generators
-    pub(crate) g: G,
-    pub(crate) h: G,
+    pub g: G,
+    pub h: G,
     /// Public keys for each ciphertext slot.
-    pub(crate) pks: Vec<G>,
+    pub pks: Vec<G>,
     /// Client's secret key share.
-    pub(crate) secret: Scalar,
+    pub secret: Scalar,
 }
 
+#[derive(Clone)]
 pub struct DecKey {
-    pub(crate) secret_keys: Vec<Scalar>,
-    pub(crate) share: Scalar,
+    pub secret_keys: Vec<Scalar>,
+    pub share: Scalar,
 }
 
 /// Encoding of a client's input (an ElGamal ciphertext).
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Encoding {
     /// g^r
-    pub(crate) rand: G,
+    pub rand: G,
     /// pk_0^r * g^s
-    pub(crate) secret: G,
+    pub secret: G,
     /// pk_i^r * g^x_i
-    pub(crate) vals: Vec<G>,
+    pub vals: Vec<G>,
 }
 
 /// Result of decrypting the aggregate encoding. For some schemes (e.g., DiscreteLog),
@@ -46,5 +47,5 @@ pub struct Encoding {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct PartialOutput {
     /// Aggregated values.
-    pub(crate) vals: Vec<G>,
+    pub vals: Vec<G>,
 }
