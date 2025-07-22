@@ -47,6 +47,10 @@ harness = false
 name = "provers"
 harness = false
 
+[[bin]]
+name = "verify-bench"
+path = "benches/bin/verify_bench.rs"
+
 #[[bin]]
 #name = "decryptor"
 #path = "experiments/bin/decryptor.rs"
