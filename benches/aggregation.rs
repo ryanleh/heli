@@ -57,14 +57,14 @@ fn bench_aggregate(c: &mut Criterion, num_clients: usize, length: usize) {
     group.finish();
 }
 
-fn bench_decode(c: &mut Criterion, num_clients: usize, length: usize) {
+fn bench_decode(c: &mut Criterion, length: usize, bitwidth: usize) {
     let mut group = c.benchmark_group("decode");
     group.warm_up_time(std::time::Duration::from_millis(100));
     group.measurement_time(std::time::Duration::from_millis(500));
 
     // Setup
-    let input = random_inputs(length, 1);
-    let setup_data = get_setup_data(num_clients, length, 1);
+    let input = random_inputs(length, bitwidth);
+    let setup_data = get_setup_data(2, length, bitwidth); // num clients doesn't matter
     let encodings: Vec<_> = setup_data
         .cks
         .iter()
@@ -74,8 +74,8 @@ fn bench_decode(c: &mut Criterion, num_clients: usize, length: usize) {
 
     // Benchmark
     group.bench_with_input(
-        BenchmarkId::from_parameter(format!("{num_clients}_clients_{length}_inputs")),
-        &(num_clients, length),
+        BenchmarkId::from_parameter(format!("{length}_inputs_{bitwidth}_bits")),
+        &(length, bitwidth),
         |b, _| {
             b.iter(|| {
                 black_box(ElGamal::decode(&setup_data.sk, aggregate.clone()).unwrap());
@@ -137,11 +137,11 @@ fn aggregate(c: &mut Criterion) {
 }
 
 fn decode(c: &mut Criterion) {
-    // Parameters (num_clients, length)
-    bench_decode(c, 100, 1);
-    bench_decode(c, 1000, 1);
-    bench_decode(c, 100, 8);
-    bench_decode(c, 1000, 8);
+    // Parameters (length, bitwidth)
+    bench_decode(c, 1, 1);
+    bench_decode(c, 1, 8);
+    bench_decode(c, 8, 1);
+    bench_decode(c, 8, 8);
 }
 
 fn post_process(c: &mut Criterion) {
