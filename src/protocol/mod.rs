@@ -91,49 +91,5 @@ mod tests {
         }
     }
 
-    fn measure_sizes<P: Prover>(length: usize, bitlength: usize) {
-        use bytesize::ByteSize;
 
-        let (_params, _sk, cks) = ElGamal::setup(1, length, &mut OsRng);
-        let (prover_key, _) = P::setup(length, bitlength);
-
-        let (encoding, r) =
-            ElGamal::encode(&cks[0], &random_input(length, bitlength), &mut OsRng).unwrap();
-        let proof = P::prove(
-            &prover_key,
-            &cks[0],
-            &random_input(length, bitlength),
-            r,
-            &encoding,
-            &mut OsRng,
-        )
-        .unwrap();
-
-        // Serialize using bincode
-        let encoding_size = bincode::serialized_size(&encoding).unwrap() as usize;
-        let proof_size = bincode::serialized_size(&proof).unwrap() as usize;
-        let total_size = encoding_size + proof_size;
-
-        println!(
-            "({:>3}, {:>3}) -> {:>8} + {:>8} = {:>8}",
-            length,
-            bitlength,
-            ByteSize::b(encoding_size as u64),
-            ByteSize::b(proof_size as u64),
-            ByteSize::b(total_size as u64)
-        );
-        println!("\n========================\n");
-    }
-
-    #[test]
-    fn print_sizes() {
-        println!("\n=== Size Measurements (Serde/Bincode) ===");
-        println!(
-            "Format: (input_length, bitlength) -> encoding_size + proof_size = comm_per_client\n"
-        );
-        measure_sizes::<Binary>(1, 1);
-        measure_sizes::<Range>(1, 8);
-        measure_sizes::<Binary>(8, 1);
-        measure_sizes::<Range>(8, 8);
-    }
 }

@@ -51,6 +51,10 @@ harness = false
 name = "verify-bench"
 path = "benches/bin/verify_bench.rs"
 
+[[bin]]
+name = "size-bench"
+path = "benches/bin/size_bench.rs"
+
 #[[bin]]
 #name = "decryptor"
 #path = "experiments/bin/decryptor.rs"
