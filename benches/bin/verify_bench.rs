@@ -85,11 +85,11 @@ impl TimeStats {
 }
 
 /// Run batch proof verification benchmarks for different client counts
-fn bench_verification<P: Prover>(config: &Config) -> Vec<(usize, TimeStats)> {
+fn bench_verification<P: Prover>(config: &Config, proof_system_name: &str) -> Vec<(usize, TimeStats)> {
     // Find the maximum number of clients to set up for
     let max_clients = config.clients.iter().max().unwrap_or(&100);
     
-    println!("Setting up verification benchmark for up to {} clients...", max_clients);
+    println!("Setting up verification benchmark for up to {} clients using {} proof system...", max_clients, proof_system_name);
     
     // Setup - use the same inputs for all benchmarks
     let input: Vec<u64> = (0..config.length)
@@ -170,17 +170,32 @@ fn main() {
     
     println!("Running proof verification benchmark...");
 
-    let results = if config.bitlength == 1 {
-        bench_verification::<Binary>(&config)
+    if config.bitlength == 1 {
+        // For bitlength 1, run both Binary and Range proof systems
+        println!("\n{}", "=".repeat(80));
+        println!("BINARY PROOF SYSTEM");
+        println!("{}", "=".repeat(80));
+        
+        let binary_results = bench_verification::<Binary>(&config, "Binary");
+        print_results(&binary_results, &config, "Binary");
+        
+        println!("\n{}", "=".repeat(80));
+        println!("RANGE PROOF SYSTEM");
+        println!("{}", "=".repeat(80));
+        
+        let range_results = bench_verification::<Range>(&config, "Range");
+        print_results(&range_results, &config, "Range");
     } else {
-        bench_verification::<Range>(&config)
-    };
-
-    println!("\n{}", "=".repeat(80));
-    println!("PROOF VERIFICATION BENCHMARK");
-    println!("{}", "=".repeat(80));
+        let results = bench_verification::<Range>(&config, "Range");
+        print_results(&results, &config, "Range");
+    }
     
+    println!("\n{}", "=".repeat(80));
+}
+
+fn print_results(results: &[(usize, TimeStats)], config: &Config, proof_system_name: &str) {
     println!("Configuration:");
+    println!("  Proof System: {}", proof_system_name);
     println!("  Client Counts: {:?}", config.clients);
     println!("  Input Length: {}", config.length);
     println!("  Bitlength: {}", config.bitlength);
@@ -204,7 +219,7 @@ fn main() {
     };
     
     for (client_count, stats) in results {
-        let per_user = stats.mean / client_count as u32;
+        let per_user = stats.mean / *client_count as u32;
         
         // Calculate speedup (baseline / current)
         let relative = if baseline_per_user > Duration::ZERO {
@@ -225,6 +240,4 @@ fn main() {
             format_duration(stats.std_dev)
         );
     }
-    
-    println!("\n{}", "=".repeat(80));
 } 

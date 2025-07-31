@@ -26,7 +26,7 @@ fn random_input(length: usize, bitlength: usize) -> Vec<u64> {
         .collect()
 }
 
-fn measure_sizes<P: Prover>(length: usize, bitlength: usize) {
+fn measure_sizes<P: Prover>(length: usize, bitlength: usize, proof_system_name: &str) {
     let (_params, _sk, cks) = ElGamal::setup(1, length, &mut OsRng);
     let (prover_key, _) = P::setup(length, bitlength);
 
@@ -48,9 +48,10 @@ fn measure_sizes<P: Prover>(length: usize, bitlength: usize) {
     let total_size = encoding_size + proof_size;
 
     println!(
-        "({:>3}, {:>3}) -> {:>8} + {:>8} = {:>8}",
+        "({:>3}, {:>3}) [{}] -> {:>8} + {:>8} = {:>8}",
         length,
         bitlength,
+        proof_system_name,
         ByteSize::b(encoding_size as u64),
         ByteSize::b(proof_size as u64),
         ByteSize::b(total_size as u64)
@@ -67,15 +68,17 @@ fn main() {
     
     println!("\n=== Size Measurements (Serde/Bincode) ===");
     println!(
-        "Format: (input_length, bitlength) -> encoding_size + proof_size = comm_per_client\n"
+        "Format: (input_length, bitlength) [proof_system] -> encoding_size + proof_size = total_size\n"
     );
     
     for &length in &config.length {
         for &bitlength in &config.bitlength {
             if bitlength == 1 {
-                measure_sizes::<Binary>(length, bitlength);
+                // For bitlength 1, run both Binary and Range proof systems
+                measure_sizes::<Binary>(length, bitlength, "Binary");
+                measure_sizes::<Range>(length, bitlength, "Range");
             } else {
-                measure_sizes::<Range>(length, bitlength);
+                measure_sizes::<Range>(length, bitlength, "Range");
             }
         }
     }
