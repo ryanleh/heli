@@ -24,6 +24,8 @@ subtle = "2.6.1"
 tari_bulletproofs_plus = "0.4.1"
 
 [dev-dependencies]
+aes = "0.8.4"
+generic-array = "0.14"
 rand = "0.8.5"
 criterion = "0.6"
 itertools = "0.14.0"
@@ -41,6 +43,10 @@ debug = true
 
 [[bench]]
 name = "aggregation"
+harness = false
+
+[[bench]]
+name = "dropout"
 harness = false
 
 [[bench]]

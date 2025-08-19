@@ -65,15 +65,14 @@ fn bench_encode<P: Prover>(c: &mut Criterion, length: usize, bitlength: usize) {
     group.finish();
 }
 
-fn bench_aggregate(c: &mut Criterion, num_clients: usize, length: usize) {
+fn bench_aggregate(c: &mut Criterion, num_clients: usize, length: usize, bitwidth: usize) {
     let mut group = c.benchmark_group("aggregate");
     group.warm_up_time(std::time::Duration::from_millis(100));
     group.measurement_time(std::time::Duration::from_millis(500));
-    group.sample_size(10);
 
     // Setup
-    let input = random_inputs(length, 1);
-    let setup_data = get_setup_data(num_clients, length, 1);
+    let input = random_inputs(length, bitwidth);
+    let setup_data = get_setup_data(num_clients, length, bitwidth);
 
     // We can use the same input for all clients since the encryption is randomized
     let encodings: Vec<_> = setup_data
@@ -84,7 +83,7 @@ fn bench_aggregate(c: &mut Criterion, num_clients: usize, length: usize) {
 
     // Benchmark
     group.bench_with_input(
-        BenchmarkId::from_parameter(format!("{num_clients}_clients_{length}_inputs")),
+        BenchmarkId::from_parameter(format!("{num_clients}_clients_{length}_inputs_{bitwidth}_bits")),
         &(num_clients, length),
         |b, _| {
             b.iter(|| {
@@ -235,19 +234,25 @@ fn client_encoding(c: &mut Criterion) {
 }
 
 fn aggregate(c: &mut Criterion) {
-    // Parameters (num_clients, length)
-    bench_aggregate(c, 100, 1);
-    bench_aggregate(c, 1000, 1);
-    bench_aggregate(c, 100, 8);
-    bench_aggregate(c, 1000, 8);
+    // Parameters (num_clients, length, bitwidth)
+    //bench_aggregate(c, 1, 1, 1);
+    //bench_aggregate(c, 1, 8, 1);
+    //bench_aggregate(c, 1, 16, 1);
+    //bench_aggregate(c, 1, 1, 8);
+    //bench_aggregate(c, 1, 8, 8);
+    //bench_aggregate(c, 1, 16, 8);
+    bench_aggregate(c, 1, 16, 16);
 }
 
 fn decode(c: &mut Criterion) {
     // Parameters (length, bitwidth)
-    bench_decode(c, 1, 1);
-    bench_decode(c, 1, 8);
-    bench_decode(c, 8, 1);
-    bench_decode(c, 8, 8);
+    let bitwidths = vec![1];
+    let lengths = vec![32, 64];
+    for b in bitwidths.iter() {
+        for l in lengths.iter() {
+            bench_decode(c, *l, *b);
+        }
+    }
 }
 
 fn post_process(c: &mut Criterion) {
