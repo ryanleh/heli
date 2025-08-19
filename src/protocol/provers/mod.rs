@@ -36,6 +36,18 @@ pub trait Prover: 'static {
         rng: &mut R,
     ) -> Result<Self::Proof>;
 
+    /// Temporary trait function, move somewhere else
+    /// 
+    /// prove _without_ verification tag, just input claims
+    fn prove_untagged<R: RngCore + CryptoRng>(
+        pk: &Self::ProverKey,
+        ck: &ClientKey,
+        input: &[u64],
+        r: Scalar,
+        encoding: &Encoding,
+        rng: &mut R,
+    ) -> Result<Self::Proof>;
+
     fn verify(
         vk: &Self::VerifierKey,
         params: &AggParams,
@@ -52,4 +64,17 @@ pub trait Prover: 'static {
         proofs: &[Self::Proof],
         rng: &mut R,
     ) -> Result<()>;
+
+    /// Temporary trait function, move somewhere else
+    /// 
+    /// batch_verify _without_ verification tag, just input claims
+    fn batch_verify_untagged<R: RngCore + CryptoRng>(
+        vk: &Self::VerifierKey,
+        params: &AggParams,
+        proof_indices: &[usize],
+        encodings: &[Encoding],
+        proofs: &[Self::Proof],
+        rng: &mut R,
+    ) -> Result<()>;
+    
 }

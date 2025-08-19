@@ -54,7 +54,7 @@ fn measure_sizes<P: Prover>(length: usize, bitlength: usize, proof_system_name: 
         proof_system_name,
         ByteSize::b(encoding_size as u64),
         ByteSize::b(proof_size as u64),
-        ByteSize::b(total_size as u64)
+        format!("{:.2}KB", total_size as f64 / 1024.0)
     );
 }
 

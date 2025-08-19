@@ -150,6 +150,110 @@ impl Prover for Binary {
         })
     }
 
+    fn prove_untagged<R: RngCore + CryptoRng>(
+        _pk: &Self::ProverKey,
+        ck: &ClientKey,
+        input: &[u64],
+        r: Scalar,
+        encoding: &Encoding,
+        rng: &mut R,
+    ) -> Result<Self::Proof> {
+        // TODO: Check that input is well-formed
+
+        // Generate commitments (and simulated transcripts) for claim 4
+        let mut r_x_rand = Vec::with_capacity(input.len()); // Randomness for real branch
+        let mut comm_g_x0 = Vec::with_capacity(input.len());
+        let mut comm_pk_x0 = Vec::with_capacity(input.len());
+        let mut comm_g_x1 = Vec::with_capacity(input.len());
+        let mut comm_pk_x1 = Vec::with_capacity(input.len());
+        let mut sim_challenges = Vec::with_capacity(input.len());
+        let mut sim_responses = Vec::with_capacity(input.len());
+
+        for i in 0..input.len() {
+            // Generate simulated transcripts for false paths in claim 4
+            let challenge = Scalar::random(&mut *rng);
+            let response = Scalar::random(&mut *rng);
+            sim_challenges.push(challenge);
+            sim_responses.push(response);
+
+            // Generate commitments
+            let rand = Scalar::random(&mut *rng);
+            r_x_rand.push(rand);
+            match input[i] {
+                0 => {
+                    // Real
+                    comm_g_x0.push(ck.g * rand);
+                    comm_pk_x0.push(ck.pks[i + 1] * rand);
+
+                    // Simulated
+                    comm_g_x1.push(ck.g * response - encoding.rand * challenge);
+                    comm_pk_x1
+                        .push(ck.pks[i + 1] * response - (encoding.vals[i] - ck.g) * challenge);
+                }
+                1 => {
+                    // Simulated
+                    comm_g_x0.push(ck.g * response - encoding.rand * challenge);
+                    comm_pk_x0.push(ck.pks[i + 1] * response - encoding.vals[i] * challenge);
+
+                    // Real
+                    comm_g_x1.push(ck.g * rand);
+                    comm_pk_x1.push(ck.pks[i + 1] * rand);
+                }
+                _ => panic!("Input should be 0 or 1"),
+            }
+        }
+
+        // Generate commitments for claims 1-3
+        let r_rand = Scalar::random(&mut *rng);
+        let comm_g_r_rand = ck.g * r_rand;
+
+        // Apply fiat-shamir to non-interactively generate challenge
+        let commitments = Commiments {
+            g_r: comm_g_r_rand,
+            g_s: G::identity(), // TODO: hacky
+            h_s: G::identity(),
+            g_x0: comm_g_x0,
+            pk_x0: comm_pk_x0,
+            g_x1: comm_g_x1,
+            pk_x1: comm_pk_x1,
+        };
+        let challenge = commitments.get_challenge(ck.g, ck.h, &ck.pks, ck.h * ck.secret, encoding);
+
+        // Generate responses for claim 4
+        let mut challenges_x = Vec::with_capacity(input.len());
+        let mut responses_x0 = Vec::with_capacity(input.len());
+        let mut responses_x1 = Vec::with_capacity(input.len());
+        for i in 0..input.len() {
+            let challenge_real = challenge - sim_challenges[i];
+            // Always send the challenge for the zero branch
+            match input[i] {
+                0 => {
+                    challenges_x.push(challenge_real);
+                    responses_x0.push(r_x_rand[i] + challenge_real * r);
+                    responses_x1.push(sim_responses[i]);
+                }
+                1 => {
+                    // Always send the challenge for the zero branch
+                    challenges_x.push(sim_challenges[i]);
+                    responses_x0.push(sim_responses[i]);
+                    responses_x1.push(r_x_rand[i] + challenge_real * r);
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        Ok(BinaryProof {
+            commitments,
+            challenges_x,
+            responses: Responses {
+                r: r_rand + challenge * r,
+                s: Scalar::ZERO,
+                x0: responses_x0,
+                x1: responses_x1,
+            },
+        })
+    }
+
     fn verify(
         _vk: &Self::VerifierKey,
         params: &AggParams,
@@ -222,6 +326,8 @@ impl Prover for Binary {
         }
         Ok(())
     }
+
+
 
     fn batch_verify<R: RngCore + CryptoRng>(
         _vk: &Self::VerifierKey,
@@ -334,7 +440,101 @@ impl Prover for Binary {
             Err(anyhow::anyhow!("Batch verification failed"))
         }
     }
+
+    fn batch_verify_untagged<R: RngCore + CryptoRng>(
+        _vk: &Self::VerifierKey,
+        params: &AggParams,
+        proof_indices: &[usize],
+        encodings: &[Encoding],
+        proofs: &[Self::Proof],
+        rng: &mut R,
+    ) -> Result<()> {
+        // We batch by taking a random linear combination over all claims.  Here we
+        // generate all the necessary randomnesss upfront.
+        let num_proof_claims = 1 + 4 * encodings[0].vals.len();
+        let total_claims = proof_indices.len() * num_proof_claims;
+        let rands: Vec<_> = (0..total_claims)
+            .map(|_| Scalar::random(&mut *rng))
+            .collect();
+
+        // Many terms share the g, h, and pk bases
+        let mut g_scalar = Scalar::ZERO;
+        let mut pk_scalars = vec![Scalar::ZERO; params.pks.len()];
+        let mut scalars = Vec::new();
+        let mut bases = Vec::new();
+
+        // Helper closure to add terms to the MSM vectors
+        let mut add_term = |scalar: Scalar, base: G| {
+            scalars.push(scalar);
+            bases.push(base);
+        };
+
+        let mut r_idx = 0;
+
+        // For each proof, add the relevant terms to the final MSM computation
+        for i in 0..proof_indices.len() {
+            let proof_idx = proof_indices[i];
+            let encoding = &encodings[i];
+            let proof = &proofs[i];
+
+            let challenge = proof.commitments.get_challenge(
+                params.g,
+                params.h,
+                &params.pks,
+                params.client_key_comms[proof_idx],
+                encoding,
+            );
+
+            // Check 1) c_0 = g^r
+            g_scalar += proof.responses.r * rands[r_idx];
+            add_term(-rands[r_idx], proof.commitments.g_r);
+            add_term(-challenge * rands[r_idx], encoding.rand);
+            r_idx += 1;
+
+            // Check 4) DLEQ claims for each input
+            for j in 0..encoding.vals.len() {
+                let challenge_0 = proof.challenges_x[j];
+                let challenge_1 = challenge - challenge_0;
+
+                // X=0, check DLEQ(c_0, pk_i^r)
+                g_scalar += proof.responses.x0[j] * rands[r_idx];
+                add_term(-rands[r_idx], proof.commitments.g_x0[j]);
+                add_term(-challenge_0 * rands[r_idx], encoding.rand);
+                r_idx += 1;
+
+                pk_scalars[j + 1] += proof.responses.x0[j] * rands[r_idx];
+                add_term(-rands[r_idx], proof.commitments.pk_x0[j]);
+                add_term(-challenge_0 * rands[r_idx], encoding.vals[j]);
+                r_idx += 1;
+
+                // X=1, check DLEQ(c_0, pk_i^r / g)
+                g_scalar += proof.responses.x1[j] * rands[r_idx];
+                add_term(-rands[r_idx], proof.commitments.g_x1[j]);
+                add_term(-challenge_1 * rands[r_idx], encoding.rand);
+                r_idx += 1;
+
+                pk_scalars[j + 1] += proof.responses.x1[j] * rands[r_idx];
+                add_term(-rands[r_idx], proof.commitments.pk_x1[j]);
+                add_term(-challenge_1 * rands[r_idx], encoding.vals[j] - params.g);
+                r_idx += 1;
+            }
+        }
+
+        // Add the shared basis terms
+        scalars.push(g_scalar);
+        scalars.extend(pk_scalars);
+        bases.push(params.g);
+        bases.extend_from_slice(&params.pks);
+
+        // If all proofs are valid, the MSM should equal the identity
+        if G::multiscalar_mul(&scalars, &bases) == G::identity() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Batch verification failed"))
+        }
+    }
 }
+
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Commiments {
@@ -575,6 +775,50 @@ mod tests {
 
         assert!(
             P::batch_verify(
+                &verifier_key,
+                &params,
+                &[0, 1, 2],
+                &encodings,
+                &proofs,
+                &mut OsRng
+            )
+            .is_ok()
+        );
+    }
+
+    /// Tests basic untagged proof correctness with batch verification
+    #[test]
+    fn untagged_proof_correctness() {
+        let num_clients = 3;
+        let length = 2;
+        let (params, _sk, cks) = Agg::setup(num_clients, length, &mut OsRng);
+        let (prover_key, verifier_key) = P::setup(length, 1);
+        let mut rng = rand::thread_rng();
+
+        let mut encodings = Vec::with_capacity(num_clients);
+        let mut proofs = Vec::with_capacity(num_clients);
+        for i in 0..num_clients {
+            let input = (0..length)
+                .map(|_| if rng.gen_bool(0.5) { 1 } else { 0 })
+                .collect::<Vec<_>>();
+            let r = Scalar::random(&mut OsRng);
+
+            let encoding = Encoding {
+                rand: params.g * r,
+                secret: params.pks[0] * r + params.g * cks[i].secret,
+                vals: input
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| params.pks[i + 1] * r + params.g * Scalar::from(*v))
+                    .collect(),
+            };
+            let proof = P::prove_untagged(&prover_key, &cks[i], &input, r, &encoding, &mut OsRng).unwrap();
+            encodings.push(encoding);
+            proofs.push(proof);
+        }
+
+        assert!(
+            P::batch_verify_untagged(
                 &verifier_key,
                 &params,
                 &[0, 1, 2],

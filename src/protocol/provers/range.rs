@@ -105,6 +105,8 @@ impl Prover for Range {
         (bitlength, bitlength)
     }
 
+
+
     fn prove<R: RngCore + CryptoRng>(
         pk: &Self::ProverKey, // bitlength
         ck: &ClientKey,
@@ -237,6 +239,8 @@ impl Prover for Range {
         Ok(())
     }
 
+
+
     fn batch_verify<R: RngCore + CryptoRng>(
         vk: &Self::VerifierKey,
         params: &AggParams,
@@ -319,6 +323,165 @@ impl Prover for Range {
                 -challenge * rands[r_idx],
                 params.client_key_comms[*proof_idx],
             );
+            r_idx += 1;
+
+            // Check 4) Pederson commitments are consistent with the ciphertext
+            for i in 0..encoding.vals.len() {
+                g_scalar += proof.xs[i] * rands[r_idx];
+                h_scalar += proof.bp_rs[i] * rands[r_idx];
+                add_term(-rands[r_idx], proof.comm_bp_x[i]);
+                add_term(-challenge * rands[r_idx], proof.range_comms[i]);
+                r_idx += 1;
+
+                g_scalar += proof.xs[i] * rands[r_idx];
+                pk_scalars[i + 1] += proof.r * rands[r_idx];
+                add_term(-rands[r_idx], proof.comm_x[i]);
+                add_term(-challenge * rands[r_idx], encoding.vals[i]);
+                r_idx += 1;
+            }
+        }
+
+        // Add the shared basis terms
+        scalars.push(g_scalar);
+        scalars.push(h_scalar);
+        scalars.extend(pk_scalars);
+        bases.push(params.g);
+        bases.push(params.h);
+        bases.extend_from_slice(&params.pks);
+
+        // If all proofs are valid, the MSM should equal the identity
+        if G::multiscalar_mul(&scalars, &bases) == G::identity() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "Batch verification failed (ciphertext consistency)"
+            ))
+        }
+    }
+
+    fn prove_untagged<R: RngCore + CryptoRng>(
+        pk: &Self::ProverKey, // bitlength
+        ck: &ClientKey,
+        input: &[u64],
+        r: Scalar,
+        encoding: &Encoding,
+        rng: &mut R,
+    ) -> Result<Self::Proof> {
+        // First, generate the bulletproof proof
+        let (range_comms, range_rands, range_proof) = Self::prove_bulletproof(*pk, ck, input, rng)?;
+
+        // Generate commitments for claim 1 only (skip claims 2-3 related to secret key)
+        let r_rand = Scalar::random(&mut *rng);
+        let comm_r = ck.g * r_rand;
+
+        // Generate commitments to bind the ciphertext to the bulletproof proof
+        let x_rands = vec![Scalar::random(&mut *rng); input.len()];
+        let bp_r_rands = vec![Scalar::random(&mut *rng); input.len()];
+        let mut comm_x = Vec::with_capacity(input.len());
+        let mut comm_bp_x = Vec::with_capacity(input.len());
+        for i in 0..input.len() {
+            comm_x.push(ck.pks[i + 1] * r_rand + ck.g * x_rands[i]);
+            comm_bp_x.push(ck.h * bp_r_rands[i] + ck.g * x_rands[i]);
+        }
+
+        // Apply fiat-shamir to non-interactively generate challenge
+        //
+        // TODO: Actually include the full transcript here
+        let hasher = Sha3_512::new()
+            .chain_update(ck.g.compress().to_bytes().as_ref())
+            .chain_update(ck.h.compress().to_bytes().as_ref())
+            .chain_update(encoding.rand.compress().to_bytes().as_ref());
+        let challenge = Scalar::from_hash(hasher);
+
+        Ok(RangeProof {
+            comm_r,
+            comm_s: G::identity(), // TODO: hacky
+            comm_ck: G::identity(),
+            comm_x,
+            comm_bp_x,
+            range_comms,
+            r: r_rand + challenge * r,
+            s: Scalar::ZERO, // Skip secret key claim
+            range_proof,
+            xs: x_rands
+                .iter()
+                .zip(input)
+                .map(|(r, x)| r + challenge * Scalar::from(*x))
+                .collect(),
+            bp_rs: bp_r_rands
+                .iter()
+                .zip(range_rands)
+                .map(|(r, x)| r + challenge * x)
+                .collect(),
+        })
+    }
+
+    fn batch_verify_untagged<R: RngCore + CryptoRng>(
+        vk: &Self::VerifierKey,
+        params: &AggParams,
+        proof_indices: &[usize],
+        encodings: &[Encoding],
+        proofs: &[Self::Proof],
+        rng: &mut R,
+    ) -> Result<()> {
+        // We batch by taking a random linear combination over all Schnorr claims.
+        // (The range proofs are done separately.)
+        //
+        // Here we generate all the necessary randomnesss upfront.
+        let num_proof_claims = 1 + 2 * encodings[0].vals.len(); // Only claim 1 + range consistency
+        let total_claims = proof_indices.len() * num_proof_claims;
+        let rands: Vec<_> = (0..total_claims)
+            .map(|_| Scalar::random(&mut *rng))
+            .collect();
+
+        // Many terms share the g, h, and pk bases
+        let mut g_scalar = Scalar::ZERO;
+        let mut h_scalar = Scalar::ZERO;
+        let mut pk_scalars = vec![Scalar::ZERO; params.pks.len()];
+        let mut scalars = Vec::new();
+        let mut bases = Vec::new();
+
+        // Helper closure to add terms to the MSM vectors
+        let mut add_term = |scalar: Scalar, base: G| {
+            scalars.push(scalar);
+            bases.push(base);
+        };
+
+        let mut r_idx = 0;
+        let range_params = Self::get_bp_params(*vk, params.h, encodings[0].vals.len())?;
+
+        // For each proof, add the relevant terms to the final MSM computation
+        for ((_proof_idx, encoding), proof) in proof_indices.iter().zip(encodings).zip(proofs) {
+            let statement = RangeStatement::init(
+                range_params.clone(),
+                proof.range_comms.clone(),
+                vec![None; encoding.vals.len()],
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to generate proof statement: {}", e))?;
+            RistrettoRangeProof::verify_batch(
+                &mut [Transcript::new(b"range_proof")],
+                &[statement],
+                &[proof.range_proof.clone()],
+                VerifyAction::VerifyOnly,
+            )
+            .map_err(|e| anyhow::anyhow!("Batch verification failed (range proof): {}", e))?;
+
+            // Apply fiat-shamir to non-interactively generate challenge
+            //
+            // TODO: Actually include the full transcript here
+            //
+            // TODO: Precompute hash for public parts and clone when computing separate
+            let mut hasher = Sha3_512::new();
+            hasher.update(params.g.compress().to_bytes().as_ref());
+            hasher.update(params.h.compress().to_bytes().as_ref());
+            hasher.update(encoding.rand.compress().to_bytes().as_ref());
+            let challenge = Scalar::from_hash(hasher);
+
+            // Check 1) c_0 = g^r
+            g_scalar += proof.r * rands[r_idx];
+            add_term(-rands[r_idx], proof.comm_r);
+            add_term(-challenge * rands[r_idx], encoding.rand);
             r_idx += 1;
 
             // Check 4) Pederson commitments are consistent with the ciphertext
@@ -724,6 +887,52 @@ mod tests {
                 &mut OsRng
             )
             .is_err()
+        );
+    }
+
+    /// Tests basic untagged proof correctness with batch verification  
+    #[test]
+    fn untagged_proof_correctness() {
+        let num_clients = 3;
+        let length = 2;
+        let bitlength = 8; // 8-bit range [0, 256)
+        let (params, _sk, cks) = Agg::setup(num_clients, length, &mut OsRng);
+        let (prover_key, verifier_key) = P::setup(length, bitlength);
+        let mut rng = rand::thread_rng();
+
+        let mut encodings = Vec::with_capacity(num_clients);
+        let mut proofs = Vec::with_capacity(num_clients);
+        for i in 0..num_clients {
+            // Generate random inputs within the range [0, 2^bitlength)
+            let input: Vec<u64> = (0..length)
+                .map(|_| rng.gen_range(0..(1 << bitlength)))
+                .collect();
+
+            let r = Scalar::random(&mut OsRng);
+            let encoding = Encoding {
+                rand: params.g * r,
+                secret: params.pks[0] * r + params.g * cks[i].secret,
+                vals: input
+                    .iter()
+                    .enumerate()
+                    .map(|(j, v)| params.pks[j + 1] * r + params.g * Scalar::from(*v))
+                    .collect(),
+            };
+            let proof = P::prove_untagged(&prover_key, &cks[i], &input, r, &encoding, &mut OsRng).unwrap();
+            encodings.push(encoding);
+            proofs.push(proof);
+        }
+
+        assert!(
+            P::batch_verify_untagged(
+                &verifier_key,
+                &params,
+                &(0..num_clients).collect::<Vec<_>>(),
+                &encodings,
+                &proofs,
+                &mut OsRng
+            )
+            .is_ok()
         );
     }
 }
