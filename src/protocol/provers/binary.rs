@@ -327,8 +327,6 @@ impl Prover for Binary {
         Ok(())
     }
 
-
-
     fn batch_verify<R: RngCore + CryptoRng>(
         _vk: &Self::VerifierKey,
         params: &AggParams,
@@ -534,7 +532,6 @@ impl Prover for Binary {
         }
     }
 }
-
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Commiments {
@@ -812,7 +809,8 @@ mod tests {
                     .map(|(i, v)| params.pks[i + 1] * r + params.g * Scalar::from(*v))
                     .collect(),
             };
-            let proof = P::prove_untagged(&prover_key, &cks[i], &input, r, &encoding, &mut OsRng).unwrap();
+            let proof =
+                P::prove_untagged(&prover_key, &cks[i], &input, r, &encoding, &mut OsRng).unwrap();
             encodings.push(encoding);
             proofs.push(proof);
         }

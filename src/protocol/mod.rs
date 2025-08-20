@@ -90,6 +90,4 @@ mod tests {
             aggregation::<Range>(n, l, b);
         }
     }
-
-
 }

@@ -1,11 +1,11 @@
+use bytesize::ByteSize;
 use clap::Parser;
 use hlagg::protocol::{
     ElGamal,
     provers::{Binary, Prover, Range},
 };
-use rand_core::OsRng;
 use rand::Rng;
-use bytesize::ByteSize;
+use rand_core::OsRng;
 
 #[derive(Parser)]
 #[command(name = "size-bench")]
@@ -14,7 +14,7 @@ struct Config {
     /// Length of input vectors (space-separated list)
     #[arg(short, long, value_delimiter = ' ', num_args = 1.., default_value = "1")]
     length: Vec<usize>,
-    
+
     /// Bit length of input values (space-separated list)
     #[arg(short, long, value_delimiter = ' ', num_args = 1.., default_value = "1")]
     bitlength: Vec<usize>,
@@ -60,17 +60,17 @@ fn measure_sizes<P: Prover>(length: usize, bitlength: usize, proof_system_name: 
 
 fn main() {
     let config = Config::parse();
-    
+
     println!("Running size measurements...");
     println!("Configuration:");
     println!("  Input Lengths: {:?}", config.length);
     println!("  Bitlengths: {:?}", config.bitlength);
-    
+
     println!("\n=== Size Measurements (Serde/Bincode) ===");
     println!(
         "Format: (input_length, bitlength) [proof_system] -> encoding_size + proof_size = total_size\n"
     );
-    
+
     for &length in &config.length {
         for &bitlength in &config.bitlength {
             if bitlength == 1 {
@@ -82,6 +82,6 @@ fn main() {
             }
         }
     }
-    
+
     println!("\n{}", "=".repeat(80));
-} 
+}

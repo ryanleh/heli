@@ -1,5 +1,8 @@
-use aes::{Aes256, cipher::{BlockEncrypt, KeyInit}};
 use aes::cipher::generic_array::GenericArray;
+use aes::{
+    Aes256,
+    cipher::{BlockEncrypt, KeyInit},
+};
 use criterion::{Criterion, criterion_group, criterion_main};
 use curve25519_dalek::scalar::Scalar;
 use std::hint::black_box;
@@ -34,7 +37,7 @@ impl Accumulator {
     fn to_64_bytes_le(&self) -> [u8; 64] {
         let mut buf = [0u8; 64];
         for i in 0..5 {
-            buf[i*8..(i+1)*8].copy_from_slice(&self.0[i].to_le_bytes());
+            buf[i * 8..(i + 1) * 8].copy_from_slice(&self.0[i].to_le_bytes());
         }
         buf
     }
@@ -56,7 +59,7 @@ fn block_to_u64_pair(block: &GenericArray<u8, aes::cipher::consts::U16>) -> [u64
 
 fn bench_dropout(c: &mut Criterion, n: u32) {
     let cipher = Aes256::new(&GenericArray::from_slice(&KEY));
-    
+
     c.bench_function(&format!("decryptor_dropout_{}", n), |b| {
         b.iter(|| {
             let mut acc = Accumulator::zero();

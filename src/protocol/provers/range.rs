@@ -105,8 +105,6 @@ impl Prover for Range {
         (bitlength, bitlength)
     }
 
-
-
     fn prove<R: RngCore + CryptoRng>(
         pk: &Self::ProverKey, // bitlength
         ck: &ClientKey,
@@ -238,8 +236,6 @@ impl Prover for Range {
 
         Ok(())
     }
-
-
 
     fn batch_verify<R: RngCore + CryptoRng>(
         vk: &Self::VerifierKey,
@@ -918,7 +914,8 @@ mod tests {
                     .map(|(j, v)| params.pks[j + 1] * r + params.g * Scalar::from(*v))
                     .collect(),
             };
-            let proof = P::prove_untagged(&prover_key, &cks[i], &input, r, &encoding, &mut OsRng).unwrap();
+            let proof =
+                P::prove_untagged(&prover_key, &cks[i], &input, r, &encoding, &mut OsRng).unwrap();
             encodings.push(encoding);
             proofs.push(proof);
         }

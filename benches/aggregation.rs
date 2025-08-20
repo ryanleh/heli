@@ -1,9 +1,9 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use group::Group;
 use hlagg::protocol::{
     ElGamal, G, Scalar,
     provers::{Binary, Prover, Range},
 };
-use group::Group;
 use rand_core::OsRng;
 use std::hint::black_box;
 
@@ -40,14 +40,13 @@ fn bench_encode<P: Prover>(c: &mut Criterion, length: usize, bitlength: usize) {
 
     // Benchmark
     group.bench_with_input(
-        BenchmarkId::from_parameter(format!(
-            "{length}_inputs_{bitlength}_bits"
-        )),
+        BenchmarkId::from_parameter(format!("{length}_inputs_{bitlength}_bits")),
         &(length, bitlength),
         |b, _| {
             b.iter(|| {
                 // Encode and prove for all clients
-                let (encoding, r) = ElGamal::encode(&setup_data.cks[0], &input, &mut OsRng).unwrap();
+                let (encoding, r) =
+                    ElGamal::encode(&setup_data.cks[0], &input, &mut OsRng).unwrap();
                 black_box(
                     P::prove(
                         &prover_key,
@@ -57,7 +56,7 @@ fn bench_encode<P: Prover>(c: &mut Criterion, length: usize, bitlength: usize) {
                         &encoding,
                         &mut OsRng,
                     )
-                    .unwrap()
+                    .unwrap(),
                 );
             });
         },
@@ -83,7 +82,9 @@ fn bench_aggregate(c: &mut Criterion, num_clients: usize, length: usize, bitwidt
 
     // Benchmark
     group.bench_with_input(
-        BenchmarkId::from_parameter(format!("{num_clients}_clients_{length}_inputs_{bitwidth}_bits")),
+        BenchmarkId::from_parameter(format!(
+            "{num_clients}_clients_{length}_inputs_{bitwidth}_bits"
+        )),
         &(num_clients, length),
         |b, _| {
             b.iter(|| {
@@ -128,11 +129,14 @@ fn bench_post_process(c: &mut Criterion, num_clients: usize, length: usize, bitw
     group.measurement_time(std::time::Duration::from_millis(500));
     group.sample_size(10);
 
-    // Choose a random number from [0, 2^bitlength] 
+    // Choose a random number from [0, 2^bitlength]
     let input = random_inputs(length, bitwidth);
     let setup_data = get_setup_data(num_clients, length, bitwidth);
     let partial_output = hlagg::protocol::messages::PartialOutput {
-        vals: input.into_iter().map(|x| G::generator() * Scalar::from(x)).collect(),
+        vals: input
+            .into_iter()
+            .map(|x| G::generator() * Scalar::from(x))
+            .collect(),
     };
 
     // Benchmark
@@ -162,16 +166,16 @@ fn bench_post_process(c: &mut Criterion, num_clients: usize, length: usize, bitw
 //    // Setup
 //    let input = random_inputs(length, bitlength);
 //    let setup_data = get_setup_data(1, length, bitlength);
-//    
+//
 //    // Use a 128-bit prime field (2^128 - 159 is prime)
 //    let field_modulus = 2u128.pow(128) - 159;
-//    
+//
 //    // Pre-generate randomness for secret sharing
 //    let mut rng = OsRng;
 //    let random_shares: Vec<u128> = (0..length)
 //        .map(|_| rng.gen_range(0..field_modulus))
 //        .collect();
-//    
+//
 //    // Pre-generate randomness for ElGamal (just the scalar r)
 //    let r = Scalar::random(&mut OsRng);
 //
@@ -270,5 +274,12 @@ fn post_process(c: &mut Criterion) {
 //    bench_secret_sharing_vs_elgamal(c, 1, 8);
 //}
 
-criterion_group!(benches, setup, client_encoding, aggregate, decode, post_process);
+criterion_group!(
+    benches,
+    setup,
+    client_encoding,
+    aggregate,
+    decode,
+    post_process
+);
 criterion_main!(benches);

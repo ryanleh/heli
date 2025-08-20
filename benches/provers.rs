@@ -45,8 +45,6 @@ fn bench_encode<P: Prover>(c: &mut Criterion, length: usize, bitlength: usize) {
     group.finish();
 }
 
-
-
 fn bench_verify<P: Prover>(c: &mut Criterion, length: usize, bitlength: usize) {
     let mut group = c.benchmark_group("verify");
     group.warm_up_time(std::time::Duration::from_millis(100));
@@ -140,8 +138,6 @@ fn bench_batch_verify<P: Prover>(
     group.finish();
 }
 
-
-
 fn encode(c: &mut Criterion) {
     // (length, bitlength)
     bench_encode::<Binary>(c, 1, 1);
@@ -149,8 +145,6 @@ fn encode(c: &mut Criterion) {
     bench_encode::<Range>(c, 1, 8);
     bench_encode::<Range>(c, 8, 8);
 }
-
-
 
 fn verify(c: &mut Criterion) {
     // (length, bitlength)
@@ -174,8 +168,6 @@ fn batch_verify(c: &mut Criterion) {
         }
     }
 }
-
-
 
 //criterion_group!(benches, encode, verify, batch_verify,);
 criterion_group!(benches, encode, batch_verify);

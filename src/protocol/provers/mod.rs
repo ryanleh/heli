@@ -37,7 +37,7 @@ pub trait Prover: 'static {
     ) -> Result<Self::Proof>;
 
     /// Temporary trait function, move somewhere else
-    /// 
+    ///
     /// prove _without_ verification tag, just input claims
     fn prove_untagged<R: RngCore + CryptoRng>(
         pk: &Self::ProverKey,
@@ -66,7 +66,7 @@ pub trait Prover: 'static {
     ) -> Result<()>;
 
     /// Temporary trait function, move somewhere else
-    /// 
+    ///
     /// batch_verify _without_ verification tag, just input claims
     fn batch_verify_untagged<R: RngCore + CryptoRng>(
         vk: &Self::VerifierKey,
@@ -76,5 +76,4 @@ pub trait Prover: 'static {
         proofs: &[Self::Proof],
         rng: &mut R,
     ) -> Result<()>;
-    
 }
