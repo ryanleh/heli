@@ -1,5 +1,5 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use hlagg::protocol::{
+use heli::protocol::{
     ElGamal,
     provers::{Binary, Prover, Range},
 };

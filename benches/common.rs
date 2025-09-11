@@ -1,4 +1,4 @@
-use hlagg::protocol::{
+use heli::protocol::{
     ElGamal,
     messages::{AggParams, ClientKey, DecKey},
 };
