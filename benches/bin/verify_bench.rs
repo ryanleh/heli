@@ -1,5 +1,5 @@
 use clap::Parser;
-use heli::protocol::{
+use heli::primitives::{
     ElGamal,
     provers::{Binary, Prover, Range},
 };

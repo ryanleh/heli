@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use group::Group;
-use heli::protocol::{
+use heli::primitives::{
     ElGamal, G, Scalar,
     provers::{Binary, Prover, Range},
 };
@@ -133,7 +133,7 @@ fn bench_post_process(c: &mut Criterion, num_clients: usize, length: usize, bitw
     // Choose a random number from [0, 2^bitlength]
     let input = random_inputs(length, bitwidth);
     let setup_data = get_setup_data(num_clients, length, bitwidth);
-    let partial_output = heli::protocol::messages::PartialOutput {
+    let partial_output = heli::primtiives::messages::PartialOutput {
         vals: input
             .into_iter()
             .map(|x| G::generator() * Scalar::from(x))

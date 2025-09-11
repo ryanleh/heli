@@ -8,7 +8,7 @@
 #![deny(unused_comparisons, bare_trait_objects, unused_must_use)]
 #![forbid(unsafe_code)]
 
-pub mod protocol;
+pub mod primitives;
 
 // TODO: End-to-end code is out of date
 //

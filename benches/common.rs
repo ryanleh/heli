@@ -1,4 +1,4 @@
-use heli::protocol::{
+use heli::primitives::{
     ElGamal,
     messages::{AggParams, ClientKey, DecKey},
 };
