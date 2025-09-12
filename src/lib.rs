@@ -8,7 +8,8 @@
 #![deny(unused_comparisons, bare_trait_objects, unused_must_use)]
 #![forbid(unsafe_code)]
 
-pub mod primitives;
+pub mod crypto;
+pub mod agg_only_enc;
 
 // TODO: End-to-end code is out of date
 //
