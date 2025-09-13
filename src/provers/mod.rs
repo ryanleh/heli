@@ -1,11 +1,17 @@
-use crate::primitives::Scalar;
+use crate::{
+    agg_only_enc::EvalKey,
+    crypto::{Scalar, ElGamalCiphertext, G},
+};
 
 use anyhow::Result;
+use sha3::{Digest, Sha3_512};
 use rand_core::{CryptoRng, RngCore};
 use serde::{Serialize, de::DeserializeOwned};
 
-//// Proves that 
-//pub mod base;
+// Proves that the ciphertext is well-formed, no input authentication 
+//
+// TODO: Reuse stuff here for other proofs
+pub mod base;
 
 //pub mod binary;
 //pub use binary::*;
@@ -13,7 +19,59 @@ use serde::{Serialize, de::DeserializeOwned};
 //pub mod range;
 //pub use range::*;
 
-// Helper macro for verifying claims - can be used by all provers
+/// Trait for proving well-formedness of aggregation-only ciphertexts + inputs
+pub trait Prover: 'static {
+    type ProverKey: Send + Sync + Serialize + DeserializeOwned;
+    type VerifierKey: Send + Sync + Serialize + DeserializeOwned;
+    type Proof: Send + Sync + Serialize + DeserializeOwned;
+
+    /// Given a set of aggregation-only evaluation keys and a max input
+    /// bitlength, setup prover and verifier keys. 
+    fn setup(eval_keys: &[EvalKey], bitlength: usize) -> (Vec<Self::ProverKey>, Self::VerifierKey);
+
+    /// Prove well-formedness of given ciphertext
+    fn prove<R: RngCore + CryptoRng>(
+        pk: &Self::ProverKey,
+        ek: &EvalKey,
+        context: u64,
+        r: Scalar,
+        input: &[Scalar],
+        rng: &mut R,
+    ) -> Result<Self::Proof>;
+
+    /// Verify a proof 
+    fn verify(
+        vk: &Self::VerifierKey,
+        ciphertext: &ElGamalCiphertext,
+        context: u64,
+        proof: &Self::Proof,
+        proof_index: usize,
+    ) -> Result<()>;
+
+    /// Batch verify a set of proofs
+    fn batch_verify<R: RngCore + CryptoRng>(
+        vk: &Self::VerifierKey,
+        ciphertexts: &[ElGamalCiphertext],
+        context: u64,
+        proofs: &[Self::Proof],
+        proof_indices: &[usize],
+        rng: &mut R,
+    ) -> Result<()>;
+}
+
+/// Apply fiat-shamir to a list of group and scalarelements
+fn fiat_shamir(elements: &[G], scalars: &[Scalar]) -> Scalar {
+    let mut hasher = Sha3_512::new();
+    for g in elements {
+        hasher.update(g.compress().to_bytes().as_ref());
+    }
+    for s in scalars {
+        hasher.update(s.to_bytes().as_ref());
+    }
+    Scalar::from_hash(hasher)
+}
+
+// Helper macro for verifying claims
 #[macro_export]
 macro_rules! check_claim {
     ($left:expr, $right:expr, $msg:expr) => {
@@ -21,62 +79,4 @@ macro_rules! check_claim {
             return Err(anyhow::anyhow!($msg));
         }
     };
-}
-
-pub trait Prover: 'static {
-    type ProverKey: Send + Sync + Serialize + DeserializeOwned;
-    type VerifierKey: Send + Sync + Serialize + DeserializeOwned;
-    type Proof: Send + Sync + Serialize + DeserializeOwned;
-
-    fn setup(num_inputs: usize, bitlength: usize) -> (Self::ProverKey, Self::VerifierKey);
-
-    fn prove<R: RngCore + CryptoRng>(
-        pk: &Self::ProverKey,
-        ck: &ClientKey,
-        input: &[u64],
-        r: Scalar,
-        encoding: &Encoding,
-        rng: &mut R,
-    ) -> Result<Self::Proof>;
-
-    /// Temporary trait function, move somewhere else
-    ///
-    /// prove _without_ verification tag, just input claims
-    fn prove_untagged<R: RngCore + CryptoRng>(
-        pk: &Self::ProverKey,
-        ck: &ClientKey,
-        input: &[u64],
-        r: Scalar,
-        encoding: &Encoding,
-        rng: &mut R,
-    ) -> Result<Self::Proof>;
-
-    fn verify(
-        vk: &Self::VerifierKey,
-        params: &AggParams,
-        proof_index: usize,
-        encoding: &Encoding,
-        proof: &Self::Proof,
-    ) -> Result<()>;
-
-    fn batch_verify<R: RngCore + CryptoRng>(
-        vk: &Self::VerifierKey,
-        params: &AggParams,
-        proof_indices: &[usize],
-        encodings: &[Encoding],
-        proofs: &[Self::Proof],
-        rng: &mut R,
-    ) -> Result<()>;
-
-    /// Temporary trait function, move somewhere else
-    ///
-    /// batch_verify _without_ verification tag, just input claims
-    fn batch_verify_untagged<R: RngCore + CryptoRng>(
-        vk: &Self::VerifierKey,
-        params: &AggParams,
-        proof_indices: &[usize],
-        encodings: &[Encoding],
-        proofs: &[Self::Proof],
-        rng: &mut R,
-    ) -> Result<()>;
 }

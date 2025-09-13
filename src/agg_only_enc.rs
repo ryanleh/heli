@@ -1,6 +1,7 @@
 use crate::crypto::*;
 use anyhow::{Result, anyhow};
 use rand_core::{CryptoRng, RngCore};
+use serde::{Serialize, Deserialize};
 
 /// Aggregation-only encryption instantiated with
 /// * ElGamal linearly-homomorphic vector encryption
@@ -15,9 +16,10 @@ pub struct SecretKey {
     keygen_prf: ScalarPRF, 
 }
 
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct EvalKey {
-    enc_pk: ElGamalPublicKey,
-    prf_key_share: Scalar,
+    pub(crate) enc_pk: ElGamalPublicKey,
+    pub(crate) prf_key_share: Scalar,
 }
 
 impl AggOnlyEnc {
