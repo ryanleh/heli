@@ -8,18 +8,16 @@ use sha3::{Digest, Sha3_512};
 use rand_core::{CryptoRng, RngCore};
 use serde::{Serialize, de::DeserializeOwned};
 
-// Proves that the ciphertext is well-formed, no input authentication 
-//
-// TODO: Reuse stuff here for other proofs
-pub mod base;
+// Prove that a ciphertext is well-formed
+pub mod ciphertext;
 
-//pub mod binary;
-//pub use binary::*;
-//
-//pub mod range;
-//pub use range::*;
+// Prove that input is well-formed
+pub mod input;
 
-/// Trait for proving well-formedness of aggregation-only ciphertexts + inputs
+//// Combine both ciphertext and input proofs (smaller keys, faster batch verifier)
+//pub mod combined;
+
+/// Trait for proving well-formedness of a ciphertext 
 pub trait Prover: 'static {
     type ProverKey: Send + Sync + Serialize + DeserializeOwned;
     type VerifierKey: Send + Sync + Serialize + DeserializeOwned;

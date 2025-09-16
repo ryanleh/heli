@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_512};
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub struct BaseProverKey {
+pub struct CiphertextProverKey {
     /// Generator for key commitments
     g_comm: G,
     /// Commitment to an evaluation key
@@ -21,7 +21,7 @@ pub struct BaseProverKey {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub struct BaseVerifierKey {
+pub struct CiphertextVerifierKey {
     /// ElGamal public-key
     enc_pk: ElGamalPublicKey,
     /// Generator for key commitments
@@ -33,35 +33,23 @@ pub struct BaseVerifierKey {
 /// Schnorr proof of well-formedness for aggregation-only ciphertext.
 /// Does not prove anything about the inputs.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub struct BaseProof {
-    /// Commitments
-    pub(crate) commitments: BaseCommiments,
-    /// Responses
-    pub(crate) responses: BaseResponses,
-}
-
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub struct BaseCommiments {
-    /// Commitment for for claim 1) c_0 = g^r.
+pub struct CiphertextProof {
+/// Commitment for for claim 1) c_0 = g^r.
     pub(super) g_r: G,
     /// Commitment for for claim 2) c_1 = pk_0^r * H(context)^k.
     pub(super) g_k: G,
     /// Commitments for for claim 3) DLEQ(g_comm^k, H(context)^k)
     pub(super) g_comm_k: G,
-}
-
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub struct BaseResponses {
     /// Response for proving knowledge of r.
     pub(super) r: Scalar,
     /// Response for proving knowledge of k.
     pub(super) k: Scalar,
 }
 
-impl Prover for BaseProof {
-    type ProverKey = BaseProverKey;
-    type VerifierKey = BaseVerifierKey;
-    type Proof = BaseProof;
+impl Prover for CiphertextProof {
+    type ProverKey = CiphertextProverKey;
+    type VerifierKey = CiphertextVerifierKey;
+    type Proof = CiphertextProof;
 
     fn setup(eval_keys: &[EvalKey], _: usize) -> (Vec<Self::ProverKey>, Self::VerifierKey) {
         // TODO: Generate this differently
@@ -70,11 +58,11 @@ impl Prover for BaseProof {
         // Compute commitments to each evaluation key
         let (prover_keys, key_commitments) = eval_keys.iter().map(|ek| {
             let key_commitment = g_comm * ek.prf_key_share;
-            (BaseProverKey { g_comm, key_commitment }, key_commitment)
+            (CiphertextProverKey { g_comm, key_commitment }, key_commitment)
         }).unzip();
 
         let enc_pk = eval_keys[0].enc_pk.clone();
-        (prover_keys, BaseVerifierKey { enc_pk, g_comm, key_commitments })
+        (prover_keys, CiphertextVerifierKey { enc_pk, g_comm, key_commitments })
     }
 
     /// Prove the following relation (informally stated) for secrets r and k:
@@ -103,15 +91,14 @@ impl Prover for BaseProof {
         // Generate challenge via fiat-shamir
         // 
         // TODO: This doesn't include full transcript atm
-        let commitments = BaseCommiments { g_r, g_k, g_comm_k };
         let challenge = fiat_shamir(&[g, pk.g_comm, g_r, g_k, g_comm_k], &[]);
 
-        Ok(BaseProof {
-            commitments,
-            responses: BaseResponses {
-                r: r_rand + challenge * r,
-                k: k_rand + challenge * ek.prf_key_share,
-            },
+        Ok(CiphertextProof {
+            g_r,
+            g_k,
+            g_comm_k,
+            r: r_rand + challenge * r,
+            k: k_rand + challenge * ek.prf_key_share,
         })
     }
 
@@ -130,22 +117,22 @@ impl Prover for BaseProof {
         let challenge = fiat_shamir(&[
             g,
             vk.g_comm,
-            proof.commitments.g_r,
-            proof.commitments.g_k,
-            proof.commitments.g_comm_k,
+            proof.g_r,
+            proof.g_k,
+            proof.g_comm_k,
         ], &[]);
 
         // Check 1) c_0 = g^r
         check_claim!(
-            g * proof.responses.r,
-            proof.commitments.g_r + ciphertext.rand * challenge,
+            g * proof.r,
+            proof.g_r + ciphertext.rand * challenge,
             "Claim failed: c_0 = g^r"
         );
 
         // Check 2) c_1 = pk_1^r * H(context)^k
         check_claim!(
-            vk.enc_pk[1] * proof.responses.r + KHPRF::evaluate(&proof.responses.k, context),
-            proof.commitments.g_k + ciphertext.slots[ciphertext.slots.len() - 1] * challenge,
+            vk.enc_pk[1] * proof.r + KHPRF::evaluate(&proof.k, context),
+            proof.g_k + ciphertext.slots[ciphertext.slots.len() - 1] * challenge,
             "Claim failed: c_1 = pk_1^r * H(context)^k"
         );
 
@@ -153,8 +140,8 @@ impl Prover for BaseProof {
         //
         // (Note that we've already shown knowledge of H(context)^k in the previous claim)
         check_claim!(
-            vk.g_comm * proof.responses.k,
-            proof.commitments.g_comm_k + vk.key_commitments[proof_index] * challenge,
+            vk.g_comm * proof.k,
+            proof.g_comm_k + vk.key_commitments[proof_index] * challenge,
             "Claim failed: ck = h^s"
         );
         Ok(())
@@ -206,27 +193,27 @@ impl Prover for BaseProof {
             let challenge = fiat_shamir(&[
                 g,
                 vk.g_comm,
-                proof.commitments.g_r,
-                proof.commitments.g_k,
-                proof.commitments.g_comm_k,
+                proof.g_r,
+                proof.g_k,
+                proof.g_comm_k,
             ], &[]);
 
             // Check 1) c_0 = g^r
-            g_scalar += proof.responses.r * rands[r_idx];
-            add_term(-rands[r_idx], proof.commitments.g_r);
+            g_scalar += proof.r * rands[r_idx];
+            add_term(-rands[r_idx], proof.g_r);
             add_term(-challenge * rands[r_idx], ciphertext.rand);
             r_idx += 1;
 
             // Check 2) c_1 = pk_0^r * H(context)^k
-            pk_scalar += proof.responses.r * rands[r_idx];
-            prf_scalar += proof.responses.k * rands[r_idx];
-            add_term(-rands[r_idx], proof.commitments.g_k);
+            pk_scalar += proof.r * rands[r_idx];
+            prf_scalar += proof.k * rands[r_idx];
+            add_term(-rands[r_idx], proof.g_k);
             add_term(-challenge * rands[r_idx], ciphertext.slots[ciphertext.slots.len() - 1]);
             r_idx += 1;
 
             // Check 3) DLEQ(g_comm^k, H(context)^k)
-            g_comm_scalar += proof.responses.k * rands[r_idx];
-            add_term(-rands[r_idx], proof.commitments.g_comm_k);
+            g_comm_scalar += proof.k * rands[r_idx];
+            add_term(-rands[r_idx], proof.g_comm_k);
             add_term(-challenge * rands[r_idx], vk.key_commitments[proof_idx]);
             r_idx += 1;
         }
@@ -261,13 +248,13 @@ mod tests {
          
          // Setup
          let (_secret_key, eval_keys) = AggOnlyEnc::setup(1, 1, &mut rng);
-         let (prover_keys, verifier_key) = BaseProof::setup(&eval_keys, 1);
+         let (prover_keys, verifier_key) = CiphertextProof::setup(&eval_keys, 1);
 
          // Generate a ciphertext and proof
          let r = Scalar::random(&mut rng);
          let input = vec![Scalar::from(rng.next_u64())];
          let ciphertext = AggOnlyEnc::encrypt(&eval_keys[0], 0, r, &input);
-         let proof = BaseProof::prove(
+         let proof = CiphertextProof::prove(
              &prover_keys[0],
              &eval_keys[0],
              0,
@@ -278,14 +265,14 @@ mod tests {
             
          // Test individual verification
          assert!(
-             BaseProof::verify(&verifier_key, &ciphertext, 0, &proof, 0).is_ok(),
+             CiphertextProof::verify(&verifier_key, &ciphertext, 0, &proof, 0).is_ok(),
              "Individual proof verification failed for input {:?}",
              input
          );
 
          // Test batch verification
          assert!(
-             BaseProof::batch_verify(
+             CiphertextProof::batch_verify(
                  &verifier_key,
                  &[ciphertext],
                  0,
@@ -299,19 +286,20 @@ mod tests {
      }
 
      #[test]
+     // Do some dumb tampering as a sanity check
      fn base_proof_soundness_tampering() {
          let mut rng = OsRng;
          
          // Setup
          let (_secret_key, eval_keys) = AggOnlyEnc::setup(1, 1, &mut rng);
-         let (prover_keys, verifier_key) = BaseProof::setup(&eval_keys, 1);
+         let (prover_keys, verifier_key) = CiphertextProof::setup(&eval_keys, 1);
          
          // Generate a valid ciphertext and proof
          let r = Scalar::random(&mut rng);
          let input = vec![Scalar::from(rng.next_u64())];
          let context = rng.next_u64();
          let ciphertext = AggOnlyEnc::encrypt(&eval_keys[0], context, r, &input);
-         let proof = BaseProof::prove(
+         let proof = CiphertextProof::prove(
              &prover_keys[0],
              &eval_keys[0],
              context,
@@ -321,46 +309,46 @@ mod tests {
          ).unwrap();
 
          // Verify the original proof is valid with both methods
-         assert!(BaseProof::verify(&verifier_key, &ciphertext, context, &proof, 0).is_ok());
-         assert!(BaseProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[proof.clone()], &[0], &mut rng).is_ok());
+         assert!(CiphertextProof::verify(&verifier_key, &ciphertext, context, &proof, 0).is_ok());
+         assert!(CiphertextProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[proof.clone()], &[0], &mut rng).is_ok());
 
          // Try tampering the ciphertext and assert that it is rejected by both methods
          let mut bad_ciphertext = ciphertext.clone();
          bad_ciphertext.rand = G::generator() * Scalar::random(&mut rng);
-         assert!(BaseProof::verify(&verifier_key, &bad_ciphertext, context, &proof, 0).is_err());
-         assert!(BaseProof::batch_verify(&verifier_key, &[bad_ciphertext], context, &[proof.clone()], &[0], &mut rng).is_err());
+         assert!(CiphertextProof::verify(&verifier_key, &bad_ciphertext, context, &proof, 0).is_err());
+         assert!(CiphertextProof::batch_verify(&verifier_key, &[bad_ciphertext], context, &[proof.clone()], &[0], &mut rng).is_err());
 
          // Tampering the attestation slot (slots[1]) should be detected by both methods
          let mut bad_ciphertext = ciphertext.clone();
          bad_ciphertext.slots[ciphertext.slots.len() - 1] = G::generator() * Scalar::random(&mut rng);
-         assert!(BaseProof::verify(&verifier_key, &bad_ciphertext, context, &proof, 0).is_err());
-         assert!(BaseProof::batch_verify(&verifier_key, &[bad_ciphertext], context, &[proof.clone()], &[0], &mut rng).is_err());
+         assert!(CiphertextProof::verify(&verifier_key, &bad_ciphertext, context, &proof, 0).is_err());
+         assert!(CiphertextProof::batch_verify(&verifier_key, &[bad_ciphertext], context, &[proof.clone()], &[0], &mut rng).is_err());
 
          // Try tampering the proof and assert that it is rejected by both methods
          let mut bad_proof = proof.clone();
-         bad_proof.responses.r = Scalar::random(&mut rng);
-         assert!(BaseProof::verify(&verifier_key, &ciphertext, context, &bad_proof, 0).is_err());
-         assert!(BaseProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[bad_proof], &[0], &mut rng).is_err());
+         bad_proof.r = Scalar::random(&mut rng);
+         assert!(CiphertextProof::verify(&verifier_key, &ciphertext, context, &bad_proof, 0).is_err());
+         assert!(CiphertextProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[bad_proof], &[0], &mut rng).is_err());
 
          let mut bad_proof = proof.clone();
-         bad_proof.responses.k = Scalar::random(&mut rng);
-         assert!(BaseProof::verify(&verifier_key, &ciphertext, context, &bad_proof, 0).is_err());
-         assert!(BaseProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[bad_proof], &[0], &mut rng).is_err());
+         bad_proof.k = Scalar::random(&mut rng);
+         assert!(CiphertextProof::verify(&verifier_key, &ciphertext, context, &bad_proof, 0).is_err());
+         assert!(CiphertextProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[bad_proof], &[0], &mut rng).is_err());
 
          let mut bad_proof = proof.clone();
-         bad_proof.commitments.g_r = G::generator() * Scalar::random(&mut rng);
-         assert!(BaseProof::verify(&verifier_key, &ciphertext, context, &bad_proof, 0).is_err());
-         assert!(BaseProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[bad_proof], &[0], &mut rng).is_err());
+         bad_proof.g_r = G::generator() * Scalar::random(&mut rng);
+         assert!(CiphertextProof::verify(&verifier_key, &ciphertext, context, &bad_proof, 0).is_err());
+         assert!(CiphertextProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[bad_proof], &[0], &mut rng).is_err());
 
          let mut bad_proof = proof.clone();
-         bad_proof.commitments.g_k = G::generator() * Scalar::random(&mut rng);
-         assert!(BaseProof::verify(&verifier_key, &ciphertext, context, &bad_proof, 0).is_err());
-         assert!(BaseProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[bad_proof], &[0], &mut rng).is_err());
+         bad_proof.g_k = G::generator() * Scalar::random(&mut rng);
+         assert!(CiphertextProof::verify(&verifier_key, &ciphertext, context, &bad_proof, 0).is_err());
+         assert!(CiphertextProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[bad_proof], &[0], &mut rng).is_err());
 
          let mut bad_proof = proof.clone();
-         bad_proof.commitments.g_comm_k = G::generator() * Scalar::random(&mut rng);
-         assert!(BaseProof::verify(&verifier_key, &ciphertext, context, &bad_proof, 0).is_err());
-         assert!(BaseProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[bad_proof], &[0], &mut rng).is_err());
+         bad_proof.g_comm_k = G::generator() * Scalar::random(&mut rng);
+         assert!(CiphertextProof::verify(&verifier_key, &ciphertext, context, &bad_proof, 0).is_err());
+         assert!(CiphertextProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[bad_proof], &[0], &mut rng).is_err());
      }
 
      #[test]
@@ -369,14 +357,14 @@ mod tests {
          
          // Setup with multiple clients
          let (_secret_key, eval_keys) = AggOnlyEnc::setup(3, 1, &mut rng);
-         let (prover_keys, verifier_key) = BaseProof::setup(&eval_keys, 1);
+         let (prover_keys, verifier_key) = CiphertextProof::setup(&eval_keys, 1);
          
          // Generate a valid ciphertext and proof for client 0
          let r = Scalar::random(&mut rng);
          let input = vec![Scalar::from(rng.next_u64())];
          let context = rng.next_u64();
          let ciphertext = AggOnlyEnc::encrypt(&eval_keys[0], context, r, &input);
-         let proof = BaseProof::prove(
+         let proof = CiphertextProof::prove(
              &prover_keys[0],
              &eval_keys[0],
              context,
@@ -386,15 +374,15 @@ mod tests {
          ).unwrap();
 
          // Verify with correct client index using both methods
-         assert!(BaseProof::verify(&verifier_key, &ciphertext, context, &proof, 0).is_ok());
-         assert!(BaseProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[proof.clone()], &[0], &mut rng).is_ok());
+         assert!(CiphertextProof::verify(&verifier_key, &ciphertext, context, &proof, 0).is_ok());
+         assert!(CiphertextProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[proof.clone()], &[0], &mut rng).is_ok());
 
          // Verify with wrong client index using both methods
-         assert!(BaseProof::verify(&verifier_key, &ciphertext, context, &proof, 1).is_err());
-         assert!(BaseProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[proof.clone()], &[1], &mut rng).is_err());
+         assert!(CiphertextProof::verify(&verifier_key, &ciphertext, context, &proof, 1).is_err());
+         assert!(CiphertextProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[proof.clone()], &[1], &mut rng).is_err());
          
-         assert!(BaseProof::verify(&verifier_key, &ciphertext, context, &proof, 2).is_err());
-         assert!(BaseProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[proof.clone()], &[2], &mut rng).is_err());
+         assert!(CiphertextProof::verify(&verifier_key, &ciphertext, context, &proof, 2).is_err());
+         assert!(CiphertextProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[proof.clone()], &[2], &mut rng).is_err());
      }
 
      #[test]
@@ -404,7 +392,7 @@ mod tests {
          
          // Setup with multiple clients
          let (_secret_key, eval_keys) = AggOnlyEnc::setup(num_clients, 1, &mut rng);
-         let (prover_keys, verifier_key) = BaseProof::setup(&eval_keys, 1);
+         let (prover_keys, verifier_key) = CiphertextProof::setup(&eval_keys, 1);
 
          let mut ciphertexts = Vec::with_capacity(num_clients);
          let mut proofs = Vec::with_capacity(num_clients);
@@ -416,7 +404,7 @@ mod tests {
              let input = vec![Scalar::from(rng.next_u64())];
              
              let ciphertext = AggOnlyEnc::encrypt(&eval_keys[i], context, r, &input);
-             let proof = BaseProof::prove(
+             let proof = CiphertextProof::prove(
                  &prover_keys[i],
                  &eval_keys[i],
                  context,
@@ -433,7 +421,7 @@ mod tests {
          // Test individual verification for each proof
          for i in 0..num_clients {
              assert!(
-                 BaseProof::verify(&verifier_key, &ciphertexts[i], context, &proofs[i], i).is_ok(),
+                 CiphertextProof::verify(&verifier_key, &ciphertexts[i], context, &proofs[i], i).is_ok(),
                  "Individual proof verification failed for client {}",
                  i
              );
@@ -441,7 +429,7 @@ mod tests {
 
          // Test batch verification
          assert!(
-             BaseProof::batch_verify(
+             CiphertextProof::batch_verify(
                  &verifier_key,
                  &ciphertexts,
                  context,
@@ -450,22 +438,6 @@ mod tests {
                  &mut rng
              ).is_ok(),
              "Batch proof verification failed"
-         );
-
-         // Test mixed verification: some individual, some batch
-         // Verify first two individually, then batch verify all three
-         assert!(BaseProof::verify(&verifier_key, &ciphertexts[0], context, &proofs[0], 0).is_ok());
-         assert!(BaseProof::verify(&verifier_key, &ciphertexts[1], context, &proofs[1], 1).is_ok());
-         assert!(
-             BaseProof::batch_verify(
-                 &verifier_key,
-                 &ciphertexts,
-                 context,
-                 &proofs,
-                 &proof_indices,
-                 &mut rng
-             ).is_ok(),
-             "Mixed individual and batch verification failed"
          );
      }
 }
