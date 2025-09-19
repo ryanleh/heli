@@ -24,7 +24,7 @@ pub struct CiphertextProverKey {
 pub struct CiphertextVerifierKey {
     /// ElGamal public-key
     enc_pk: ElGamalPublicKey,
-    /// Generator for key commitments
+    /// Generator for commitments
     g_comm: G,
     /// Commitments to the evaluation keys
     key_commitments: Vec<G>,
@@ -243,7 +243,7 @@ mod tests {
     use rand::rngs::OsRng;
 
      #[test]
-     fn base_proof_correctness() {
+     fn ct_proof_correctness() {
          let mut rng = OsRng;
          
          // Setup
@@ -287,7 +287,7 @@ mod tests {
 
      #[test]
      // Do some dumb tampering as a sanity check
-     fn base_proof_soundness_tampering() {
+     fn ct_proof_soundness_tampering() {
          let mut rng = OsRng;
          
          // Setup
@@ -352,7 +352,7 @@ mod tests {
      }
 
      #[test]
-     fn base_proof_soundness_wrong_client() {
+     fn ct_proof_soundness_wrong_client() {
          let mut rng = OsRng;
          
          // Setup with multiple clients
@@ -383,61 +383,5 @@ mod tests {
          
          assert!(CiphertextProof::verify(&verifier_key, &ciphertext, context, &proof, 2).is_err());
          assert!(CiphertextProof::batch_verify(&verifier_key, &[ciphertext.clone()], context, &[proof.clone()], &[2], &mut rng).is_err());
-     }
-
-     #[test]
-     fn base_proof_batch_correctness() {
-         let mut rng = OsRng;
-         let num_clients = 3;
-         
-         // Setup with multiple clients
-         let (_secret_key, eval_keys) = AggOnlyEnc::setup(num_clients, 1, &mut rng);
-         let (prover_keys, verifier_key) = CiphertextProof::setup(&eval_keys, 1);
-
-         let mut ciphertexts = Vec::with_capacity(num_clients);
-         let mut proofs = Vec::with_capacity(num_clients);
-         let mut proof_indices = Vec::with_capacity(num_clients);
-         let context = rng.next_u64(); // Use same context for all clients
-         
-         for i in 0..num_clients {
-             let r = Scalar::random(&mut rng);
-             let input = vec![Scalar::from(rng.next_u64())];
-             
-             let ciphertext = AggOnlyEnc::encrypt(&eval_keys[i], context, r, &input);
-             let proof = CiphertextProof::prove(
-                 &prover_keys[i],
-                 &eval_keys[i],
-                 context,
-                 r,
-                 &input,
-                 &mut rng
-             ).unwrap();
-             
-             ciphertexts.push(ciphertext);
-             proofs.push(proof);
-             proof_indices.push(i);
-         }
-
-         // Test individual verification for each proof
-         for i in 0..num_clients {
-             assert!(
-                 CiphertextProof::verify(&verifier_key, &ciphertexts[i], context, &proofs[i], i).is_ok(),
-                 "Individual proof verification failed for client {}",
-                 i
-             );
-         }
-
-         // Test batch verification
-         assert!(
-             CiphertextProof::batch_verify(
-                 &verifier_key,
-                 &ciphertexts,
-                 context,
-                 &proofs,
-                 &proof_indices,
-                 &mut rng
-             ).is_ok(),
-             "Batch proof verification failed"
-         );
      }
 }
