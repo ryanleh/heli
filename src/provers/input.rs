@@ -55,7 +55,7 @@ pub struct BinaryProof {
 
 /// Bulletproof proof proving knowledge of x in [0, 2^bitlength) for the given
 /// ElGamal ciphertext.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RangeProof { 
     // Bulletproof commitment
     range_comms: Vec<G>,
@@ -70,7 +70,7 @@ pub struct RangeProof {
     bp_rs: Vec<Scalar>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum InputProof {
     Binary(BinaryProof),
     Range(RangeProof),
@@ -313,7 +313,7 @@ impl Prover for InputProof {
             (InputProofKey::Binary { enc_pk }, InputProof::Binary(binary_proof)) => {
                 let g = G::generator();
                 
-                // Apply fiat-shamir to generate challenge
+        // Apply fiat-shamir to generate challenge
                 let challenge = fiat_shamir(
                     &binary_proof.g_x0.iter()
                         .chain(binary_proof.pk_x0.iter())
@@ -329,33 +329,33 @@ impl Prover for InputProof {
                 // corresponds to either 0 or 1
                 for i in 0..binary_proof.challenges_x.len() {
                     let challenge_0 = binary_proof.challenges_x[i];
-                    let challenge_1 = challenge - challenge_0;
+            let challenge_1 = challenge - challenge_0;
 
-                    // X=0, check DLEQ(c_0, pk_i^r)
-                    check_claim!(
+            // X=0, check DLEQ(c_0, pk_i^r)
+            check_claim!(
                                 g * binary_proof.x0[i],
                                 binary_proof.g_x0[i] + ciphertext.rand * challenge_0,
                                 format!("Claim failed: DLEQ(c_0, pk_{}^r) for x=0", i)
-                    );
-                    check_claim!(
+            );
+            check_claim!(
                                 enc_pk[i] * binary_proof.x0[i],
                                 binary_proof.pk_x0[i] + ciphertext.slots[i] * challenge_0,
                                 format!("Claim failed: DLEQ(c_0, pk_{}^r) for x=0", i)
-                    );
+            );
 
-                    // X=1, check DLEQ(c_0, pk_i^r / g)
-                    check_claim!(
+            // X=1, check DLEQ(c_0, pk_i^r / g)
+            check_claim!(
                                 g * binary_proof.x1[i],
                                 binary_proof.g_x1[i] + ciphertext.rand * challenge_1,
                                 format!("Claim failed: DLEQ(c_0, pk_{}^r / g) for x=1", i)
-                    );
-                    check_claim!(
+            );
+            check_claim!(
                                 enc_pk[i] * binary_proof.x1[i],
                                 binary_proof.pk_x1[i] + (ciphertext.slots[i] - g) * challenge_1,
                                 format!("Claim failed: DLEQ(c_0, pk_{}^r / g) for x=1", i)
-                    );
-                }
-                Ok(())
+            );
+        }
+        Ok(())
             },
             (InputProofKey::Range { bitlength, enc_pk, g_comm }, InputProof::Range(range_proof)) => {
                 let g = G::generator();
@@ -517,30 +517,30 @@ impl Prover for InputProof {
                 // Here we generate all the necessary randomnesss upfront.
                 let num_inputs = ciphertexts[0].slots.len() - 1; // -1 to exclude attestation slot
                 let num_proof_claims = 1 + 2 * num_inputs; // Only claim 1 + range consistency
-                let total_claims = proof_indices.len() * num_proof_claims;
-                let rands: Vec<_> = (0..total_claims)
-                    .map(|_| Scalar::random(&mut *rng))
-                    .collect();
+        let total_claims = proof_indices.len() * num_proof_claims;
+        let rands: Vec<_> = (0..total_claims)
+            .map(|_| Scalar::random(&mut *rng))
+            .collect();
 
-                // Many terms share the g, h, and pk bases
-                let mut g_scalar = Scalar::ZERO;
-                let mut h_scalar = Scalar::ZERO;
+        // Many terms share the g, h, and pk bases
+        let mut g_scalar = Scalar::ZERO;
+        let mut h_scalar = Scalar::ZERO;
                 let mut pk_scalars = vec![Scalar::ZERO; enc_pk.len()];
-                let mut scalars = Vec::new();
-                let mut bases = Vec::new();
+        let mut scalars = Vec::new();
+        let mut bases = Vec::new();
 
-                // Helper closure to add terms to the MSM vectors
-                let mut add_term = |scalar: Scalar, base: G| {
-                    scalars.push(scalar);
-                    bases.push(base);
-                };
+        // Helper closure to add terms to the MSM vectors
+        let mut add_term = |scalar: Scalar, base: G| {
+            scalars.push(scalar);
+            bases.push(base);
+        };
 
-                let mut r_idx = 0;
+        let mut r_idx = 0;
                 let g = G::generator();
                 let range_params = Self::get_bp_params(*bitlength, *g_comm, num_inputs)?;
 
-                // For each proof, add the relevant terms to the final MSM computation
-                for i in 0..proof_indices.len() {
+        // For each proof, add the relevant terms to the final MSM computation
+        for i in 0..proof_indices.len() {
                     let ciphertext = &ciphertexts[i];
                     let InputProof::Range(proof) = &proofs[i] else {
                         return Err(anyhow::anyhow!("Proof type mismatch"));
@@ -573,13 +573,13 @@ impl Prover for InputProof {
                             .cloned()
                             .collect::<Vec<_>>(),
                         &[]
-                    );
+            );
 
-                    // Check 1) c_0 = g^r
+            // Check 1) c_0 = g^r
                     g_scalar += proof.r * rands[r_idx];
                     add_term(-rands[r_idx], proof.comm_r);
                     add_term(-challenge * rands[r_idx], ciphertext.rand);
-                    r_idx += 1;
+            r_idx += 1;
 
                     // Check 4) Pederson commitments are consistent with the ciphertext
                     for j in 0..num_inputs {
@@ -587,28 +587,28 @@ impl Prover for InputProof {
                         h_scalar += proof.bp_rs[j] * rands[r_idx];
                         add_term(-rands[r_idx], proof.comm_bp_x[j]);
                         add_term(-challenge * rands[r_idx], proof.range_comms[j]);
-                        r_idx += 1;
+            r_idx += 1;
 
                         g_scalar += proof.xs[j] * rands[r_idx];
                         pk_scalars[j] += proof.r * rands[r_idx];
                         add_term(-rands[r_idx], proof.comm_x[j]);
                         add_term(-challenge * rands[r_idx], ciphertext.slots[j]);
-                        r_idx += 1;
-                    }
-                }
+                r_idx += 1;
+            }
+        }
 
-                // Add the shared basis terms
-                scalars.push(g_scalar);
-                scalars.push(h_scalar);
-                scalars.extend(pk_scalars);
+        // Add the shared basis terms
+        scalars.push(g_scalar);
+        scalars.push(h_scalar);
+        scalars.extend(pk_scalars);
                 bases.push(g);
                 bases.push(*g_comm);
                 bases.extend_from_slice(enc_pk);
 
-                // If all proofs are valid, the MSM should equal the identity
-                if G::multiscalar_mul(&scalars, &bases) == G::identity() {
-                    Ok(())
-                } else {
+        // If all proofs are valid, the MSM should equal the identity
+        if G::multiscalar_mul(&scalars, &bases) == G::identity() {
+            Ok(())
+        } else {
                     Err(anyhow::anyhow!(
                         "Batch verification failed (ciphertext consistency)"
                     ))

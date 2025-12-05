@@ -14,8 +14,8 @@ pub mod ciphertext;
 // Prove that input is well-formed
 pub mod input;
 
-//// Combine both ciphertext and input proofs (smaller keys, faster batch verifier)
-//pub mod combined;
+// Combine both ciphertext and input proofs via enums
+pub mod multi;
 
 /// Trait for proving well-formedness of a ciphertext 
 pub trait Prover: 'static {
