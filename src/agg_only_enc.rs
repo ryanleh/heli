@@ -1,33 +1,29 @@
 use crate::crypto::*;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
+use group::Group;
 use rand_core::{CryptoRng, RngCore};
 use serde::{Serialize, Deserialize};
 
 /// Aggregation-only encryption instantiated with
-/// * ElGamal linearly-homomorphic vector encryption
-/// * Naor-Pinkas-Reingold key-homomorphic PRF
+/// Naor-Pinkas-Reingold key-homomorphic PRF
 /// 
 /// This implementation only supports basic sums, not general linear functions.
 pub struct AggOnlyEnc;
 
 pub struct SecretKey {
-    enc_sk: ElGamalSecretKey,
     prf_key: Scalar,
     keygen_prf: ScalarPRF, 
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub struct EvalKey {
-    pub(crate) enc_pk: ElGamalPublicKey,
-    pub(crate) prf_key_share: Scalar,
-}
+pub struct EvalKey(Scalar);
+
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Ciphertext(Vec<G>);
 
 impl AggOnlyEnc {
     // Given the function arity, output a secret key and set of evaluation keys
-    pub fn setup<R: RngCore + CryptoRng>(arity: usize, length: usize, rng: &mut R) -> (SecretKey, Vec<EvalKey>) {
-        // Setup ElGamal encryption (encrypts `length` elements + a checksum)
-        let (enc_pk, enc_sk) = ElGamal::setup(length+1, rng);
-
+    pub fn setup<R: RngCore + CryptoRng>(arity: usize, rng: &mut R) -> (SecretKey, Vec<EvalKey>) {
         // Initialize PRF for generating client keys
         let mut keygen_prf_key = [0u8; 32];
         rng.fill_bytes(&mut keygen_prf_key);
@@ -38,32 +34,79 @@ impl AggOnlyEnc {
         let eval_keys = (0..arity).map(|i| {
             let prf_key_share = keygen_prf.evaluate(i as u64);
             prf_key += prf_key_share;
-            EvalKey { enc_pk: enc_pk.clone(), prf_key_share }
+            EvalKey(prf_key_share)
         }).collect();
 
-        (SecretKey { enc_sk, prf_key, keygen_prf }, eval_keys)
+        (SecretKey { prf_key, keygen_prf }, eval_keys)
     }
 
     // Encrypt an input under the provided context and randomness
-    pub fn encrypt(ek: &EvalKey, context: u64, r: Scalar, input: &[Scalar]) -> ElGamalCiphertext {
-        let attestation = KHPRF::evaluate(&ek.prf_key_share, context);
-        let ciphertext = ElGamal::encrypt(&ek.enc_pk, r, &input, &[attestation]);
-        ciphertext
+    pub fn encrypt(ek: &EvalKey, context: u32, input: &[Scalar]) -> Ciphertext {
+        // For each slot, the KH-PRF is evaluated on the context concatenated with the slot index.
+        let context_lifted = (context as u64) << 32;
+        let g = G::generator();
+        Ciphertext(input.iter()
+            .enumerate()
+            .map(|(i, x)| g * x + KHPRF::evaluate(&ek, context_lifted + i as u64))
+            .collect())
     }
-        
-    // Decrypt an aggregate ciphertext under the provided context with the
-    // specified dropouts. This function performs partial decryption, so
-    // inputs need to be post-processed to get the final result.
-    pub fn decrypt(sk: &SecretKey, context: u64, dropouts: &[u64], aggregate: ElGamalCiphertext) -> Result<Vec<G>> {
-        // Generate the KH-PRF contribution for missing evaluation keys
-        let dropout_prf_key = sk.keygen_prf.batch_evaluate(dropouts);
-        let mut partial_decryption = ElGamal::decrypt(&sk.enc_sk, aggregate);
 
-        let checksum = partial_decryption.pop().unwrap();
-        if KHPRF::evaluate(&(sk.prf_key - dropout_prf_key), context) != checksum {
-            return Err(anyhow!("Verification check failed"));
-        } 
-        Ok(partial_decryption)
+    // Generate the decryption mask for a given context and dropout list
+    pub fn decrypt_mask(sk: &SecretKey, context: u32, dropouts: &[usize], length: usize) -> Vec<G> {
+        let key = match dropouts.len() {
+            0 => sk.prf_key,
+            _ => sk.prf_key - sk.keygen_prf.batch_evaluate(dropouts),
+        };
+        let context_lifted = (context as u64) << 32;
+        (0..length).map(|i| KHPRF::evaluate(&key, context_lifted + i as u64)).collect()
+    }
+
+    // Decrypt an aggregate ciphertext using the provided decryption mask
+    pub fn decrypt(aggregate: &[G], mask: &[G], max_dlog: u64) -> Result<Vec<u64>> {
+        let g = G::generator();
+        let result = aggregate
+            .into_iter()
+            .zip(mask.iter())
+            .map(|(a, m)| a - m)
+            .map(|a| compute_dlog(&g, &a, max_dlog))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(result)
+    }
+}
+
+impl std::ops::Deref for EvalKey {
+    type Target = Scalar;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for Ciphertext {
+    type Target = [G];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// Homomorphically add ciphertexts
+impl std::ops::Add for Ciphertext {
+    type Output = Ciphertext;
+    
+    fn add(mut self, other: Ciphertext) -> Ciphertext {
+        self.0.iter_mut()
+            .zip(other.iter())
+            .for_each(|(e1, e2)| *e1 += e2);
+        self
+    }
+}
+    
+// Homomorphically multiply ciphertext by scalar
+impl std::ops::Mul<Scalar> for Ciphertext {
+    type Output = Ciphertext;
+
+    fn mul(mut self, scalar: Scalar) -> Ciphertext {
+        self.0.iter_mut().for_each(|slot| *slot *= scalar);
+        self
     }
 }
 
@@ -83,11 +126,12 @@ mod tests {
     fn agg_only_correctness() {
         let mut rng = OsRng;
         let arity = 5;
+        let context = 2357;
         let length = 3;
         let max_val = 1000;
 
         // Setup the scheme
-        let (sk, eval_keys) = AggOnlyEnc::setup(arity, length, &mut rng);
+        let (sk, eval_keys) = AggOnlyEnc::setup(arity, &mut rng);
 
         // Generate ciphertexts
         let mut inputs = Vec::with_capacity(arity);
@@ -95,28 +139,28 @@ mod tests {
         for i in 0..arity {
             // Generate ciphertext
             let input = random_inputs(length, max_val);
-            ciphertexts.push(AggOnlyEnc::encrypt(&eval_keys[i], 0, Scalar::random(&mut rng), &input));
+            ciphertexts.push(AggOnlyEnc::encrypt(&eval_keys[i], context, &input));
             inputs.push(input);
         }
 
         // Test aggregation with different sets of dropouts
-        let dropouts = vec![vec![], vec![1, 2, 3], vec![0, 4]];
+        let dropouts: Vec<Vec<usize>> = vec![vec![], vec![1, 2, 3], vec![0, 4]];
         for dropout in dropouts {
             // Only aggregate ciphertexts that are not in the dropout list
             let (to_aggregate_inputs, to_aggregate_cts): (Vec<_>, Vec<_>) = ciphertexts
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| !dropout.contains(&(*i as u64)))
+                .filter(|(i, _)| !dropout.contains(i))
                 .map(|(i, ct)| (inputs[i].clone(), ct.clone()))
                 .unzip();
             let aggregate = to_aggregate_cts.into_iter().reduce(|a, b| a + b).unwrap();
-            let lifted_results = AggOnlyEnc::decrypt(&sk, 0, &dropout, aggregate).unwrap();
-
+            let mask = AggOnlyEnc::decrypt_mask(&sk, context, dropout.as_slice(), aggregate.len());
+            let results = AggOnlyEnc::decrypt(&aggregate, &mask, max_val * arity as u64).unwrap();
+            
             let expected_results = to_aggregate_inputs.into_iter().reduce(|mut a, b| {
                 a.iter_mut().zip(b.iter()).for_each(|(x, y)| *x += y);
                 a
             }).unwrap();
-            let results = ElGamal::post_process(arity as u64 * max_val, &lifted_results).unwrap();
             assert_eq!(results.into_iter().map(Scalar::from).collect::<Vec<_>>(), expected_results);
         }
     }
@@ -126,25 +170,26 @@ mod tests {
         let mut rng = OsRng;
         let arity = 4;
         let length = 2;
-        let context = 456u64;
+        let context = 2357;
         let max_val = 100;
 
         // Setup the scheme
-        let (sk, eval_keys) = AggOnlyEnc::setup(arity, length, &mut rng);
+        let (sk, eval_keys) = AggOnlyEnc::setup(arity, &mut rng);
 
         // Generate ciphertexts
         let mut inputs = Vec::with_capacity(arity);
         let mut ciphertexts = Vec::with_capacity(arity);
         for i in 0..arity {
             let input = random_inputs(length, max_val);
-            ciphertexts.push(AggOnlyEnc::encrypt(&eval_keys[i], context, Scalar::random(&mut rng), &input));
+            ciphertexts.push(AggOnlyEnc::encrypt(&eval_keys[i], context, &input));
             inputs.push(input);
         }
 
         // Test case 1: Claim dropouts that didn't happen
         let aggregate1 = ciphertexts.clone().into_iter().reduce(|a, b| a + b).unwrap();
-        let wrong_dropouts = vec![0u64, 2u64]; // Claiming clients 0 and 2 dropped out, but they didn't
-        let result1 = AggOnlyEnc::decrypt(&sk, context, &wrong_dropouts, aggregate1);
+        let wrong_dropouts = vec![0, 2]; // Claiming clients 0 and 2 dropped out, but they didn't
+        let mask = AggOnlyEnc::decrypt_mask(&sk, context, wrong_dropouts.as_slice(), aggregate1.len());
+        let result1 = AggOnlyEnc::decrypt(&aggregate1, &mask, max_val);
         assert!(result1.is_err());
 
         // Test case 2: Actually drop some clients but don't report it
@@ -156,7 +201,8 @@ mod tests {
             .map(|(i, ct)| (inputs[i].clone(), ct.clone()))
             .unzip();
         let aggregate2 = remaining_cts.into_iter().reduce(|a, b| a + b).unwrap();
-        let result2 = AggOnlyEnc::decrypt(&sk, context, &[], aggregate2); // Don't report dropouts
+        let mask = AggOnlyEnc::decrypt_mask(&sk, context, wrong_dropouts.as_slice(), aggregate2.len());
+        let result2 = AggOnlyEnc::decrypt(&aggregate2, &mask, max_val);
         assert!(result2.is_err());
     }
 
@@ -165,24 +211,25 @@ mod tests {
         let mut rng = OsRng;
         let arity = 3;
         let length = 2;
-        let context = 111u64;
-        let wrong_context = 222u64;
-        let context1 = 333u64;
-        let context2 = 444u64;
+        let context = 111u32;
+        let wrong_context = 222u32;
+        let context1 = 333u32;
+        let context2 = 444u32;
         let max_val = 100;
 
         // Setup the scheme
-        let (sk, eval_keys) = AggOnlyEnc::setup(arity, length, &mut rng);
+        let (sk, eval_keys) = AggOnlyEnc::setup(arity, &mut rng);
 
         // Test case 1: Wrong context
         let mut ciphertexts = Vec::with_capacity(arity);
         for i in 0..arity {
             let input = random_inputs(length, max_val);
-            ciphertexts.push(AggOnlyEnc::encrypt(&eval_keys[i], context, Scalar::random(&mut rng), &input));
+            ciphertexts.push(AggOnlyEnc::encrypt(&eval_keys[i], context, &input));
         }
 
         let aggregate1 = ciphertexts.into_iter().reduce(|a, b| a + b).unwrap();
-        let result1 = AggOnlyEnc::decrypt(&sk, wrong_context, &[], aggregate1);
+        let mask = AggOnlyEnc::decrypt_mask(&sk, wrong_context, &[], aggregate1.len());
+        let result1 = AggOnlyEnc::decrypt(&aggregate1, &mask, max_val);
         assert!(result1.is_err());
 
         // Test case 2: Mixed contexts
@@ -190,14 +237,16 @@ mod tests {
         for i in 0..arity {
             let input = random_inputs(length, max_val);
             let ctx = if i % 2 == 0 { context1 } else { context2 };
-            ciphertexts2.push(AggOnlyEnc::encrypt(&eval_keys[i], ctx, Scalar::random(&mut rng), &input));
+            ciphertexts2.push(AggOnlyEnc::encrypt(&eval_keys[i], ctx, &input));
         }
 
         let aggregate2 = ciphertexts2.into_iter().reduce(|a, b| a + b).unwrap();
-        let result2 = AggOnlyEnc::decrypt(&sk, context1, &[], aggregate2.clone());
+        let mask2 = AggOnlyEnc::decrypt_mask(&sk, context1, &[], aggregate2.len());
+        let result2 = AggOnlyEnc::decrypt(&aggregate2, &mask2, max_val);
         assert!(result2.is_err());
 
-        let result3 = AggOnlyEnc::decrypt(&sk, context2, &[], aggregate2);
+        let mask3 = AggOnlyEnc::decrypt_mask(&sk, context2, &[], aggregate2.len());
+        let result3 = AggOnlyEnc::decrypt(&aggregate2, &mask3, max_val);
         assert!(result3.is_err());
     }
 }

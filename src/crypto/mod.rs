@@ -2,9 +2,9 @@
 pub type G = curve25519_dalek::RistrettoPoint;
 pub type Scalar = curve25519_dalek::Scalar;
 
-/// ElGamal linearly-homomorphic vector encryption scheme
-pub mod elgamal;
-pub use elgamal::*;
+/// 
+pub mod dlog;
+pub use dlog::*;
 
 /// Two different PRFs:
 /// * AES-based PRF for generating random scalar elements,

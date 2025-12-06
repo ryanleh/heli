@@ -43,11 +43,14 @@ impl ScalarPRF {
 
     // Computes the sum of a batch of PRF evaluations. It uses a 320-bit
     // accumulator, so can support up to 2^64 unique evaluations.
-    pub fn batch_evaluate(&self, indices: &[u64]) -> Scalar {
+    pub fn batch_evaluate(&self, indices: &[usize]) -> Scalar {
+        if indices.is_empty() {
+            return Scalar::ZERO;
+        }
         let mut accum = [0u64; 5];
         for idx in indices.into_iter() {
             // Compute the PRF eval
-            let aes_blocks = self.evaluate_aes(*idx);
+            let aes_blocks = self.evaluate_aes(*idx as u64);
             let limbs = [
                 u64::from_le_bytes(aes_blocks[0][0..8].try_into().unwrap()),
                 u64::from_le_bytes(aes_blocks[0][8..16].try_into().unwrap()),
