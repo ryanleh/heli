@@ -15,11 +15,17 @@ pub struct ScalarPRF {
 }
 
 impl KHPRF {
-    // Evaluates the PRF on the given input. For our purposes, the
+    // Evaluates the PRF on the given context and index. For our purposes, the
     // input just needs to a number, but can be an arbitrary bit-string.
-    pub fn evaluate(key: &Scalar, input: u64) -> G {
-        let base = G::hash_from_bytes::<Sha3_512>(&input.to_le_bytes().as_ref());
+    pub fn evaluate_context(key: &Scalar, context: u32, index: usize) -> G {
+        let base = Self::compute_generator(context, index);
         base * key
+    }
+
+    // Compute the generator of the PRF
+    pub fn compute_generator(context: u32, index: usize) -> G {
+        let full_context = (context as u64) << 32 + index as u64;
+        G::hash_from_bytes::<Sha3_512>(&full_context.to_le_bytes().as_ref())
     }
 }
 

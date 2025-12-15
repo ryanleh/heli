@@ -2,7 +2,7 @@
 pub type G = curve25519_dalek::RistrettoPoint;
 pub type Scalar = curve25519_dalek::Scalar;
 
-/// 
+///
 pub mod dlog;
 pub use dlog::*;
 

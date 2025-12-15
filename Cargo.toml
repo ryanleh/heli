@@ -53,9 +53,9 @@ debug = true
 #name = "provers"
 #harness = false
 #
-#[[bin]]
-#name = "verify-bench"
-#path = "benches/bin/verify_bench.rs"
+[[bin]]
+name = "verify-bench"
+path = "benches/bin/verify_bench.rs"
 #
 #[[bin]]
 #name = "size-bench"

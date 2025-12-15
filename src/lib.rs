@@ -14,8 +14,8 @@ pub mod crypto;
 /// Aggregation-only encryption scheme
 pub mod agg_only_enc;
 
-///// Proofs for protecting against malicious clients
-//pub mod provers;
+/// Proofs for protecting against malicious clients
+pub mod proofs;
 
 // TODO: End-to-end code is out of date
 //

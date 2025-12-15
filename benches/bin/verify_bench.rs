@@ -1,7 +1,8 @@
 use clap::Parser;
-use heli::primitives::{
-    ElGamal,
-    provers::{Binary, Prover, Range},
+use heli::{
+    agg_only_enc::AggOnlyEnc,
+    crypto::Scalar,
+    proofs::Proof,
 };
 use rand::Rng;
 use rand_core::OsRng;
@@ -84,8 +85,10 @@ impl TimeStats {
     }
 }
 
+const CONTEXT: u32 = 42;
+
 /// Run batch proof verification benchmarks for different client counts
-fn bench_verification<P: Prover>(
+fn bench_verification(
     config: &Config,
     proof_system_name: &str,
 ) -> Vec<(usize, TimeStats)> {
@@ -98,22 +101,23 @@ fn bench_verification<P: Prover>(
     );
 
     // Setup - use the same inputs for all benchmarks
-    let input: Vec<u64> = (0..config.length)
-        .map(|_| OsRng.gen_range(0..(1 << config.bitlength)))
+    let input: Vec<Scalar> = (0..config.length)
+        .map(|_| Scalar::from(OsRng.gen_range(0u64..(1u64 << config.bitlength))))
         .collect();
-    let (params, _sk, cks) = ElGamal::setup(*max_clients, config.length, &mut OsRng);
-    let (prover_key, verifier_key) = P::setup(config.length, config.bitlength);
+    let (_sk, eval_keys) = AggOnlyEnc::setup(*max_clients, &mut OsRng);
+    let (prover_keys, verifier_key) = Proof::setup(&eval_keys, config.bitlength, config.length);
 
-    // Create encodings and proofs for maximum number of clients
-    let (encodings, proofs): (Vec<_>, Vec<_>) = (0..*max_clients)
+    // Create ciphertexts and proofs for maximum number of clients
+    let (ciphertexts, proofs): (Vec<_>, Vec<_>) = (0..*max_clients)
         .map(|i| {
-            let (encoding, r) = ElGamal::encode(&cks[i], &input, &mut OsRng).unwrap();
-            let proof = P::prove(&prover_key, &cks[i], &input, r, &encoding, &mut OsRng).unwrap();
-            (encoding, proof)
+            let ciphertext = AggOnlyEnc::encrypt(&eval_keys[i], CONTEXT, &input);
+            let proof = Proof::prove(&prover_keys[i], &eval_keys[i], CONTEXT, &input, &mut OsRng).unwrap();
+            (ciphertext, proof)
         })
         .unzip();
 
     let mut results = Vec::new();
+    let mut rng = OsRng;
 
     // Benchmark each client count
     for &client_count in &config.clients {
@@ -121,19 +125,19 @@ fn bench_verification<P: Prover>(
 
         // Create indices for this client count
         let indices = (0..client_count).collect::<Vec<_>>();
-        let client_encodings = &encodings[..client_count];
+        let client_ciphertexts = &ciphertexts[..client_count];
         let client_proofs = &proofs[..client_count];
 
         // Warmup runs
         for _ in 0..config.warmup {
             black_box(
-                P::batch_verify(
+                Proof::batch_verify(
                     &verifier_key,
-                    &params,
-                    &indices,
-                    client_encodings,
+                    client_ciphertexts,
+                    CONTEXT,
                     client_proofs,
-                    &mut OsRng,
+                    &indices,
+                    &mut rng,
                 )
                 .unwrap(),
             );
@@ -144,13 +148,13 @@ fn bench_verification<P: Prover>(
         for _ in 0..config.iterations {
             let start = Instant::now();
             black_box(
-                P::batch_verify(
+                Proof::batch_verify(
                     &verifier_key,
-                    &params,
-                    &indices,
-                    client_encodings,
+                    client_ciphertexts,
+                    CONTEXT,
                     client_proofs,
-                    &mut OsRng,
+                    &indices,
+                    &mut rng,
                 )
                 .unwrap(),
             );
@@ -164,132 +168,18 @@ fn bench_verification<P: Prover>(
     results
 }
 
-/// Run batch proof verification benchmarks for untagged proofs
-fn bench_verification_untagged<P: Prover>(
-    config: &Config,
-    proof_system_name: &str,
-) -> Vec<(usize, TimeStats)> {
-    // Find the maximum number of clients to set up for
-    let max_clients = config.clients.iter().max().unwrap_or(&100);
-
-    println!(
-        "Setting up untagged verification benchmark for up to {} clients using {} proof system...",
-        max_clients, proof_system_name
-    );
-
-    // Setup - use the same inputs for all benchmarks
-    let input: Vec<u64> = (0..config.length)
-        .map(|_| OsRng.gen_range(0..(1 << config.bitlength)))
-        .collect();
-    let (params, _sk, cks) = ElGamal::setup(*max_clients, config.length, &mut OsRng);
-    let (prover_key, verifier_key) = P::setup(config.length, config.bitlength);
-
-    // Create encodings and untagged proofs for maximum number of clients
-    let (encodings, proofs): (Vec<_>, Vec<_>) = (0..*max_clients)
-        .map(|i| {
-            let (encoding, r) = ElGamal::encode(&cks[i], &input, &mut OsRng).unwrap();
-            let proof =
-                P::prove_untagged(&prover_key, &cks[i], &input, r, &encoding, &mut OsRng).unwrap();
-            (encoding, proof)
-        })
-        .unzip();
-
-    let mut results = Vec::new();
-
-    // Benchmark each client count
-    for &client_count in &config.clients {
-        println!("Benchmarking {} clients (untagged)...", client_count);
-
-        // Create indices for this client count
-        let indices = (0..client_count).collect::<Vec<_>>();
-        let client_encodings = &encodings[..client_count];
-        let client_proofs = &proofs[..client_count];
-
-        // Warmup runs
-        for _ in 0..config.warmup {
-            black_box(
-                P::batch_verify_untagged(
-                    &verifier_key,
-                    &params,
-                    &indices,
-                    client_encodings,
-                    client_proofs,
-                    &mut OsRng,
-                )
-                .unwrap(),
-            );
-        }
-
-        // Measurement runs
-        let mut times = Vec::with_capacity(config.iterations);
-        for _ in 0..config.iterations {
-            let start = Instant::now();
-            black_box(
-                P::batch_verify_untagged(
-                    &verifier_key,
-                    &params,
-                    &indices,
-                    client_encodings,
-                    client_proofs,
-                    &mut OsRng,
-                )
-                .unwrap(),
-            );
-            let duration = start.elapsed();
-            times.push(duration);
-        }
-
-        results.push((client_count, TimeStats::from_times(&times)));
-    }
-
-    results
-}
 
 fn main() {
     let config = Config::parse();
 
     println!("Running proof verification benchmark...");
 
-    if config.bitlength == 1 {
-        // For bitlength 1, run both Binary and Range proof systems
-        println!("\n{}", "=".repeat(80));
-        println!("BINARY PROOF SYSTEM");
-        println!("{}", "=".repeat(80));
+    println!("\n{}", "=".repeat(80));
+    println!("RANGE PROOF SYSTEM");
+    println!("{}", "=".repeat(80));
 
-        let binary_results = bench_verification::<Binary>(&config, "Binary");
-        print_results(&binary_results, &config, "Binary");
-
-        println!("\n{}", "=".repeat(80));
-        println!("BINARY PROOF SYSTEM (UNTAGGED)");
-        println!("{}", "=".repeat(80));
-
-        let binary_untagged_results = bench_verification_untagged::<Binary>(&config, "Binary");
-        print_results(&binary_untagged_results, &config, "Binary (Untagged)");
-
-        println!("\n{}", "=".repeat(80));
-        println!("RANGE PROOF SYSTEM");
-        println!("{}", "=".repeat(80));
-
-        let range_results = bench_verification::<Range>(&config, "Range");
-        print_results(&range_results, &config, "Range");
-
-        println!("\n{}", "=".repeat(80));
-        println!("RANGE PROOF SYSTEM (UNTAGGED)");
-        println!("{}", "=".repeat(80));
-
-        let range_untagged_results = bench_verification_untagged::<Range>(&config, "Range");
-        print_results(&range_untagged_results, &config, "Range (Untagged)");
-    } else {
-        let results = bench_verification::<Range>(&config, "Range");
-        print_results(&results, &config, "Range");
-
-        println!("\n{}", "=".repeat(80));
-        println!("RANGE PROOF SYSTEM (UNTAGGED)");
-        println!("{}", "=".repeat(80));
-
-        let range_untagged_results = bench_verification_untagged::<Range>(&config, "Range");
-        print_results(&range_untagged_results, &config, "Range (Untagged)");
-    }
+    let range_results = bench_verification(&config, "Range");
+    print_results(&range_results, &config, "Range");
 
     println!("\n{}", "=".repeat(80));
 }

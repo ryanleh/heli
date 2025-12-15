@@ -2,17 +2,17 @@ use crate::crypto::*;
 use anyhow::Result;
 use group::Group;
 use rand_core::{CryptoRng, RngCore};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// Aggregation-only encryption instantiated with
 /// Naor-Pinkas-Reingold key-homomorphic PRF
-/// 
+///
 /// This implementation only supports basic sums, not general linear functions.
 pub struct AggOnlyEnc;
 
 pub struct SecretKey {
     prf_key: Scalar,
-    keygen_prf: ScalarPRF, 
+    keygen_prf: ScalarPRF,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -31,24 +31,34 @@ impl AggOnlyEnc {
 
         // Generate evaluation keys
         let mut prf_key = Scalar::ZERO;
-        let eval_keys = (0..arity).map(|i| {
-            let prf_key_share = keygen_prf.evaluate(i as u64);
-            prf_key += prf_key_share;
-            EvalKey(prf_key_share)
-        }).collect();
+        let eval_keys = (0..arity)
+            .map(|i| {
+                let prf_key_share = keygen_prf.evaluate(i as u64);
+                prf_key += prf_key_share;
+                EvalKey(prf_key_share)
+            })
+            .collect();
 
-        (SecretKey { prf_key, keygen_prf }, eval_keys)
+        (
+            SecretKey {
+                prf_key,
+                keygen_prf,
+            },
+            eval_keys,
+        )
     }
 
     // Encrypt an input under the provided context and randomness
     pub fn encrypt(ek: &EvalKey, context: u32, input: &[Scalar]) -> Ciphertext {
         // For each slot, the KH-PRF is evaluated on the context concatenated with the slot index.
-        let context_lifted = (context as u64) << 32;
         let g = G::generator();
-        Ciphertext(input.iter()
-            .enumerate()
-            .map(|(i, x)| g * x + KHPRF::evaluate(&ek, context_lifted + i as u64))
-            .collect())
+        Ciphertext(
+            input
+                .iter()
+                .enumerate()
+                .map(|(i, x)| g * x + KHPRF::evaluate_context(&ek, context, i))
+                .collect(),
+        )
     }
 
     // Generate the decryption mask for a given context and dropout list
@@ -57,8 +67,9 @@ impl AggOnlyEnc {
             0 => sk.prf_key,
             _ => sk.prf_key - sk.keygen_prf.batch_evaluate(dropouts),
         };
-        let context_lifted = (context as u64) << 32;
-        (0..length).map(|i| KHPRF::evaluate(&key, context_lifted + i as u64)).collect()
+        (0..length)
+            .map(|i| KHPRF::evaluate_context(&key, context, i))
+            .collect()
     }
 
     // Decrypt an aggregate ciphertext using the provided decryption mask
@@ -91,15 +102,16 @@ impl std::ops::Deref for Ciphertext {
 // Homomorphically add ciphertexts
 impl std::ops::Add for Ciphertext {
     type Output = Ciphertext;
-    
+
     fn add(mut self, other: Ciphertext) -> Ciphertext {
-        self.0.iter_mut()
+        self.0
+            .iter_mut()
             .zip(other.iter())
             .for_each(|(e1, e2)| *e1 += e2);
         self
     }
 }
-    
+
 // Homomorphically multiply ciphertext by scalar
 impl std::ops::Mul<Scalar> for Ciphertext {
     type Output = Ciphertext;
@@ -156,12 +168,18 @@ mod tests {
             let aggregate = to_aggregate_cts.into_iter().reduce(|a, b| a + b).unwrap();
             let mask = AggOnlyEnc::decrypt_mask(&sk, context, dropout.as_slice(), aggregate.len());
             let results = AggOnlyEnc::decrypt(&aggregate, &mask, max_val * arity as u64).unwrap();
-            
-            let expected_results = to_aggregate_inputs.into_iter().reduce(|mut a, b| {
-                a.iter_mut().zip(b.iter()).for_each(|(x, y)| *x += y);
-                a
-            }).unwrap();
-            assert_eq!(results.into_iter().map(Scalar::from).collect::<Vec<_>>(), expected_results);
+
+            let expected_results = to_aggregate_inputs
+                .into_iter()
+                .reduce(|mut a, b| {
+                    a.iter_mut().zip(b.iter()).for_each(|(x, y)| *x += y);
+                    a
+                })
+                .unwrap();
+            assert_eq!(
+                results.into_iter().map(Scalar::from).collect::<Vec<_>>(),
+                expected_results
+            );
         }
     }
 
@@ -186,9 +204,14 @@ mod tests {
         }
 
         // Test case 1: Claim dropouts that didn't happen
-        let aggregate1 = ciphertexts.clone().into_iter().reduce(|a, b| a + b).unwrap();
+        let aggregate1 = ciphertexts
+            .clone()
+            .into_iter()
+            .reduce(|a, b| a + b)
+            .unwrap();
         let wrong_dropouts = vec![0, 2]; // Claiming clients 0 and 2 dropped out, but they didn't
-        let mask = AggOnlyEnc::decrypt_mask(&sk, context, wrong_dropouts.as_slice(), aggregate1.len());
+        let mask =
+            AggOnlyEnc::decrypt_mask(&sk, context, wrong_dropouts.as_slice(), aggregate1.len());
         let result1 = AggOnlyEnc::decrypt(&aggregate1, &mask, max_val);
         assert!(result1.is_err());
 
@@ -201,7 +224,8 @@ mod tests {
             .map(|(i, ct)| (inputs[i].clone(), ct.clone()))
             .unzip();
         let aggregate2 = remaining_cts.into_iter().reduce(|a, b| a + b).unwrap();
-        let mask = AggOnlyEnc::decrypt_mask(&sk, context, wrong_dropouts.as_slice(), aggregate2.len());
+        let mask =
+            AggOnlyEnc::decrypt_mask(&sk, context, wrong_dropouts.as_slice(), aggregate2.len());
         let result2 = AggOnlyEnc::decrypt(&aggregate2, &mask, max_val);
         assert!(result2.is_err());
     }
