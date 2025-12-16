@@ -69,7 +69,6 @@ pub struct BinaryProof {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RangeProof { 
     /// Commitments for DLEQ claim
-    pub(super) hash_k: Vec<G>,
     pub(super) g_comm_k: G,
     // Bulletproof commitments
     pub(super) range_comms: Vec<G>,
@@ -273,10 +272,12 @@ impl Proof {
 
                 // Generate commitments for claims (1) and (2)
                 let k_rand = Scalar::random(&mut *rng);
-                let hash_k = (0..input.len())
-                    .map(|i| KHPRF::evaluate_context(&k_rand, context, i))
-                    .collect::<Vec<_>>();
                 let g_comm_k = *g_comm * k_rand;
+
+
+                let hash_bases = (0..input.len())
+                    .map(|i| KHPRF::compute_generator(context, i))
+                    .collect::<Vec<_>>();
 
                 // Generate commitments to bind the ciphertext to the bulletproof proof
                 let x_rands = vec![Scalar::random(&mut *rng); input.len()];
@@ -284,25 +285,24 @@ impl Proof {
                 let mut g_x = Vec::with_capacity(input.len());
                 let mut g_bp_x = Vec::with_capacity(input.len());
                 for i in 0..input.len() {
-                    g_x.push(g * x_rands[i]);
+                    g_x.push(hash_bases[i] * k_rand + g * x_rands[i]);
                     g_bp_x.push(*g_comm * bp_r_rands[i] + g * x_rands[i]);
                 }
 
                 // Apply fiat-shamir to non-interactively generate challenge
                 let challenge = fiat_shamir(
-                    &[g, *g_comm, g_comm_k]
-                        .iter()
-                        .chain(hash_k.iter())
-                        .chain(g_x.iter())
-                        .chain(g_bp_x.iter())
-                        .chain(range_comms.iter())
-                        .cloned()
-                        .collect::<Vec<_>>(),
+                    &[g, *g_comm, g_comm_k],
+                        //.iter()
+                        //.chain(hash_k.iter())
+                        //.chain(g_x.iter())
+                        //.chain(g_bp_x.iter())
+                        //.chain(range_comms.iter())
+                        //.cloned()
+                        //.collect::<Vec<_>>(),
                     &[],
                 );
 
                 Ok(Proof::Range(RangeProof {
-                    hash_k,
                     g_comm_k,
                     range_comms,
                     g_x,
@@ -357,14 +357,14 @@ impl Proof {
             ) => {
                 // Apply fiat-shamir to generate challenge (same as in prove)
                 let challenge = fiat_shamir(
-                    &[g, *g_comm, proof.g_comm_k]
-                        .iter()
-                        .chain(proof.hash_k.iter())
-                        .chain(proof.g_x.iter())
-                        .chain(proof.g_bp_x.iter())
-                        .chain(proof.range_comms.iter())
-                        .cloned()
-                        .collect::<Vec<_>>(),
+                    &[g, *g_comm, proof.g_comm_k],
+                        //.iter()
+                        //.chain(proof.hash_k.iter())
+                        //.chain(proof.g_x.iter())
+                        //.chain(proof.g_bp_x.iter())
+                        //.chain(proof.range_comms.iter())
+                        //.cloned()
+                        //.collect::<Vec<_>>(),
                     &[],
                 );
 
@@ -374,7 +374,7 @@ impl Proof {
                     let g_hash = KHPRF::compute_generator(context, i);
                     crate::check_claim!(
                         g * proof.xs[i] + g_hash * proof.k,
-                        ciphertext[i] * challenge + proof.g_x[i] + proof.hash_k[i],
+                        ciphertext[i] * challenge + proof.g_x[i],
                         format!("Claim 1 failed (ciphertext consistency) for slot {}", i)
                     );
 
@@ -386,11 +386,11 @@ impl Proof {
                     );
                 }
 
-                // Check claim 2: DLEQ(g_comm^k, key_commitment^k)
+                // Check claim 2
                 crate::check_claim!(
                     *g_comm * proof.k,
                     key_commitments[proof_index] * challenge + proof.g_comm_k,
-                    format!("Claim 2 failed (DLEQ) for proof index {}", proof_index)
+                    "Claim 2 failed (DLEQ)"
                 );
 
                 // Verify bulletproof (claim 3)
@@ -492,15 +492,17 @@ impl Proof {
                     })?;
 
                     // Apply fiat-shamir to non-interactively generate challenge
+                    //
+                    // TODO: Update
                     let challenge = fiat_shamir(
-                        &[g, *g_comm, proof.g_comm_k]
-                            .iter()
-                            .chain(proof.hash_k.iter())
-                            .chain(proof.g_x.iter())
-                            .chain(proof.g_bp_x.iter())
-                            .chain(proof.range_comms.iter())
-                            .cloned()
-                            .collect::<Vec<_>>(),
+                        &[g, *g_comm, proof.g_comm_k],
+                            //.iter()
+                            //.chain(proof.hash_k.iter())
+                            //.chain(proof.g_x.iter())
+                            //.chain(proof.g_bp_x.iter())
+                            //.chain(proof.range_comms.iter())
+                            //.cloned()
+                            //.collect::<Vec<_>>(),
                         &[],
                     );
 
@@ -518,7 +520,7 @@ impl Proof {
                         g_scalar += proof.xs[j] * rands[r_idx];
                         g_hash_scalars[j] += proof.k * rands[r_idx];
                         add_term(-rands[r_idx], proof.g_x[j]);
-                        add_term(-rands[r_idx], proof.hash_k[j]);
+                        //add_term(-rands[r_idx], proof.hash_k[j]);
                         add_term(-challenge * rands[r_idx], ciphertext[j]);
                         r_idx += 1;
 
@@ -732,31 +734,31 @@ mod tests {
                     );
                 }
 
-                // Tamper with hash_k
-                let mut bad_proof = proof.clone();
-                if let Proof::Range(bad_range_proof) = &mut bad_proof {
-                    bad_range_proof.hash_k[0] = G::generator() * Scalar::random(&mut rng);
-                    assert!(
-                        bad_proof
-                            .verify(&verifier_key, &ciphertext, CONTEXT, 0)
-                            .is_err(),
-                        "Tampered hash_k accepted for config {}",
-                        config_idx
-                    );
-                    assert!(
-                        Proof::batch_verify(
-                            &verifier_key,
-                            &[ciphertext.clone()],
-                            CONTEXT,
-                            &[bad_proof.clone()],
-                            &[0],
-                            &mut rng
-                        )
-                        .is_err(),
-                        "Tampered hash_k accepted in batch for config {}",
-                        config_idx
-                    );
-                }
+//                // Tamper with hash_k
+//                let mut bad_proof = proof.clone();
+//                if let Proof::Range(bad_range_proof) = &mut bad_proof {
+//                    bad_range_proof.hash_k[0] = G::generator() * Scalar::random(&mut rng);
+//                    assert!(
+//                        bad_proof
+//                            .verify(&verifier_key, &ciphertext, CONTEXT, 0)
+//                            .is_err(),
+//                        "Tampered hash_k accepted for config {}",
+//                        config_idx
+//                    );
+//                    assert!(
+//                        Proof::batch_verify(
+//                            &verifier_key,
+//                            &[ciphertext.clone()],
+//                            CONTEXT,
+//                            &[bad_proof.clone()],
+//                            &[0],
+//                            &mut rng
+//                        )
+//                        .is_err(),
+//                        "Tampered hash_k accepted in batch for config {}",
+//                        config_idx
+//                    );
+//                }
 
                 // Tamper with g_x
                 let mut bad_proof = proof.clone();
