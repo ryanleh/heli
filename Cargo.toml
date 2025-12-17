@@ -41,22 +41,22 @@ debug-assertions = true
 incremental = true
 debug = true
 
-#[[bench]]
-#name = "aggregation"
-#harness = false
-#
-#[[bench]]
-#name = "dropout"
-#harness = false
-#
-#[[bench]]
-#name = "provers"
-#harness = false
-#
+[[bench]]
+name = "aggregation"
+harness = false
+
+[[bench]]
+name = "dropout"
+harness = false
+
+[[bench]]
+name = "provers"
+harness = false
+
 [[bin]]
 name = "verify-bench"
 path = "benches/bin/verify_bench.rs"
-#
-#[[bin]]
-#name = "size-bench"
-#path = "benches/bin/size_bench.rs"
+
+[[bin]]
+name = "size-bench"
+path = "benches/bin/size_bench.rs"

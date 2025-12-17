@@ -81,7 +81,7 @@ pub struct RangeProof {
     bp_rs: Vec<Scalar>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Proof {
     Binary(BinaryProof),
     Range(RangeProof),

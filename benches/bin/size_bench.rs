@@ -27,11 +27,18 @@ fn random_input(length: usize, bitlength: usize) -> Vec<u64> {
         .collect()
 }
 
-fn measure_sizes(length: usize, bitlength: usize, proof_system_name: &str) {
+fn measure_sizes(length: usize, bitlength: usize) {
     const CONTEXT: u32 = 42;
     let mut rng = OsRng;
     let (_, eval_keys) = AggOnlyEnc::setup(1, &mut rng);
     let (prover_keys, _) = Proof::setup(&eval_keys, bitlength, length);
+
+    // Determine the actual proof system type being used
+    let proof_system_name = if bitlength == 1 && length < 8 {
+        "Binary"
+    } else {
+        "Range"
+    };
 
     let input: Vec<Scalar> = random_input(length, bitlength)
         .into_iter()
@@ -79,8 +86,7 @@ fn main() {
 
     for &length in &config.length {
         for &bitlength in &config.bitlength {
-            // Note: Binary proofs are not yet implemented, so we only measure Range
-            measure_sizes(length, bitlength, "Range");
+            measure_sizes(length, bitlength);
         }
     }
 
