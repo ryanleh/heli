@@ -10,6 +10,7 @@ use merlin::Transcript;
 use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_512};
+use std::borrow::Borrow;
 use tari_bulletproofs_plus::{
     commitment_opening::CommitmentOpening,
     generators::pedersen_gens::{ExtensionDegree, PedersenGens},
@@ -168,8 +169,8 @@ impl Proof {
     }
 
     /// Prove the following relation (informally stated) for secrets x_i and k:
-    ///  1) c_0 = g^x_i * H(context || i)^k, 
-    ///  2) DLEQ(g_comm^k, H(context || i)^k) 
+    ///  1) c_i = g^x_i * H(context || i)^k, 
+    ///  2) C_i = g_comm^k
     ///  3) x_i < bitlength
     /// 
     /// This enforces that the client's aggregation-only ciphertext is well-formed.
@@ -178,9 +179,15 @@ impl Proof {
         ek: &EvalKey,
         context: u32,
         input: &[Scalar],
+        ciphertext: &Ciphertext,
         rng: &mut R,
     ) -> Result<Proof> {
         let g = G::generator();
+
+        // Generators for the key-homomorphic PRF
+        let hash_bases = (0..input.len())
+            .map(|i| KHPRF::compute_generator(context, i))
+            .collect::<Vec<_>>();
         
         // Claims (1) and (2) are done using standard Schnorr proofs. Claim (3) is done
         // using either OR composition for x=0 and x=1, or bulletproofs
@@ -224,21 +231,13 @@ impl Proof {
                 }
 
                 // Generate challenge
-                //
-                // TODO: Can probably do this without cloning
                 let challenge = fiat_shamir(
                     [g, *g_comm, g_comm_k]
-                        .into_iter()
-                        .chain(g_x0.clone().into_iter())
-                        .chain(g_x1.clone().into_iter())
-                        .chain(hash_k.clone().into_iter())
-                        .collect::<Vec<_>>()
-                        .as_slice(),
-                    [k_rand]
-                        .into_iter()
-                        .chain(x_rand.clone().into_iter())
-                        .collect::<Vec<_>>()
-                        .as_slice(),
+                        .iter()
+                        .chain(g_x0.iter())
+                        .chain(g_x1.iter())
+                        .chain(hash_k.iter()),
+                    [k_rand].iter().chain(x_rand.iter()),
                 );
 
                 // Generate responses
@@ -273,13 +272,10 @@ impl Proof {
                 // Generate commitments for claims (1) and (2)
                 let k_rand = Scalar::random(&mut *rng);
                 let g_comm_k = *g_comm * k_rand;
+                
 
-
-                let hash_bases = (0..input.len())
-                    .map(|i| KHPRF::compute_generator(context, i))
-                    .collect::<Vec<_>>();
-
-                // Generate commitments to bind the ciphertext to the bulletproof proof
+                // Generate commitments to for claim (1) and to bind the ciphertext
+                // to the bulletproof proof
                 let x_rands = vec![Scalar::random(&mut *rng); input.len()];
                 let bp_r_rands = vec![Scalar::random(&mut *rng); input.len()];
                 let mut g_x = Vec::with_capacity(input.len());
@@ -291,15 +287,13 @@ impl Proof {
 
                 // Apply fiat-shamir to non-interactively generate challenge
                 let challenge = fiat_shamir(
-                    &[g, *g_comm, g_comm_k],
-                        //.iter()
-                        //.chain(hash_k.iter())
-                        //.chain(g_x.iter())
-                        //.chain(g_bp_x.iter())
-                        //.chain(range_comms.iter())
-                        //.cloned()
-                        //.collect::<Vec<_>>(),
-                    &[],
+                    [g, *g_comm, g_comm_k]
+                        .iter()
+                        .chain(g_x.iter())
+                        .chain(g_bp_x.iter())
+                        .chain(range_comms.iter())
+                        .chain(ciphertext.iter()),
+                    std::iter::empty::<&Scalar>(),
                 );
 
                 Ok(Proof::Range(RangeProof {
@@ -357,15 +351,13 @@ impl Proof {
             ) => {
                 // Apply fiat-shamir to generate challenge (same as in prove)
                 let challenge = fiat_shamir(
-                    &[g, *g_comm, proof.g_comm_k],
-                        //.iter()
-                        //.chain(proof.hash_k.iter())
-                        //.chain(proof.g_x.iter())
-                        //.chain(proof.g_bp_x.iter())
-                        //.chain(proof.range_comms.iter())
-                        //.cloned()
-                        //.collect::<Vec<_>>(),
-                    &[],
+                    [g, *g_comm, proof.g_comm_k]
+                        .iter()
+                        .chain(proof.g_x.iter())
+                        .chain(proof.g_bp_x.iter())
+                        .chain(proof.range_comms.iter())
+                        .chain(ciphertext.iter()),
+                    std::iter::empty::<&Scalar>(),
                 );
 
                 // TODO: There's a few repeated group operations here
@@ -492,18 +484,14 @@ impl Proof {
                     })?;
 
                     // Apply fiat-shamir to non-interactively generate challenge
-                    //
-                    // TODO: Update
                     let challenge = fiat_shamir(
-                        &[g, *g_comm, proof.g_comm_k],
-                            //.iter()
-                            //.chain(proof.hash_k.iter())
-                            //.chain(proof.g_x.iter())
-                            //.chain(proof.g_bp_x.iter())
-                            //.chain(proof.range_comms.iter())
-                            //.cloned()
-                            //.collect::<Vec<_>>(),
-                        &[],
+                        [g, *g_comm, proof.g_comm_k]
+                            .iter()
+                            .chain(proof.g_x.iter())
+                            .chain(proof.g_bp_x.iter())
+                            .chain(proof.range_comms.iter())
+                            .chain(ciphertext.iter()),
+                        std::iter::empty::<&Scalar>(),
                     );
 
                     // Check claim 2: DLEQ(g_comm^k, H(context || i)^k)
@@ -520,7 +508,6 @@ impl Proof {
                         g_scalar += proof.xs[j] * rands[r_idx];
                         g_hash_scalars[j] += proof.k * rands[r_idx];
                         add_term(-rands[r_idx], proof.g_x[j]);
-                        //add_term(-rands[r_idx], proof.hash_k[j]);
                         add_term(-challenge * rands[r_idx], ciphertext[j]);
                         r_idx += 1;
 
@@ -555,6 +542,35 @@ impl Proof {
     }
 }
 
+
+/// Apply fiat-shamir to a list of group and scalar elements
+fn fiat_shamir<I, J>(elements: I, scalars: J) -> Scalar
+where
+    I: IntoIterator,
+    I::Item: Borrow<G>,
+    J: IntoIterator,
+    J::Item: Borrow<Scalar>,
+{
+    let mut hasher = Sha3_512::new();
+    for g in elements {
+        hasher.update(g.borrow().compress().as_bytes());
+    }
+    for s in scalars {
+        hasher.update(s.borrow().as_bytes());
+    }
+    Scalar::from_hash(hasher)
+}
+
+// Helper macro for verifying claims
+#[macro_export]
+macro_rules! check_claim {
+    ($left:expr, $right:expr, $msg:expr) => {
+        if $left != $right {
+            return Err(anyhow::anyhow!($msg));
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,7 +601,7 @@ mod tests {
                 .collect();
             let ciphertext = AggOnlyEnc::encrypt(&eval_keys[0], CONTEXT, &input);
             let proof =
-                Proof::prove(&prover_keys[0], &eval_keys[0], CONTEXT, &input, &mut rng).unwrap();
+                Proof::prove(&prover_keys[0], &eval_keys[0], CONTEXT, &input, &ciphertext, &mut rng).unwrap();
 
             // Test individual verification
             assert!(
@@ -633,7 +649,7 @@ mod tests {
                 .collect();
             let ciphertext = AggOnlyEnc::encrypt(&eval_keys[0], CONTEXT, &input);
             let proof =
-                Proof::prove(&prover_keys[0], &eval_keys[0], CONTEXT, &input, &mut rng).unwrap();
+                Proof::prove(&prover_keys[0], &eval_keys[0], CONTEXT, &input, &ciphertext, &mut rng).unwrap();
 
             // Verify the original proof is valid with both methods
             assert!(proof.verify(&verifier_key, &ciphertext, CONTEXT, 0).is_ok());
@@ -733,32 +749,6 @@ mod tests {
                         config_idx
                     );
                 }
-
-//                // Tamper with hash_k
-//                let mut bad_proof = proof.clone();
-//                if let Proof::Range(bad_range_proof) = &mut bad_proof {
-//                    bad_range_proof.hash_k[0] = G::generator() * Scalar::random(&mut rng);
-//                    assert!(
-//                        bad_proof
-//                            .verify(&verifier_key, &ciphertext, CONTEXT, 0)
-//                            .is_err(),
-//                        "Tampered hash_k accepted for config {}",
-//                        config_idx
-//                    );
-//                    assert!(
-//                        Proof::batch_verify(
-//                            &verifier_key,
-//                            &[ciphertext.clone()],
-//                            CONTEXT,
-//                            &[bad_proof.clone()],
-//                            &[0],
-//                            &mut rng
-//                        )
-//                        .is_err(),
-//                        "Tampered hash_k accepted in batch for config {}",
-//                        config_idx
-//                    );
-//                }
 
                 // Tamper with g_x
                 let mut bad_proof = proof.clone();
@@ -864,7 +854,7 @@ mod tests {
                 .collect();
             let ciphertext = AggOnlyEnc::encrypt(&eval_keys[0], CONTEXT, &input);
             let proof =
-                Proof::prove(&prover_keys[0], &eval_keys[0], CONTEXT, &input, &mut rng).unwrap();
+                Proof::prove(&prover_keys[0], &eval_keys[0], CONTEXT, &input, &ciphertext, &mut rng).unwrap();
 
             // Verify with correct client index using both methods
             assert!(proof.verify(&verifier_key, &ciphertext, CONTEXT, 0).is_ok());
@@ -907,26 +897,4 @@ mod tests {
             }
         }
     }
-}
-
-/// Apply fiat-shamir to a list of group and scalarelements
-fn fiat_shamir(elements: &[G], scalars: &[Scalar]) -> Scalar {
-    let mut hasher = Sha3_512::new();
-    for g in elements {
-        hasher.update(g.compress().to_bytes().as_ref());
-    }
-    for s in scalars {
-        hasher.update(s.to_bytes().as_ref());
-    }
-    Scalar::from_hash(hasher)
-}
-
-// Helper macro for verifying claims
-#[macro_export]
-macro_rules! check_claim {
-    ($left:expr, $right:expr, $msg:expr) => {
-        if $left != $right {
-            return Err(anyhow::anyhow!($msg));
-        }
-    };
 }

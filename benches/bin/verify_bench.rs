@@ -111,7 +111,7 @@ fn bench_verification(
     let (ciphertexts, proofs): (Vec<_>, Vec<_>) = (0..*max_clients)
         .map(|i| {
             let ciphertext = AggOnlyEnc::encrypt(&eval_keys[i], CONTEXT, &input);
-            let proof = Proof::prove(&prover_keys[i], &eval_keys[i], CONTEXT, &input, &mut OsRng).unwrap();
+            let proof = Proof::prove(&prover_keys[i], &eval_keys[i], CONTEXT, &input, &ciphertext, &mut OsRng).unwrap();
             (ciphertext, proof)
         })
         .unzip();
