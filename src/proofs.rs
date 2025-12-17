@@ -66,7 +66,7 @@ pub struct BinaryProof {
 /// Sigma protocol + Bulletproof for proving ciphertext well-formedness
 /// with b-bounded inputs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RangeProof { 
+pub struct RangeProof {
     /// Commitments for DLEQ claim
     pub(super) g_comm_k: G,
     // Bulletproof commitments
@@ -152,7 +152,10 @@ impl Proof {
         // proof is slightly more efficient.
         if bitlength == 1 && length < 8 {
             let prover_keys = vec![ProverKey::Binary { g_comm }; eval_keys.len()];
-            let verifier_key = VerifierKey::Binary { g_comm, key_commitments };
+            let verifier_key = VerifierKey::Binary {
+                g_comm,
+                key_commitments,
+            };
             (prover_keys, verifier_key)
         } else {
             let prover_keys = vec![ProverKey::Range { g_comm, bitlength }; eval_keys.len()];
@@ -166,10 +169,10 @@ impl Proof {
     }
 
     /// Prove the following relation (informally stated) for secrets x_i and k:
-    ///  1) c_i = g^x_i * H(context || i)^k, 
+    ///  1) c_i = g^x_i * H(context || i)^k,
     ///  2) C_i = g_comm^k
     ///  3) x_i < bitlength
-    /// 
+    ///
     /// This enforces that the client's aggregation-only ciphertext is well-formed.
     pub fn prove<R: RngCore + CryptoRng>(
         pk: &ProverKey,
@@ -185,7 +188,7 @@ impl Proof {
         let hash_bases = (0..input.len())
             .map(|i| KHPRF::compute_generator(context, i))
             .collect::<Vec<_>>();
-        
+
         // Claims (1) and (2) are done using standard Schnorr proofs. Claim (3) is done
         // using either OR composition for x=0 and x=1, or bulletproofs
         match pk {
@@ -285,7 +288,7 @@ impl Proof {
                 // Generate commitments for claims (1) and (2)
                 let k_rand = Scalar::random(&mut *rng);
                 let g_comm_k = *g_comm * k_rand;
-                
+
                 // Generate commitments to for claim (1) and to bind the ciphertext
                 // to the bulletproof proof
                 let x_rands = vec![Scalar::random(&mut *rng); input.len()];
@@ -544,7 +547,7 @@ impl Proof {
 
                         g_hash_scalars[j] += proof.x1[j] * rands[r_idx];
                         add_term(-rands[r_idx], proof.hash_x1[j]);
-                        add_term(-challenge_1 * rands[r_idx], ciphertext[j]-g);
+                        add_term(-challenge_1 * rands[r_idx], ciphertext[j] - g);
                         r_idx += 1;
                     }
                 }
@@ -680,7 +683,6 @@ impl Proof {
     }
 }
 
-
 /// Apply fiat-shamir to a list of group and scalar elements
 fn fiat_shamir<I, J>(elements: I, scalars: J) -> Scalar
 where
@@ -722,11 +724,7 @@ mod tests {
         const CONTEXT: u32 = 42;
 
         // Test configurations: (bitlength, length)
-        let configs = vec![
-            (8, 4),
-            (4, 2),
-            (1, 4),
-        ];
+        let configs = vec![(8, 4), (4, 2), (1, 4)];
 
         for (config_idx, (bitlength, length)) in configs.iter().enumerate() {
             // Setup
@@ -738,8 +736,15 @@ mod tests {
                 .map(|_| Scalar::from(rng.gen_range(0u64..(1u64 << bitlength))))
                 .collect();
             let ciphertext = AggOnlyEnc::encrypt(&eval_keys[0], CONTEXT, &input);
-            let proof =
-                Proof::prove(&prover_keys[0], &eval_keys[0], CONTEXT, &input, &ciphertext, &mut rng).unwrap();
+            let proof = Proof::prove(
+                &prover_keys[0],
+                &eval_keys[0],
+                CONTEXT,
+                &input,
+                &ciphertext,
+                &mut rng,
+            )
+            .unwrap();
 
             // Test individual verification
             if let Err(e) = proof.verify(&verifier_key, &ciphertext, CONTEXT, 0) {
@@ -787,8 +792,15 @@ mod tests {
                 .map(|_| Scalar::from(rng.gen_range(0u64..(1u64 << bitlength))))
                 .collect();
             let ciphertext = AggOnlyEnc::encrypt(&eval_keys[0], CONTEXT, &input);
-            let proof =
-                Proof::prove(&prover_keys[0], &eval_keys[0], CONTEXT, &input, &ciphertext, &mut rng).unwrap();
+            let proof = Proof::prove(
+                &prover_keys[0],
+                &eval_keys[0],
+                CONTEXT,
+                &input,
+                &ciphertext,
+                &mut rng,
+            )
+            .unwrap();
 
             // Verify the original proof is valid with both methods
             assert!(proof.verify(&verifier_key, &ciphertext, CONTEXT, 0).is_ok());
@@ -1099,8 +1111,15 @@ mod tests {
                 .map(|_| Scalar::from(rng.gen_range(0u64..(1u64 << bitlength))))
                 .collect();
             let ciphertext = AggOnlyEnc::encrypt(&eval_keys[0], CONTEXT, &input);
-            let proof =
-                Proof::prove(&prover_keys[0], &eval_keys[0], CONTEXT, &input, &ciphertext, &mut rng).unwrap();
+            let proof = Proof::prove(
+                &prover_keys[0],
+                &eval_keys[0],
+                CONTEXT,
+                &input,
+                &ciphertext,
+                &mut rng,
+            )
+            .unwrap();
 
             // Verify with correct client index using both methods
             assert!(proof.verify(&verifier_key, &ciphertext, CONTEXT, 0).is_ok());

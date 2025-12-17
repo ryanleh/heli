@@ -1,9 +1,5 @@
 use clap::Parser;
-use heli::{
-    agg_only_enc::AggOnlyEnc,
-    crypto::Scalar,
-    proofs::Proof,
-};
+use heli::{agg_only_enc::AggOnlyEnc, crypto::Scalar, proofs::Proof};
 use rand::Rng;
 use rand_core::OsRng;
 use std::hint::black_box;
@@ -88,9 +84,7 @@ impl TimeStats {
 const CONTEXT: u32 = 42;
 
 /// Run batch proof verification benchmarks for different client counts
-fn bench_verification(
-    config: &Config,
-) -> Vec<(usize, TimeStats)> {
+fn bench_verification(config: &Config) -> Vec<(usize, TimeStats)> {
     // Find the maximum number of clients to set up for
     let max_clients = config.clients.iter().max().unwrap_or(&100);
 
@@ -117,7 +111,15 @@ fn bench_verification(
     let (ciphertexts, proofs): (Vec<_>, Vec<_>) = (0..*max_clients)
         .map(|i| {
             let ciphertext = AggOnlyEnc::encrypt(&eval_keys[i], CONTEXT, &input);
-            let proof = Proof::prove(&prover_keys[i], &eval_keys[i], CONTEXT, &input, &ciphertext, &mut OsRng).unwrap();
+            let proof = Proof::prove(
+                &prover_keys[i],
+                &eval_keys[i],
+                CONTEXT,
+                &input,
+                &ciphertext,
+                &mut OsRng,
+            )
+            .unwrap();
             (ciphertext, proof)
         })
         .unzip();
@@ -174,7 +176,6 @@ fn bench_verification(
     results
 }
 
-
 fn main() {
     let config = Config::parse();
 
@@ -186,7 +187,7 @@ fn main() {
     } else {
         "RANGE"
     };
-    
+
     println!("\n{}", "=".repeat(80));
     println!("{} PROOF SYSTEM", proof_system_type);
     println!("{}", "=".repeat(80));

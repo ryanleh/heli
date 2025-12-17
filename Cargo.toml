@@ -45,14 +45,6 @@ debug = true
 name = "aggregation"
 harness = false
 
-[[bench]]
-name = "dropout"
-harness = false
-
-[[bench]]
-name = "provers"
-harness = false
-
 [[bin]]
 name = "verify-bench"
 path = "benches/bin/verify_bench.rs"

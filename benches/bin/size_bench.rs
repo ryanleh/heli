@@ -1,10 +1,6 @@
 use bytesize::ByteSize;
 use clap::Parser;
-use heli::{
-    agg_only_enc::{AggOnlyEnc, EvalKey},
-    crypto::Scalar,
-    proofs::Proof,
-};
+use heli::{agg_only_enc::AggOnlyEnc, crypto::Scalar, proofs::Proof};
 use rand::Rng;
 use rand_core::OsRng;
 
