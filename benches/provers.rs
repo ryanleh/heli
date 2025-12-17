@@ -1,7 +1,8 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use heli::primitives::{
-    ElGamal,
-    provers::{Binary, Prover, Range},
+use heli::{
+    agg_only_enc::AggOnlyEnc,
+    crypto::Scalar,
+    proofs::Proof,
 };
 use itertools::iproduct;
 use rand_core::OsRng;
@@ -10,17 +11,22 @@ use std::hint::black_box;
 mod common;
 use common::*;
 
-fn bench_encode<P: Prover>(c: &mut Criterion, length: usize, bitlength: usize) {
+fn bench_encode(c: &mut Criterion, length: usize, bitlength: usize) {
     let mut group = c.benchmark_group("prove");
     group.warm_up_time(std::time::Duration::from_millis(100));
     group.measurement_time(std::time::Duration::from_millis(500));
     group.sample_size(10);
 
     // Setup
-    let input = random_inputs(length, bitlength);
-    let setup_data = get_setup_data(1, length, bitlength);
-    let (prover_key, _) = P::setup(length, bitlength);
-    let (encoding, r) = ElGamal::encode(&setup_data.cks[0], &input, &mut OsRng).unwrap();
+    let mut rng = OsRng;
+    let (_, eval_keys) = AggOnlyEnc::setup(1, &mut rng);
+    let (prover_keys, _) = Proof::setup(&eval_keys, bitlength, length);
+    let input: Vec<Scalar> = random_inputs(length, bitlength)
+        .into_iter()
+        .map(|x| Scalar::from(x))
+        .collect();
+    const CONTEXT: u32 = 42;
+    let ciphertext = AggOnlyEnc::encrypt(&eval_keys[0], CONTEXT, &input);
 
     // Benchmark
     group.bench_with_input(
@@ -29,12 +35,12 @@ fn bench_encode<P: Prover>(c: &mut Criterion, length: usize, bitlength: usize) {
         |b, _| {
             b.iter(|| {
                 black_box(
-                    P::prove(
-                        &prover_key,
-                        &setup_data.cks[0],
+                    Proof::prove(
+                        &prover_keys[0],
+                        &eval_keys[0],
+                        CONTEXT,
                         &input,
-                        r,
-                        &encoding,
+                        &ciphertext,
                         &mut OsRng,
                     )
                     .unwrap(),
@@ -45,23 +51,28 @@ fn bench_encode<P: Prover>(c: &mut Criterion, length: usize, bitlength: usize) {
     group.finish();
 }
 
-fn bench_verify<P: Prover>(c: &mut Criterion, length: usize, bitlength: usize) {
+fn bench_verify(c: &mut Criterion, length: usize, bitlength: usize) {
     let mut group = c.benchmark_group("verify");
     group.warm_up_time(std::time::Duration::from_millis(100));
     group.measurement_time(std::time::Duration::from_millis(500));
     group.sample_size(10);
 
     // Setup
-    let input = random_inputs(length, bitlength);
-    let setup_data = get_setup_data(1, length, bitlength);
-    let (prover_key, verifier_key) = P::setup(length, bitlength);
-    let (encoding, r) = ElGamal::encode(&setup_data.cks[0], &input, &mut OsRng).unwrap();
-    let proof = P::prove(
-        &prover_key,
-        &setup_data.cks[0],
+    let mut rng = OsRng;
+    const CONTEXT: u32 = 42;
+    let (_, eval_keys) = AggOnlyEnc::setup(1, &mut rng);
+    let (prover_keys, verifier_key) = Proof::setup(&eval_keys, bitlength, length);
+    let input: Vec<Scalar> = random_inputs(length, bitlength)
+        .into_iter()
+        .map(|x| Scalar::from(x))
+        .collect();
+    let ciphertext = AggOnlyEnc::encrypt(&eval_keys[0], CONTEXT, &input);
+    let proof = Proof::prove(
+        &prover_keys[0],
+        &eval_keys[0],
+        CONTEXT,
         &input,
-        r,
-        &encoding,
+        &ciphertext,
         &mut OsRng,
     )
     .unwrap();
@@ -72,16 +83,14 @@ fn bench_verify<P: Prover>(c: &mut Criterion, length: usize, bitlength: usize) {
         &(length, bitlength),
         |b, _| {
             b.iter(|| {
-                black_box(
-                    P::verify(&verifier_key, &setup_data.params, 0, &encoding, &proof).unwrap(),
-                );
+                black_box(proof.verify(&verifier_key, &ciphertext, CONTEXT, 0).unwrap());
             });
         },
     );
     group.finish();
 }
 
-fn bench_batch_verify<P: Prover>(
+fn bench_batch_verify(
     c: &mut Criterion,
     num_clients: usize,
     length: usize,
@@ -93,22 +102,27 @@ fn bench_batch_verify<P: Prover>(
     group.sample_size(10);
 
     // Setup
-    let input = random_inputs(length, bitlength);
-    let setup_data = get_setup_data(num_clients, length, bitlength);
-    let (prover_key, verifier_key) = P::setup(length, bitlength);
-    let (encodings, proofs): (Vec<_>, Vec<_>) = (0..num_clients)
+    let mut rng = OsRng;
+    const CONTEXT: u32 = 42;
+    let (_, eval_keys) = AggOnlyEnc::setup(num_clients, &mut rng);
+    let (prover_keys, verifier_key) = Proof::setup(&eval_keys, bitlength, length);
+    let input: Vec<Scalar> = random_inputs(length, bitlength)
+        .into_iter()
+        .map(|x| Scalar::from(x))
+        .collect();
+    let (ciphertexts, proofs): (Vec<_>, Vec<_>) = (0..num_clients)
         .map(|i| {
-            let (encoding, r) = ElGamal::encode(&setup_data.cks[i], &input, &mut OsRng).unwrap();
-            let proof = P::prove(
-                &prover_key,
-                &setup_data.cks[i],
+            let ciphertext = AggOnlyEnc::encrypt(&eval_keys[i], CONTEXT, &input);
+            let proof = Proof::prove(
+                &prover_keys[i],
+                &eval_keys[i],
+                CONTEXT,
                 &input,
-                r,
-                &encoding,
+                &ciphertext,
                 &mut OsRng,
             )
             .unwrap();
-            (encoding, proof)
+            (ciphertext, proof)
         })
         .unzip();
     let indices = (0..num_clients).collect::<Vec<_>>();
@@ -122,12 +136,12 @@ fn bench_batch_verify<P: Prover>(
         |b, _| {
             b.iter(|| {
                 black_box(
-                    P::batch_verify(
+                    Proof::batch_verify(
                         &verifier_key,
-                        &setup_data.params,
-                        &indices,
-                        &encodings,
+                        &ciphertexts,
+                        CONTEXT,
                         &proofs,
+                        &indices,
                         &mut OsRng,
                     )
                     .unwrap(),
@@ -140,32 +154,26 @@ fn bench_batch_verify<P: Prover>(
 
 fn encode(c: &mut Criterion) {
     // (length, bitlength)
-    bench_encode::<Binary>(c, 1, 1);
-    bench_encode::<Binary>(c, 8, 1);
-    bench_encode::<Range>(c, 1, 8);
-    bench_encode::<Range>(c, 8, 8);
+    // Note: Binary proofs are not yet implemented, so we only benchmark Range
+    bench_encode(c, 1, 8);
+    bench_encode(c, 8, 8);
 }
 
 fn verify(c: &mut Criterion) {
     // (length, bitlength)
-    bench_verify::<Binary>(c, 1, 1);
-    bench_verify::<Binary>(c, 8, 1);
-    bench_verify::<Range>(c, 1, 8);
-    bench_verify::<Range>(c, 8, 8);
+    // Note: Binary proofs are not yet implemented, so we only benchmark Range
+    bench_verify(c, 1, 8);
+    bench_verify(c, 8, 8);
 }
 
 fn batch_verify(c: &mut Criterion) {
     // (num_clients, length, bitlength)
     let num_clients = vec![100];
     let lengths = vec![1, 8];
-    let bitlengths = vec![1, 8];
+    let bitlengths = vec![8]; // Only Range proofs are implemented
 
     for (n, l, b) in iproduct!(&num_clients, &lengths, &bitlengths) {
-        if *b == 1 {
-            bench_batch_verify::<Binary>(c, *n, *l, *b);
-        } else {
-            bench_batch_verify::<Range>(c, *n, *l, *b);
-        }
+        bench_batch_verify(c, *n, *l, *b);
     }
 }
 

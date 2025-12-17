@@ -1,7 +1,4 @@
-use heli::primitives::{
-    ElGamal,
-    messages::{AggParams, ClientKey, DecKey},
-};
+use heli::agg_only_enc::{AggOnlyEnc, EvalKey, SecretKey};
 use rand::Rng;
 use rand_core::OsRng;
 use std::collections::HashMap;
@@ -9,12 +6,10 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 // Setup data structure
-#[derive(Clone)]
 #[allow(dead_code)]
 pub struct SetupData {
-    pub params: AggParams,
-    pub sk: DecKey,
-    pub cks: Vec<ClientKey>,
+    pub sk: SecretKey,
+    pub eval_keys: Vec<EvalKey>,
 }
 
 // Global cache for setup data - ensures each configuration is only generated once
@@ -27,15 +22,10 @@ pub fn get_setup_data(num_clients: usize, length: usize, bitlength: usize) -> Se
     let mut cache = cache.lock().unwrap();
 
     // Check if we already have this configuration
-    match cache.get(&(num_clients, length, bitlength)) {
-        Some(cached) => cached.clone(),
-        None => {
-            let (params, sk, cks) = ElGamal::setup(num_clients, length, &mut OsRng);
-            let data = SetupData { params, sk, cks };
-            cache.insert((num_clients, length, bitlength), data.clone());
-            data
-        }
-    }
+    // Note: We can't cache SetupData because SecretKey doesn't implement Clone
+    // So we always generate fresh setup data
+    let (sk, eval_keys) = AggOnlyEnc::setup(num_clients, &mut OsRng);
+    SetupData { sk, eval_keys }
 }
 
 #[allow(dead_code)]

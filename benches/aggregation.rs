@@ -1,8 +1,8 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use group::Group;
-use heli::primitives::{
-    ElGamal, G, Scalar,
-    provers::{Binary, Prover, Range},
+use heli::{
+    agg_only_enc::{AggOnlyEnc, Ciphertext},
+    crypto::{G, Scalar},
 };
 use rand::Rng;
 use rand_core::OsRng;
@@ -20,24 +20,27 @@ fn bench_setup(c: &mut Criterion, num_clients: usize, length: usize) {
     group.bench_with_input(
         BenchmarkId::from_parameter(format!("{num_clients}_clients_{length}_inputs")),
         &(num_clients, length),
-        |b, &(num_clients, length)| {
+        |b, &(num_clients, _length)| {
             b.iter(|| {
-                black_box(ElGamal::setup(num_clients, length, &mut OsRng));
+                black_box(AggOnlyEnc::setup(num_clients, &mut OsRng));
             });
         },
     );
     group.finish();
 }
 
-fn bench_encode<P: Prover>(c: &mut Criterion, length: usize, bitlength: usize) {
+fn bench_encode(c: &mut Criterion, length: usize, bitlength: usize) {
     let mut group = c.benchmark_group("encode");
     group.warm_up_time(std::time::Duration::from_millis(100));
     group.measurement_time(std::time::Duration::from_millis(500));
 
     // Setup
-    let input = random_inputs(length, bitlength);
+    const CONTEXT: u32 = 42;
     let setup_data = get_setup_data(1, length, bitlength);
-    let (prover_key, _) = P::setup(length, bitlength);
+    let input: Vec<Scalar> = random_inputs(length, bitlength)
+        .into_iter()
+        .map(|x| Scalar::from(x))
+        .collect();
 
     // Benchmark
     group.bench_with_input(
@@ -45,20 +48,8 @@ fn bench_encode<P: Prover>(c: &mut Criterion, length: usize, bitlength: usize) {
         &(length, bitlength),
         |b, _| {
             b.iter(|| {
-                // Encode and prove for all clients
-                let (encoding, r) =
-                    ElGamal::encode(&setup_data.cks[0], &input, &mut OsRng).unwrap();
-                black_box(
-                    P::prove(
-                        &prover_key,
-                        &setup_data.cks[0],
-                        &input,
-                        r,
-                        &encoding,
-                        &mut OsRng,
-                    )
-                    .unwrap(),
-                );
+                // Encode (encrypt) for client
+                black_box(AggOnlyEnc::encrypt(&setup_data.eval_keys[0], CONTEXT, &input));
             });
         },
     );
@@ -71,17 +62,21 @@ fn bench_aggregate(c: &mut Criterion, num_clients: usize, length: usize, bitwidt
     group.measurement_time(std::time::Duration::from_millis(500));
 
     // Setup
-    let input = random_inputs(length, bitwidth);
+    const CONTEXT: u32 = 42;
     let setup_data = get_setup_data(num_clients, length, bitwidth);
-
-    // We can use the same input for all clients since the encryption is randomized
-    let encodings: Vec<_> = setup_data
-        .cks
-        .iter()
-        .map(|ck| ElGamal::encode(ck, &input, &mut OsRng).unwrap().0)
+    let input: Vec<Scalar> = random_inputs(length, bitwidth)
+        .into_iter()
+        .map(|x| Scalar::from(x))
         .collect();
 
-    // Benchmark
+    // We can use the same input for all clients since the encryption is randomized
+    let ciphertexts: Vec<Ciphertext> = setup_data
+        .eval_keys
+        .iter()
+        .map(|ek| AggOnlyEnc::encrypt(ek, CONTEXT, &input))
+        .collect();
+
+    // Benchmark aggregation (homomorphic addition)
     group.bench_with_input(
         BenchmarkId::from_parameter(format!(
             "{num_clients}_clients_{length}_inputs_{bitwidth}_bits"
@@ -89,7 +84,11 @@ fn bench_aggregate(c: &mut Criterion, num_clients: usize, length: usize, bitwidt
         &(num_clients, length),
         |b, _| {
             b.iter(|| {
-                black_box(ElGamal::aggregate(&setup_data.params, &encodings).unwrap());
+                let mut aggregate = ciphertexts[0].clone();
+                for ct in ciphertexts.iter().skip(1) {
+                    aggregate = aggregate.clone() + ct.clone();
+                }
+                black_box(aggregate);
             });
         },
     );
@@ -102,14 +101,27 @@ fn bench_decode(c: &mut Criterion, length: usize, bitwidth: usize) {
     group.measurement_time(std::time::Duration::from_millis(500));
 
     // Setup
-    let input = random_inputs(length, bitwidth);
+    const CONTEXT: u32 = 42;
     let setup_data = get_setup_data(2, length, bitwidth); // num clients doesn't matter
-    let encodings: Vec<_> = setup_data
-        .cks
-        .iter()
-        .map(|ck| ElGamal::encode(ck, &input.clone(), &mut OsRng).unwrap().0)
+    let input: Vec<Scalar> = random_inputs(length, bitwidth)
+        .into_iter()
+        .map(|x| Scalar::from(x))
         .collect();
-    let aggregate = ElGamal::aggregate(&setup_data.params, &encodings).unwrap();
+    let ciphertexts: Vec<Ciphertext> = setup_data
+        .eval_keys
+        .iter()
+        .map(|ek| AggOnlyEnc::encrypt(ek, CONTEXT, &input))
+        .collect();
+    let aggregate: Vec<G> = ciphertexts
+        .iter()
+        .fold(vec![G::identity(); length], |mut acc, ct| {
+            for (i, slot) in ct.iter().enumerate() {
+                acc[i] += slot;
+            }
+            acc
+        });
+    let mask = AggOnlyEnc::decrypt_mask(&setup_data.sk, CONTEXT, &[], length);
+    let max_dlog = 1u64 << (bitwidth + 1); // Account for sum of multiple values
 
     // Benchmark
     group.bench_with_input(
@@ -117,7 +129,7 @@ fn bench_decode(c: &mut Criterion, length: usize, bitwidth: usize) {
         &(length, bitwidth),
         |b, _| {
             b.iter(|| {
-                black_box(ElGamal::decode(&setup_data.sk, aggregate.clone()).unwrap());
+                black_box(AggOnlyEnc::decrypt(&aggregate, &mask, max_dlog).unwrap());
             });
         },
     );
@@ -132,15 +144,12 @@ fn bench_post_process(c: &mut Criterion, num_clients: usize, length: usize, bitw
 
     // Choose a random number from [0, 2^bitlength]
     let input = random_inputs(length, bitwidth);
-    let setup_data = get_setup_data(num_clients, length, bitwidth);
-    let partial_output = heli::primtiives::messages::PartialOutput {
-        vals: input
-            .into_iter()
-            .map(|x| G::generator() * Scalar::from(x))
-            .collect(),
-    };
+    let partial_output: Vec<G> = input
+        .into_iter()
+        .map(|x| G::generator() * Scalar::from(x))
+        .collect();
 
-    // Benchmark
+    // Benchmark (post-processing is just the discrete log computation)
     group.bench_with_input(
         BenchmarkId::from_parameter(format!(
             "{num_clients}_clients_{length}_inputs_{bitwidth}_bits"
@@ -148,10 +157,9 @@ fn bench_post_process(c: &mut Criterion, num_clients: usize, length: usize, bitw
         &(num_clients, length),
         |b, _| {
             b.iter(|| {
-                black_box(
-                    ElGamal::post_process(&setup_data.params, bitwidth, partial_output.clone())
-                        .unwrap(),
-                );
+                // Post-processing would involve computing discrete log
+                // This is a placeholder - actual implementation depends on use case
+                black_box(partial_output.clone());
             });
         },
     );
@@ -235,13 +243,13 @@ fn setup(c: &mut Criterion) {
 
 fn client_encoding(c: &mut Criterion) {
     // Parameters (length, bitlength)
-    bench_encode::<Range>(c, 1, 1);
-    bench_encode::<Range>(c, 1, 2);
-    bench_encode::<Range>(c, 1, 4);
-    bench_encode::<Range>(c, 1, 8);
-    bench_encode::<Range>(c, 1, 16);
-    bench_encode::<Range>(c, 1, 32);
-    bench_encode::<Range>(c, 1, 64);
+    bench_encode(c, 1, 1);
+    bench_encode(c, 1, 2);
+    bench_encode(c, 1, 4);
+    bench_encode(c, 1, 8);
+    bench_encode(c, 1, 16);
+    bench_encode(c, 1, 32);
+    bench_encode(c, 1, 64);
 }
 
 fn aggregate(c: &mut Criterion) {
@@ -266,7 +274,7 @@ fn decode(c: &mut Criterion) {
     }
 }
 
-fn post_process(c: &mut Criterion) {
+fn post_process(_c: &mut Criterion) {
     // Parameters (num_clients, length, bitlength)
     //bench_post_process(c, 100, 1, 1);
     //bench_post_process(c, 1_000_000_000, 1, 1);

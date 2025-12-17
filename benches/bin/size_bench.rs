@@ -1,8 +1,9 @@
 use bytesize::ByteSize;
 use clap::Parser;
-use heli::primitives::{
-    ElGamal,
-    provers::{Binary, Prover, Range},
+use heli::{
+    agg_only_enc::{AggOnlyEnc, EvalKey},
+    crypto::Scalar,
+    proofs::Proof,
 };
 use rand::Rng;
 use rand_core::OsRng;
@@ -26,24 +27,29 @@ fn random_input(length: usize, bitlength: usize) -> Vec<u64> {
         .collect()
 }
 
-fn measure_sizes<P: Prover>(length: usize, bitlength: usize, proof_system_name: &str) {
-    let (_params, _sk, cks) = ElGamal::setup(1, length, &mut OsRng);
-    let (prover_key, _) = P::setup(length, bitlength);
+fn measure_sizes(length: usize, bitlength: usize, proof_system_name: &str) {
+    const CONTEXT: u32 = 42;
+    let mut rng = OsRng;
+    let (_, eval_keys) = AggOnlyEnc::setup(1, &mut rng);
+    let (prover_keys, _) = Proof::setup(&eval_keys, bitlength, length);
 
-    let (encoding, r) =
-        ElGamal::encode(&cks[0], &random_input(length, bitlength), &mut OsRng).unwrap();
-    let proof = P::prove(
-        &prover_key,
-        &cks[0],
-        &random_input(length, bitlength),
-        r,
-        &encoding,
+    let input: Vec<Scalar> = random_input(length, bitlength)
+        .into_iter()
+        .map(|x| Scalar::from(x))
+        .collect();
+    let ciphertext = AggOnlyEnc::encrypt(&eval_keys[0], CONTEXT, &input);
+    let proof = Proof::prove(
+        &prover_keys[0],
+        &eval_keys[0],
+        CONTEXT,
+        &input,
+        &ciphertext,
         &mut OsRng,
     )
     .unwrap();
 
     // Serialize using bincode
-    let encoding_size = bincode::serialized_size(&encoding).unwrap() as usize;
+    let encoding_size = bincode::serialized_size(&ciphertext).unwrap() as usize;
     let proof_size = bincode::serialized_size(&proof).unwrap() as usize;
     let total_size = encoding_size + proof_size;
 
@@ -73,13 +79,8 @@ fn main() {
 
     for &length in &config.length {
         for &bitlength in &config.bitlength {
-            if bitlength == 1 {
-                // For bitlength 1, run both Binary and Range proof systems
-                measure_sizes::<Binary>(length, bitlength, "Binary");
-                measure_sizes::<Range>(length, bitlength, "Range");
-            } else {
-                measure_sizes::<Range>(length, bitlength, "Range");
-            }
+            // Note: Binary proofs are not yet implemented, so we only measure Range
+            measure_sizes(length, bitlength, "Range");
         }
     }
 
