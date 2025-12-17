@@ -47,22 +47,20 @@ pub enum VerifierKey {
 /// Sigma protocol for proving ciphertext well-formedness with binary inputs.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct BinaryProof {
-    /// Commitments for inputs on both branches.
-    pub(super) g_x0: Vec<G>,
-    pub(super) g_x1: Vec<G>,
-    /// Commitments for DLEQ claim
-    pub(super) hash_k: Vec<G>,
-    pub(super) g_comm_k: G,
+    /// Commitments for inputs on x=0 branch.
+    pub(super) g_comm_x0: Vec<G>,
+    pub(super) hash_x0: Vec<G>,
+    /// Commitments for inputs on x=1 branch.
+    pub(super) g_comm_x1: Vec<G>,
+    pub(super) hash_x1: Vec<G>,
 
     /// Challenges for x=0 branch
-    pub(crate) challenges_x0: Vec<Scalar>, // x=0 branch
+    pub(crate) challenges_x: Vec<Scalar>,
 
     /// Responses for proving knowledge of x=0 branch.
     pub(super) x0: Vec<Scalar>,
     /// Responses for proving knowledge of x=1 branch.
     pub(super) x1: Vec<Scalar>,
-    /// Response for proving knowledge of k.
-    pub(super) k: Scalar,
 }
 
 /// Sigma protocol + Bulletproof for proving ciphertext well-formedness
@@ -153,10 +151,9 @@ impl Proof {
         // For short binary inputs (l < 8 in our experiments), the Schnorr
         // proof is slightly more efficient.
         if bitlength == 1 && length < 8 {
-            unimplemented!()
-            //let prover_keys = vec![ProverKey::Binary { g_comm }; eval_keys.len()];
-            //let verifier_key = VerifierKey::Binary { g_comm, key_commitments };
-            //(prover_keys, verifier_key)
+            let prover_keys = vec![ProverKey::Binary { g_comm }; eval_keys.len()];
+            let verifier_key = VerifierKey::Binary { g_comm, key_commitments };
+            (prover_keys, verifier_key)
         } else {
             let prover_keys = vec![ProverKey::Range { g_comm, bitlength }; eval_keys.len()];
             let verifier_key = VerifierKey::Range {
@@ -193,76 +190,92 @@ impl Proof {
         // using either OR composition for x=0 and x=1, or bulletproofs
         match pk {
             ProverKey::Binary { g_comm } => {
-                // Commitments for claims (1) and (2)
-                let k_rand = Scalar::random(&mut *rng);
-                let hash_k = (0..input.len())
-                    .map(|i| KHPRF::evaluate_context(&k_rand, context, i))
-                    .collect::<Vec<_>>();
-                let g_comm_k = g_comm * k_rand;
-
-                // Commitments for claim (3)
-                let mut x_rand = Vec::with_capacity(input.len()); // Randomness for real branch
-                let mut g_x0 = Vec::with_capacity(input.len());
-                let mut g_x1 = Vec::with_capacity(input.len());
+                // Generate commitments
+                let mut k_rand = Vec::with_capacity(input.len()); // Randomness for real branch
+                let mut g_comm_x0 = Vec::with_capacity(input.len());
+                let mut hash_x0 = Vec::with_capacity(input.len());
+                let mut g_comm_x1 = Vec::with_capacity(input.len());
+                let mut hash_x1 = Vec::with_capacity(input.len());
                 let mut sim_challenges = Vec::with_capacity(input.len());
                 let mut sim_responses = Vec::with_capacity(input.len());
 
                 for i in 0..input.len() {
-                    // Simulated transcripts for false paths
-                    let sim_challenge = Scalar::random(&mut *rng);
-                    let sim_response = Scalar::random(&mut *rng);
-                    sim_challenges.push(sim_challenge);
-                    sim_responses.push(sim_response);
+                    // Generate simulated transcripts for false paths
+                    let challenge = Scalar::random(&mut *rng);
+                    let response = Scalar::random(&mut *rng);
+                    sim_challenges.push(challenge);
+                    sim_responses.push(response);
 
-                    // Randomness for real branch
+                    // Generate randomness for real branch
                     let rand = Scalar::random(&mut *rng);
-                    x_rand.push(rand);
+                    k_rand.push(rand);
 
                     // OR composition for x=0 and x=1
+                    // For x=0: ciphertext[i] = H(context || i)^k
+                    // For x=1: ciphertext[i] = g + H(context || i)^k
+                    let hash_base = hash_bases[i];
                     if input[i] == Scalar::ZERO {
-                        g_x0.push(g * rand); // Real
-                        g_x1.push(g * sim_response - hash_k[i] * sim_challenge); // Simulated
+                        // Real branch for x=0
+                        g_comm_x0.push(g_comm * rand);
+                        hash_x0.push(hash_base * rand);
+
+                        // Simulated branch for x=1
+                        g_comm_x1.push(g_comm * (response - (**ek) * challenge));
+                        hash_x1.push(hash_base * (response - (**ek) * challenge) + g * challenge);
                     } else if input[i] == Scalar::ONE {
-                        g_x0.push(g * sim_response - hash_k[i] * sim_challenge); // Simulated
-                        g_x1.push(g * rand); // Real
+                        // Simulated branch for x=0
+                        g_comm_x0.push(g_comm * (response - (**ek) * challenge));
+                        hash_x0.push(hash_base * (response - (**ek) * challenge) - g * challenge);
+
+                        // Real branch for x=1
+                        g_comm_x1.push(g_comm * rand);
+                        hash_x1.push(hash_base * rand);
                     } else {
                         return Err(anyhow::anyhow!("Expected binary input"));
                     }
                 }
 
-                // Generate challenge
+                // Generate challenge via fiat-shamir
                 let challenge = fiat_shamir(
-                    [g, *g_comm, g_comm_k]
+                    [g, *g_comm]
                         .iter()
-                        .chain(g_x0.iter())
-                        .chain(g_x1.iter())
-                        .chain(hash_k.iter()),
-                    [k_rand].iter().chain(x_rand.iter()),
+                        .chain(g_comm_x0.iter())
+                        .chain(hash_x0.iter())
+                        .chain(g_comm_x1.iter())
+                        .chain(hash_x1.iter())
+                        .chain(ciphertext.iter()),
+                    std::iter::empty::<&Scalar>(),
                 );
 
-                // Generate responses
-                let mut challenges_x0 = Vec::with_capacity(input.len());
+                // Generate responses for claim 3
+                let mut challenges_x = Vec::with_capacity(input.len());
                 let mut responses_x0 = Vec::with_capacity(input.len());
                 let mut responses_x1 = Vec::with_capacity(input.len());
-
-                // TODO: This is not right lol 
                 for i in 0..input.len() {
                     let challenge_real = challenge - sim_challenges[i];
+                    // Always send the challenge for the zero branch
                     if input[i] == Scalar::ZERO {
-                        challenges_x0.push(challenge_real);
-                        responses_x0.push(x_rand[i]);
+                        challenges_x.push(challenge_real);
+                        responses_x0.push(k_rand[i] + challenge_real * (**ek));
                         responses_x1.push(sim_responses[i]);
                     } else if input[i] == Scalar::ONE {
-                        // Always send the challenge for the zero branch
-                        challenges_x0.push(sim_challenges[i]);
+                        challenges_x.push(sim_challenges[i]);
                         responses_x0.push(sim_responses[i]);
-                        responses_x1.push(x_rand[i] + challenge_real);
+                        responses_x1.push(k_rand[i] + challenge_real * (**ek));
                     } else {
                         unreachable!()
                     }
                 }
 
-                unimplemented!() // Binary proof not yet implemented
+                Ok(Proof::Binary(BinaryProof {
+                    g_comm_x0,
+                    hash_x0,
+                    g_comm_x1,
+                    hash_x1,
+                    challenges_x,
+                    x0: responses_x0,
+                    x1: responses_x1,
+                }))
             }
             ProverKey::Range { g_comm, bitlength } => {
                 // First, generate the bulletproof proof
@@ -273,7 +286,6 @@ impl Proof {
                 let k_rand = Scalar::random(&mut *rng);
                 let g_comm_k = *g_comm * k_rand;
                 
-
                 // Generate commitments to for claim (1) and to bind the ciphertext
                 // to the bulletproof proof
                 let x_rands = vec![Scalar::random(&mut *rng); input.len()];
@@ -333,13 +345,55 @@ impl Proof {
         //  3) x_i < bitlength
         match (self, vk) {
             (
-                Proof::Binary(_proof),
+                Proof::Binary(proof),
                 VerifierKey::Binary {
-                    g_comm: _,
-                    key_commitments: _,
+                    g_comm,
+                    key_commitments,
                 },
             ) => {
-                unimplemented!();
+                // Apply fiat-shamir to generate challenge (same as in prove)
+                let challenge = fiat_shamir(
+                    [g, *g_comm]
+                        .iter()
+                        .chain(proof.g_comm_x0.iter())
+                        .chain(proof.hash_x0.iter())
+                        .chain(proof.g_comm_x1.iter())
+                        .chain(proof.hash_x1.iter())
+                        .chain(ciphertext.iter()),
+                    std::iter::empty::<&Scalar>(),
+                );
+
+                // Check that each input slot is either 0 or 1 and uses the correct key
+                for i in 0..proof.challenges_x.len() {
+                    let challenge_0 = proof.challenges_x[i];
+                    let challenge_1 = challenge - challenge_0;
+                    let g_hash = KHPRF::compute_generator(context, i);
+
+                    // X=0
+                    crate::check_claim!(
+                        g_comm * proof.x0[i],
+                        key_commitments[proof_index] * challenge_0 + proof.g_comm_x0[i],
+                        format!("Claim (2) failed for x=0, slot {}", i)
+                    );
+                    crate::check_claim!(
+                        g_hash * proof.x0[i],
+                        ciphertext[i] * challenge_0 + proof.hash_x0[i],
+                        format!("Claim (1/3) failed for x=0, slot {}", i)
+                    );
+
+                    // X=1
+                    crate::check_claim!(
+                        g_comm * proof.x1[i],
+                        key_commitments[proof_index] * challenge_1 + proof.g_comm_x1[i],
+                        format!("Claim (2) failed for x=1, slot {}", i)
+                    );
+                    crate::check_claim!(
+                        g_hash * proof.x1[i],
+                        (ciphertext[i] - g) * challenge_1 + proof.hash_x1[i],
+                        format!("Claim (1/3) failed for x=1, slot {}", i)
+                    );
+                }
+                Ok(())
             }
             (
                 Proof::Range(proof),
@@ -420,10 +474,94 @@ impl Proof {
 
         match vk {
             VerifierKey::Binary {
-                g_comm: _,
-                key_commitments: _,
+                g_comm,
+                key_commitments,
             } => {
-                unimplemented!();
+                // We batch by taking a random linear combination over all claims
+                let num_inputs = ciphertexts[0].len();
+                let num_proof_claims = 4 * num_inputs; // 4 claims per input (2 for x=0, 2 for x=1)
+                let total_claims = proof_indices.len() * num_proof_claims;
+                let rands: Vec<_> = (0..total_claims)
+                    .map(|_| Scalar::random(&mut *rng))
+                    .collect();
+
+                // Many terms share the g_comm, g_hash, and key_commitments bases
+                let mut g_comm_scalar = Scalar::ZERO;
+                let mut g_hash_scalars = vec![Scalar::ZERO; num_inputs];
+                let mut scalars = Vec::new();
+                let mut bases = Vec::new();
+
+                // Helper closure to add terms to the MSM vectors
+                let mut add_term = |scalar: Scalar, base: G| {
+                    scalars.push(scalar);
+                    bases.push(base);
+                };
+
+                let mut r_idx = 0;
+
+                // For each proof, add the relevant terms to the final MSM computation
+                for i in 0..proof_indices.len() {
+                    let proof_idx = proof_indices[i];
+                    let ciphertext = &ciphertexts[i];
+                    let Proof::Binary(proof) = &proofs[i] else {
+                        return Err(anyhow::anyhow!("Proof type mismatch"));
+                    };
+
+                    // Apply fiat-shamir to generate challenge (same as in verify)
+                    let challenge = fiat_shamir(
+                        [g, *g_comm]
+                            .iter()
+                            .chain(proof.g_comm_x0.iter())
+                            .chain(proof.hash_x0.iter())
+                            .chain(proof.g_comm_x1.iter())
+                            .chain(proof.hash_x1.iter())
+                            .chain(ciphertext.iter()),
+                        std::iter::empty::<&Scalar>(),
+                    );
+
+                    // Check DLEQ claims for each input
+                    for j in 0..num_inputs {
+                        let challenge_0 = proof.challenges_x[j];
+                        let challenge_1 = challenge - challenge_0;
+                        let _g_hash = KHPRF::compute_generator(context, j);
+
+                        // X=0
+                        g_comm_scalar += proof.x0[j] * rands[r_idx];
+                        add_term(-rands[r_idx], proof.g_comm_x0[j]);
+                        add_term(-challenge_0 * rands[r_idx], key_commitments[proof_idx]);
+                        r_idx += 1;
+
+                        g_hash_scalars[j] += proof.x0[j] * rands[r_idx];
+                        add_term(-rands[r_idx], proof.hash_x0[j]);
+                        add_term(-challenge_0 * rands[r_idx], ciphertext[j]);
+                        r_idx += 1;
+
+                        // X=1
+                        g_comm_scalar += proof.x1[j] * rands[r_idx];
+                        add_term(-rands[r_idx], proof.g_comm_x1[j]);
+                        add_term(-challenge_1 * rands[r_idx], key_commitments[proof_idx]);
+                        r_idx += 1;
+
+                        g_hash_scalars[j] += proof.x1[j] * rands[r_idx];
+                        add_term(-rands[r_idx], proof.hash_x1[j]);
+                        add_term(-challenge_1 * rands[r_idx], ciphertext[j]-g);
+                        r_idx += 1;
+                    }
+                }
+
+                // Add the shared basis terms
+                scalars.push(g_comm_scalar);
+                scalars.extend(g_hash_scalars);
+                // Add unique bases for key_commitments and ciphertext terms (already added via add_term)
+                bases.push(*g_comm);
+                bases.extend((0..num_inputs).map(|i| KHPRF::compute_generator(context, i)));
+
+                // If all proofs are valid, the MSM should equal the identity
+                if G::multiscalar_mul(&scalars, &bases) == G::identity() {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("Batch verification failed"))
+                }
             }
             VerifierKey::Range {
                 g_comm,
@@ -587,7 +725,7 @@ mod tests {
         let configs = vec![
             (8, 4),
             (4, 2),
-            // (1, 4), // Binary not yet implemented
+            (1, 4),
         ];
 
         for (config_idx, (bitlength, length)) in configs.iter().enumerate() {
@@ -604,11 +742,12 @@ mod tests {
                 Proof::prove(&prover_keys[0], &eval_keys[0], CONTEXT, &input, &ciphertext, &mut rng).unwrap();
 
             // Test individual verification
-            assert!(
-                proof.verify(&verifier_key, &ciphertext, CONTEXT, 0).is_ok(),
-                "Individual proof verification failed for config {}",
-                config_idx
-            );
+            if let Err(e) = proof.verify(&verifier_key, &ciphertext, CONTEXT, 0) {
+                panic!(
+                    "Individual proof verification failed for config {}: {}",
+                    config_idx, e
+                );
+            }
 
             // Test batch verification
             assert!(
@@ -635,7 +774,7 @@ mod tests {
         // Test configurations: (bitlength, length)
         let configs = vec![
             (8, 4),
-            // (1, 4), // Binary not yet implemented
+            (1, 4), // Binary proof
         ];
 
         for (config_idx, (bitlength, length)) in configs.iter().enumerate() {
@@ -723,109 +862,216 @@ mod tests {
             }
 
             // Try tampering the proof (only public fields)
-            if let Proof::Range(_) = &proof {
-                let mut bad_proof = proof.clone();
-                if let Proof::Range(bad_range_proof) = &mut bad_proof {
-                    // Tamper with g_comm_k
-                    bad_range_proof.g_comm_k = G::generator() * Scalar::random(&mut rng);
-                    assert!(
-                        bad_proof
-                            .verify(&verifier_key, &ciphertext, CONTEXT, 0)
+            match &proof {
+                Proof::Range(_) => {
+                    let mut bad_proof = proof.clone();
+                    if let Proof::Range(bad_range_proof) = &mut bad_proof {
+                        // Tamper with g_comm_k
+                        bad_range_proof.g_comm_k = G::generator() * Scalar::random(&mut rng);
+                        assert!(
+                            bad_proof
+                                .verify(&verifier_key, &ciphertext, CONTEXT, 0)
+                                .is_err(),
+                            "Tampered g_comm_k accepted for config {}",
+                            config_idx
+                        );
+                        assert!(
+                            Proof::batch_verify(
+                                &verifier_key,
+                                &[ciphertext.clone()],
+                                CONTEXT,
+                                &[bad_proof.clone()],
+                                &[0],
+                                &mut rng
+                            )
                             .is_err(),
-                        "Tampered g_comm_k accepted for config {}",
-                        config_idx
-                    );
-                    assert!(
-                        Proof::batch_verify(
-                            &verifier_key,
-                            &[ciphertext.clone()],
-                            CONTEXT,
-                            &[bad_proof.clone()],
-                            &[0],
-                            &mut rng
-                        )
-                        .is_err(),
-                        "Tampered g_comm_k accepted in batch for config {}",
-                        config_idx
-                    );
-                }
+                            "Tampered g_comm_k accepted in batch for config {}",
+                            config_idx
+                        );
+                    }
 
-                // Tamper with g_x
-                let mut bad_proof = proof.clone();
-                if let Proof::Range(bad_range_proof) = &mut bad_proof {
-                    bad_range_proof.g_x[0] = G::generator() * Scalar::random(&mut rng);
-                    assert!(
-                        bad_proof
-                            .verify(&verifier_key, &ciphertext, CONTEXT, 0)
+                    // Tamper with g_x
+                    let mut bad_proof = proof.clone();
+                    if let Proof::Range(bad_range_proof) = &mut bad_proof {
+                        bad_range_proof.g_x[0] = G::generator() * Scalar::random(&mut rng);
+                        assert!(
+                            bad_proof
+                                .verify(&verifier_key, &ciphertext, CONTEXT, 0)
+                                .is_err(),
+                            "Tampered g_x accepted for config {}",
+                            config_idx
+                        );
+                        assert!(
+                            Proof::batch_verify(
+                                &verifier_key,
+                                &[ciphertext.clone()],
+                                CONTEXT,
+                                &[bad_proof.clone()],
+                                &[0],
+                                &mut rng
+                            )
                             .is_err(),
-                        "Tampered g_x accepted for config {}",
-                        config_idx
-                    );
-                    assert!(
-                        Proof::batch_verify(
-                            &verifier_key,
-                            &[ciphertext.clone()],
-                            CONTEXT,
-                            &[bad_proof.clone()],
-                            &[0],
-                            &mut rng
-                        )
-                        .is_err(),
-                        "Tampered g_x accepted in batch for config {}",
-                        config_idx
-                    );
-                }
+                            "Tampered g_x accepted in batch for config {}",
+                            config_idx
+                        );
+                    }
 
-                // Tamper with g_bp_x
-                let mut bad_proof = proof.clone();
-                if let Proof::Range(bad_range_proof) = &mut bad_proof {
-                    bad_range_proof.g_bp_x[0] = G::generator() * Scalar::random(&mut rng);
-                    assert!(
-                        bad_proof
-                            .verify(&verifier_key, &ciphertext, CONTEXT, 0)
+                    // Tamper with g_bp_x
+                    let mut bad_proof = proof.clone();
+                    if let Proof::Range(bad_range_proof) = &mut bad_proof {
+                        bad_range_proof.g_bp_x[0] = G::generator() * Scalar::random(&mut rng);
+                        assert!(
+                            bad_proof
+                                .verify(&verifier_key, &ciphertext, CONTEXT, 0)
+                                .is_err(),
+                            "Tampered g_bp_x accepted for config {}",
+                            config_idx
+                        );
+                        assert!(
+                            Proof::batch_verify(
+                                &verifier_key,
+                                &[ciphertext.clone()],
+                                CONTEXT,
+                                &[bad_proof.clone()],
+                                &[0],
+                                &mut rng
+                            )
                             .is_err(),
-                        "Tampered g_bp_x accepted for config {}",
-                        config_idx
-                    );
-                    assert!(
-                        Proof::batch_verify(
-                            &verifier_key,
-                            &[ciphertext.clone()],
-                            CONTEXT,
-                            &[bad_proof.clone()],
-                            &[0],
-                            &mut rng
-                        )
-                        .is_err(),
-                        "Tampered g_bp_x accepted in batch for config {}",
-                        config_idx
-                    );
-                }
+                            "Tampered g_bp_x accepted in batch for config {}",
+                            config_idx
+                        );
+                    }
 
-                // Tamper with range_comms
-                let mut bad_proof = proof.clone();
-                if let Proof::Range(bad_range_proof) = &mut bad_proof {
-                    bad_range_proof.range_comms[0] = G::generator() * Scalar::random(&mut rng);
-                    assert!(
-                        bad_proof
-                            .verify(&verifier_key, &ciphertext, CONTEXT, 0)
+                    // Tamper with range_comms
+                    let mut bad_proof = proof.clone();
+                    if let Proof::Range(bad_range_proof) = &mut bad_proof {
+                        bad_range_proof.range_comms[0] = G::generator() * Scalar::random(&mut rng);
+                        assert!(
+                            bad_proof
+                                .verify(&verifier_key, &ciphertext, CONTEXT, 0)
+                                .is_err(),
+                            "Tampered range_comms accepted for config {}",
+                            config_idx
+                        );
+                        assert!(
+                            Proof::batch_verify(
+                                &verifier_key,
+                                &[ciphertext.clone()],
+                                CONTEXT,
+                                &[bad_proof.clone()],
+                                &[0],
+                                &mut rng
+                            )
                             .is_err(),
-                        "Tampered range_comms accepted for config {}",
-                        config_idx
-                    );
-                    assert!(
-                        Proof::batch_verify(
-                            &verifier_key,
-                            &[ciphertext.clone()],
-                            CONTEXT,
-                            &[bad_proof.clone()],
-                            &[0],
-                            &mut rng
-                        )
-                        .is_err(),
-                        "Tampered range_comms accepted in batch for config {}",
-                        config_idx
-                    );
+                            "Tampered range_comms accepted in batch for config {}",
+                            config_idx
+                        );
+                    }
+                }
+                Proof::Binary(_) => {
+                    // Tamper with g_comm_x0
+                    let mut bad_proof = proof.clone();
+                    if let Proof::Binary(bad_binary_proof) = &mut bad_proof {
+                        bad_binary_proof.g_comm_x0[0] = G::generator() * Scalar::random(&mut rng);
+                        assert!(
+                            bad_proof
+                                .verify(&verifier_key, &ciphertext, CONTEXT, 0)
+                                .is_err(),
+                            "Tampered g_comm_x0 accepted for config {}",
+                            config_idx
+                        );
+                        assert!(
+                            Proof::batch_verify(
+                                &verifier_key,
+                                &[ciphertext.clone()],
+                                CONTEXT,
+                                &[bad_proof.clone()],
+                                &[0],
+                                &mut rng
+                            )
+                            .is_err(),
+                            "Tampered g_comm_x0 accepted in batch for config {}",
+                            config_idx
+                        );
+                    }
+
+                    // Tamper with hash_x0
+                    let mut bad_proof = proof.clone();
+                    if let Proof::Binary(bad_binary_proof) = &mut bad_proof {
+                        bad_binary_proof.hash_x0[0] = G::generator() * Scalar::random(&mut rng);
+                        assert!(
+                            bad_proof
+                                .verify(&verifier_key, &ciphertext, CONTEXT, 0)
+                                .is_err(),
+                            "Tampered hash_x0 accepted for config {}",
+                            config_idx
+                        );
+                        assert!(
+                            Proof::batch_verify(
+                                &verifier_key,
+                                &[ciphertext.clone()],
+                                CONTEXT,
+                                &[bad_proof.clone()],
+                                &[0],
+                                &mut rng
+                            )
+                            .is_err(),
+                            "Tampered hash_x0 accepted in batch for config {}",
+                            config_idx
+                        );
+                    }
+
+                    // Tamper with g_comm_x1
+                    let mut bad_proof = proof.clone();
+                    if let Proof::Binary(bad_binary_proof) = &mut bad_proof {
+                        bad_binary_proof.g_comm_x1[0] = G::generator() * Scalar::random(&mut rng);
+                        assert!(
+                            bad_proof
+                                .verify(&verifier_key, &ciphertext, CONTEXT, 0)
+                                .is_err(),
+                            "Tampered g_comm_x1 accepted for config {}",
+                            config_idx
+                        );
+                        assert!(
+                            Proof::batch_verify(
+                                &verifier_key,
+                                &[ciphertext.clone()],
+                                CONTEXT,
+                                &[bad_proof.clone()],
+                                &[0],
+                                &mut rng
+                            )
+                            .is_err(),
+                            "Tampered g_comm_x1 accepted in batch for config {}",
+                            config_idx
+                        );
+                    }
+
+                    // Tamper with hash_x1
+                    let mut bad_proof = proof.clone();
+                    if let Proof::Binary(bad_binary_proof) = &mut bad_proof {
+                        bad_binary_proof.hash_x1[0] = G::generator() * Scalar::random(&mut rng);
+                        assert!(
+                            bad_proof
+                                .verify(&verifier_key, &ciphertext, CONTEXT, 0)
+                                .is_err(),
+                            "Tampered hash_x1 accepted for config {}",
+                            config_idx
+                        );
+                        assert!(
+                            Proof::batch_verify(
+                                &verifier_key,
+                                &[ciphertext.clone()],
+                                CONTEXT,
+                                &[bad_proof.clone()],
+                                &[0],
+                                &mut rng
+                            )
+                            .is_err(),
+                            "Tampered hash_x1 accepted in batch for config {}",
+                            config_idx
+                        );
+                    }
                 }
             }
         }
@@ -839,7 +1085,7 @@ mod tests {
         // Test configurations: (bitlength, length)
         let configs = vec![
             (8, 4),
-            // (1, 4), // Binary not yet implemented
+            (1, 4), // Binary proof
         ];
 
         for (config_idx, (bitlength, length)) in configs.iter().enumerate() {

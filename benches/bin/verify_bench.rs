@@ -90,14 +90,20 @@ const CONTEXT: u32 = 42;
 /// Run batch proof verification benchmarks for different client counts
 fn bench_verification(
     config: &Config,
-    proof_system_name: &str,
 ) -> Vec<(usize, TimeStats)> {
     // Find the maximum number of clients to set up for
     let max_clients = config.clients.iter().max().unwrap_or(&100);
 
+    // Determine the actual proof system type being used
+    let actual_proof_system = if config.bitlength == 1 && config.length < 8 {
+        "Binary"
+    } else {
+        "Range"
+    };
+
     println!(
-        "Setting up verification benchmark for up to {} clients using {} proof system...",
-        max_clients, proof_system_name
+        "Setting up verification benchmark for up to {} clients using {} proof system (bitlength={}, length={})...",
+        max_clients, actual_proof_system, config.bitlength, config.length
     );
 
     // Setup - use the same inputs for all benchmarks
@@ -174,12 +180,19 @@ fn main() {
 
     println!("Running proof verification benchmark...");
 
+    // Determine proof system type from config
+    let proof_system_type = if config.bitlength == 1 && config.length < 8 {
+        "BINARY"
+    } else {
+        "RANGE"
+    };
+    
     println!("\n{}", "=".repeat(80));
-    println!("RANGE PROOF SYSTEM");
+    println!("{} PROOF SYSTEM", proof_system_type);
     println!("{}", "=".repeat(80));
 
-    let range_results = bench_verification(&config, "Range");
-    print_results(&range_results, &config, "Range");
+    let results = bench_verification(&config);
+    print_results(&results, &config, proof_system_type);
 
     println!("\n{}", "=".repeat(80));
 }

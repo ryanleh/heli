@@ -60,15 +60,3 @@ path = "benches/bin/verify_bench.rs"
 #[[bin]]
 #name = "size-bench"
 #path = "benches/bin/size_bench.rs"
-
-#[[bin]]
-#name = "decryptor"
-#path = "experiments/bin/decryptor.rs"
-#
-#[[bin]]
-#name = "aggregator"
-#path = "experiments/bin/aggregator.rs"
-#
-#[[bin]]
-#name = "client"
-#path = "experiments/bin/client.rs"
