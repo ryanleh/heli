@@ -125,7 +125,16 @@ fn bench_decode(
 
     // Randomly choose dropout indices
     let mut rng = OsRng;
-    let dropouts = (0..num_clients).choose_multiple(&mut rng, num_dropouts);
+    let (invert, dropouts) = match 2 * num_dropouts > num_clients {
+        true => (
+            true,
+            (0..num_clients).choose_multiple(&mut rng, num_dropouts),
+        ),
+        false => (
+            false,
+            (0..num_clients).choose_multiple(&mut rng, num_clients),
+        ),
+    };
 
     // Benchmark decrypt_mask computation
     group.bench_with_input(
@@ -139,6 +148,7 @@ fn bench_decode(
                     &setup_data.sk,
                     CONTEXT,
                     &dropouts,
+                    invert,
                     length,
                 ));
             });
@@ -177,7 +187,7 @@ fn bench_post_process(c: &mut Criterion, num_clients: usize, length: usize, bitw
         });
 
     // Pre-compute mask
-    let mask = AggOnlyEnc::decrypt_mask(&setup_data.sk, CONTEXT, &[], length);
+    let mask = AggOnlyEnc::decrypt_mask(&setup_data.sk, CONTEXT, &[], false, length);
     let max_dlog = (1u64 << bitwidth) * num_clients as u64; // Account for sum of multiple values
 
     // Benchmark decrypt (post-processing)

@@ -62,10 +62,19 @@ impl AggOnlyEnc {
     }
 
     // Generate the decryption mask for a given context and dropout list
-    pub fn decrypt_mask(sk: &SecretKey, context: u32, dropouts: &[usize], length: usize) -> Vec<G> {
+    pub fn decrypt_mask(
+        sk: &SecretKey,
+        context: u32,
+        dropouts: &[usize],
+        invert: bool,
+        length: usize,
+    ) -> Vec<G> {
         let key = match dropouts.len() {
             0 => sk.prf_key,
-            _ => sk.prf_key - sk.keygen_prf.batch_evaluate(dropouts),
+            _ => match invert {
+                false => sk.prf_key - sk.keygen_prf.batch_evaluate(dropouts),
+                true => sk.keygen_prf.batch_evaluate(dropouts),
+            },
         };
         (0..length)
             .map(|i| KHPRF::evaluate_context(&key, context, i))
@@ -166,8 +175,24 @@ mod tests {
                 .map(|(i, ct)| (inputs[i].clone(), ct.clone()))
                 .unzip();
             let aggregate = to_aggregate_cts.into_iter().reduce(|a, b| a + b).unwrap();
-            let mask = AggOnlyEnc::decrypt_mask(&sk, context, dropout.as_slice(), aggregate.len());
+            let mask =
+                AggOnlyEnc::decrypt_mask(&sk, context, dropout.as_slice(), false, aggregate.len());
             let results = AggOnlyEnc::decrypt(&aggregate, &mask, max_val * arity as u64).unwrap();
+
+            // Check that doing the inverse dropout list produces the same mask
+            if dropout.len() != 0 {
+                let online = (0..arity)
+                    .filter(|i| !dropout.contains(i))
+                    .collect::<Vec<_>>();
+                let mask_from_inv = AggOnlyEnc::decrypt_mask(
+                    &sk,
+                    context,
+                    online.as_slice(),
+                    true,
+                    aggregate.len(),
+                );
+                assert_eq!(mask, mask_from_inv);
+            }
 
             let expected_results = to_aggregate_inputs
                 .into_iter()
@@ -210,8 +235,13 @@ mod tests {
             .reduce(|a, b| a + b)
             .unwrap();
         let wrong_dropouts = vec![0, 2]; // Claiming clients 0 and 2 dropped out, but they didn't
-        let mask =
-            AggOnlyEnc::decrypt_mask(&sk, context, wrong_dropouts.as_slice(), aggregate1.len());
+        let mask = AggOnlyEnc::decrypt_mask(
+            &sk,
+            context,
+            wrong_dropouts.as_slice(),
+            false,
+            aggregate1.len(),
+        );
         let result1 = AggOnlyEnc::decrypt(&aggregate1, &mask, max_val);
         assert!(result1.is_err());
 
@@ -224,8 +254,13 @@ mod tests {
             .map(|(i, ct)| (inputs[i].clone(), ct.clone()))
             .unzip();
         let aggregate2 = remaining_cts.into_iter().reduce(|a, b| a + b).unwrap();
-        let mask =
-            AggOnlyEnc::decrypt_mask(&sk, context, wrong_dropouts.as_slice(), aggregate2.len());
+        let mask = AggOnlyEnc::decrypt_mask(
+            &sk,
+            context,
+            wrong_dropouts.as_slice(),
+            false,
+            aggregate2.len(),
+        );
         let result2 = AggOnlyEnc::decrypt(&aggregate2, &mask, max_val);
         assert!(result2.is_err());
     }
@@ -252,7 +287,7 @@ mod tests {
         }
 
         let aggregate1 = ciphertexts.into_iter().reduce(|a, b| a + b).unwrap();
-        let mask = AggOnlyEnc::decrypt_mask(&sk, wrong_context, &[], aggregate1.len());
+        let mask = AggOnlyEnc::decrypt_mask(&sk, wrong_context, &[], false, aggregate1.len());
         let result1 = AggOnlyEnc::decrypt(&aggregate1, &mask, max_val);
         assert!(result1.is_err());
 
@@ -265,11 +300,11 @@ mod tests {
         }
 
         let aggregate2 = ciphertexts2.into_iter().reduce(|a, b| a + b).unwrap();
-        let mask2 = AggOnlyEnc::decrypt_mask(&sk, context1, &[], aggregate2.len());
+        let mask2 = AggOnlyEnc::decrypt_mask(&sk, context1, &[], false, aggregate2.len());
         let result2 = AggOnlyEnc::decrypt(&aggregate2, &mask2, max_val);
         assert!(result2.is_err());
 
-        let mask3 = AggOnlyEnc::decrypt_mask(&sk, context2, &[], aggregate2.len());
+        let mask3 = AggOnlyEnc::decrypt_mask(&sk, context2, &[], false, aggregate2.len());
         let result3 = AggOnlyEnc::decrypt(&aggregate2, &mask3, max_val);
         assert!(result3.is_err());
     }
