@@ -22,9 +22,6 @@ use tari_bulletproofs_plus::{
     ristretto::RistrettoRangeProof,
 };
 
-// TODO: Stuff will need to change for the range proof
-
-/// Prover and verifier keys
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProverKey {
     Binary { g_comm: G },                  // Schnorr proof
@@ -144,8 +141,7 @@ impl Proof {
         bitlength: usize,
         length: usize,
     ) -> (Vec<ProverKey>, VerifierKey) {
-        // TODO: Generate this correctly
-        let g_comm = G::from_hash(Sha3_512::new().chain_update(b"h"));
+        let g_comm = Self::get_g_comm();
         let key_commitments = eval_keys.iter().map(|ek| g_comm * (**ek)).collect();
 
         // For short binary inputs (l < 8 in our experiments), the Schnorr
@@ -338,7 +334,7 @@ impl Proof {
         vk: &VerifierKey,
         ciphertext: &Ciphertext,
         context: u32,
-        proof_index: usize,
+        proof_index: u32,
     ) -> Result<()> {
         let g = G::generator();
 
@@ -375,7 +371,7 @@ impl Proof {
                     // X=0
                     crate::check_claim!(
                         g_comm * proof.x0[i],
-                        key_commitments[proof_index] * challenge_0 + proof.g_comm_x0[i],
+                        key_commitments[proof_index as usize] * challenge_0 + proof.g_comm_x0[i],
                         format!("Claim (2) failed for x=0, slot {}", i)
                     );
                     crate::check_claim!(
@@ -387,7 +383,7 @@ impl Proof {
                     // X=1
                     crate::check_claim!(
                         g_comm * proof.x1[i],
-                        key_commitments[proof_index] * challenge_1 + proof.g_comm_x1[i],
+                        key_commitments[proof_index as usize] * challenge_1 + proof.g_comm_x1[i],
                         format!("Claim (2) failed for x=1, slot {}", i)
                     );
                     crate::check_claim!(
@@ -438,7 +434,7 @@ impl Proof {
                 // Check claim 2
                 crate::check_claim!(
                     *g_comm * proof.k,
-                    key_commitments[proof_index] * challenge + proof.g_comm_k,
+                    key_commitments[proof_index as usize] * challenge + proof.g_comm_k,
                     "Claim 2 failed (DLEQ)"
                 );
 
@@ -470,7 +466,7 @@ impl Proof {
         ciphertexts: &[Ciphertext],
         context: u32,
         proofs: &[Proof],
-        proof_indices: &[usize],
+        proof_indices: &[u32],
         rng: &mut R,
     ) -> Result<()> {
         let g = G::generator();
@@ -504,7 +500,7 @@ impl Proof {
 
                 // For each proof, add the relevant terms to the final MSM computation
                 for i in 0..proof_indices.len() {
-                    let proof_idx = proof_indices[i];
+                    let proof_idx = proof_indices[i] as usize;
                     let ciphertext = &ciphertexts[i];
                     let Proof::Binary(proof) = &proofs[i] else {
                         return Err(anyhow::anyhow!("Proof type mismatch"));
@@ -600,7 +596,7 @@ impl Proof {
 
                 // For each proof, add the relevant terms to the final MSM computation
                 for i in 0..proof_indices.len() {
-                    let proof_idx = proof_indices[i];
+                    let proof_idx = proof_indices[i] as usize;
                     let ciphertext = &ciphertexts[i];
                     let Proof::Range(proof) = &proofs[i] else {
                         return Err(anyhow::anyhow!("Proof type mismatch"));
@@ -680,6 +676,11 @@ impl Proof {
                 }
             }
         }
+    }
+
+    // TODO: Generate this correctly
+    pub fn get_g_comm() -> G {
+        G::from_hash(Sha3_512::new().chain_update(b"h"))
     }
 }
 

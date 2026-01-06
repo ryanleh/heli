@@ -4,15 +4,34 @@ use aes::{
     Aes256,
     cipher::{BlockEncrypt, KeyInit},
 };
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha3::Sha3_512;
 
 /// Naor-Pinkas-Reingold key-homomorphic PRF
 pub struct KHPRF;
 
 /// AES-based PRF for generating random scalar elements,
+#[derive(Clone)]
 pub struct ScalarPRF {
+    key: [u8; 32],
     cipher: Aes256,
 }
+
+impl Serialize for ScalarPRF {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.key.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ScalarPRF {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let key = <[u8; 32]>::deserialize(deserializer)?;
+        Ok(Self::new(&key))
+    }
+}
+
+#[cfg(not(target_feature = "aes"))]
+compile_error!("This crate requires AES-NI (target-feature=aes)");
 
 impl KHPRF {
     // Evaluates the PRF on the given context and index. For our purposes, the
@@ -32,6 +51,7 @@ impl KHPRF {
 impl ScalarPRF {
     pub fn new(key: &[u8; 32]) -> Self {
         Self {
+            key: *key,
             cipher: Aes256::new(&GenericArray::from_slice(key)),
         }
     }
@@ -79,15 +99,17 @@ impl ScalarPRF {
 
     fn evaluate_aes(&self, index: u64) -> [GenericArray<u8, aes::cipher::consts::U16>; 2] {
         // Set input
-        let mut blocks = [GenericArray::default(); 2];
-        for (i, block) in blocks.iter_mut().enumerate() {
-            block[0..8].copy_from_slice(&index.to_le_bytes()); // index
-            block[15] = i as u8; // block domain bit
-        }
+        let mut block0 = GenericArray::default();
+        let mut block1 = GenericArray::default();
 
-        // Evaluate AES
-        self.cipher.encrypt_blocks(&mut blocks);
-        blocks
+        block0[0..8].copy_from_slice(&index.to_le_bytes());
+        block1[0..8].copy_from_slice(&index.to_le_bytes());
+        block1[15] = 1; // block domain bit
+
+        self.cipher.encrypt_block(&mut block0);
+        self.cipher.encrypt_block(&mut block1);
+
+        [block0, block1]
     }
 
     /// Add a 256-bit integer (4 limbs) to a 320-bit accumulator.

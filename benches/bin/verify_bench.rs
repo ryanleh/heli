@@ -1,9 +1,12 @@
+mod common;
+use common::{TimeStats, print_results};
+
 use clap::Parser;
 use heli::{agg_only_enc::AggOnlyEnc, crypto::Scalar, proofs::Proof};
 use rand::Rng;
 use rand_core::OsRng;
 use std::hint::black_box;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Parser)]
 struct Config {
@@ -26,59 +29,6 @@ struct Config {
     /// Bit length of input values
     #[arg(short, long, default_value_t = 1)]
     bitlength: usize,
-}
-
-#[derive(Debug)]
-pub struct TimeStats {
-    pub mean: Duration,
-    pub min: Duration,
-    pub max: Duration,
-    pub median: Duration,
-    pub std_dev: Duration,
-}
-
-impl TimeStats {
-    fn from_times(times: &[Duration]) -> Self {
-        if times.is_empty() {
-            return Self {
-                mean: Duration::ZERO,
-                min: Duration::ZERO,
-                max: Duration::ZERO,
-                median: Duration::ZERO,
-                std_dev: Duration::ZERO,
-            };
-        }
-
-        // Sort times to find min, max, median
-        let mut sorted_times = times.to_vec();
-        sorted_times.sort();
-
-        let mean_nanos =
-            times.iter().map(|d| d.as_nanos() as f64).sum::<f64>() / times.len() as f64;
-        let mean = Duration::from_nanos(mean_nanos as u64);
-        let min = sorted_times[0];
-        let max = sorted_times[times.len() - 1];
-        let median = sorted_times[times.len() / 2];
-
-        // Calculate standard deviation
-        let variance = times
-            .iter()
-            .map(|d| {
-                let diff = d.as_nanos() as f64 - mean_nanos;
-                diff * diff
-            })
-            .sum::<f64>()
-            / times.len() as f64;
-        let std_dev = Duration::from_nanos(variance.sqrt() as u64);
-
-        Self {
-            mean,
-            min,
-            max,
-            median,
-            std_dev,
-        }
-    }
 }
 
 const CONTEXT: u32 = 42;
@@ -132,7 +82,7 @@ fn bench_verification(config: &Config) -> Vec<(usize, TimeStats)> {
         println!("Benchmarking {} clients...", client_count);
 
         // Create indices for this client count
-        let indices = (0..client_count).collect::<Vec<_>>();
+        let indices = (0u32..client_count as u32).collect::<Vec<_>>();
         let client_ciphertexts = &ciphertexts[..client_count];
         let client_proofs = &proofs[..client_count];
 
@@ -193,64 +143,18 @@ fn main() {
     println!("{}", "=".repeat(80));
 
     let results = bench_verification(&config);
-    print_results(&results, &config, proof_system_type);
+    print_results(
+        &results,
+        proof_system_type,
+        &config.clients,
+        config.length,
+        config.bitlength,
+        config.iterations,
+        config.warmup,
+        "Verification Results",
+        "Mean (ms)",
+        "Per-User (ms)",
+    );
 
     println!("\n{}", "=".repeat(80));
-}
-
-fn print_results(results: &[(usize, TimeStats)], config: &Config, proof_system_name: &str) {
-    println!("Configuration:");
-    println!("  Proof System: {}", proof_system_name);
-    println!("  Client Counts: {:?}", config.clients);
-    println!("  Input Length: {}", config.length);
-    println!("  Bitlength: {}", config.bitlength);
-    println!(
-        "  Iterations: {} (warmup: {})",
-        config.iterations, config.warmup
-    );
-
-    // Helper function to format duration with 2 decimal places
-    let format_duration = |duration: Duration| {
-        let millis = duration.as_micros() as f64 / 1000.0;
-        format!("{:.2}ms", millis)
-    };
-
-    println!("\nVerification Results:");
-    println!(
-        "  Clients | Mean (ms) | Per-User (ms) | Relative | Median (ms) | Min (ms) | Max (ms) | Std Dev (ms)"
-    );
-    println!(
-        "  --------|-----------|---------------|----------|-------------|----------|----------|-------------"
-    );
-
-    // Calculate baseline per-user cost (from first result)
-    let baseline_per_user = if let Some((_, first_stats)) = results.first() {
-        first_stats.mean / results[0].0 as u32
-    } else {
-        Duration::ZERO
-    };
-
-    for (client_count, stats) in results {
-        let per_user = stats.mean / *client_count as u32;
-
-        // Calculate speedup (baseline / current)
-        let relative = if baseline_per_user > Duration::ZERO {
-            let speedup = baseline_per_user.as_nanos() as f64 / per_user.as_nanos() as f64;
-            format!("{:.1}x", speedup)
-        } else {
-            "1.0x".to_string()
-        };
-
-        println!(
-            "  {:6} | {:9} | {:13} | {:8} | {:11} | {:8} | {:8} | {:11}",
-            client_count,
-            format_duration(stats.mean),
-            format_duration(per_user),
-            relative,
-            format_duration(stats.median),
-            format_duration(stats.min),
-            format_duration(stats.max),
-            format_duration(stats.std_dev)
-        );
-    }
 }

@@ -6,23 +6,33 @@ edition = "2024"
 [dependencies]
 aes = "0.8.4"
 anyhow = "1.0"
+base64 = "0.22"
 bincode = "1.3"
 bytesize = "1.3"
 clap = { version = "4.0", features = ["derive"] }
 curve25519-dalek = { version = "4.2.0", features = ["group", "serde", "digest"]}
 group = "0.13"
+hpke = "0.11"
 merlin = "3.0"
 rand = "0.8.5"
 rand_core = "0.6.4"
+rand_chacha = "0.3"
+rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 toml = "0.8"
+ring = "0.17"
+serde_json = "1.0.149"
+serde_cbor = "0.11"
+sha2 = "0.10"
 sha3 = "0.10"
+sled = "0.34.7"
 subtle = "2.6.1"
 tari_bulletproofs_plus = "0.4.1"
+x509-parser = { version = "0.18.0", features = ["verify"]}
 
 [dev-dependencies]
 generic-array = "0.14"
@@ -52,3 +62,28 @@ path = "benches/bin/verify_bench.rs"
 [[bin]]
 name = "size-bench"
 path = "benches/bin/size_bench.rs"
+
+[[bin]]
+name = "hpke"
+path = "benches/bin/hpke.rs"
+
+[[bin]]
+name = "report-gen-bench"
+path = "benches/bin/report_gen_bench.rs"
+
+# Experiment binaries
+[[bin]]
+name = "generate_keys"
+path = "experiments/generate_keys.rs"
+
+[[bin]]
+name = "exp_aggregator"
+path = "experiments/aggregator.rs"
+
+[[bin]]
+name = "exp_decryptor"
+path = "experiments/decryptor.rs"
+
+[[bin]]
+name = "exp_client"
+path = "experiments/client.rs"

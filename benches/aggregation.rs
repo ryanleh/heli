@@ -9,8 +9,12 @@ use rand::{Rng, seq::IteratorRandom};
 use rand_core::OsRng;
 use std::hint::black_box;
 
-mod common;
-use common::*;
+pub fn random_inputs(len: usize, bitlength: usize) -> Vec<u64> {
+    let mut rng = OsRng;
+    (0..len)
+        .map(|_| rng.gen_range(0..(1 << bitlength)))
+        .collect()
+}
 
 fn bench_setup(c: &mut Criterion, num_clients: usize, length: usize) {
     let mut group = c.benchmark_group("setup");
@@ -37,8 +41,8 @@ fn bench_encode(c: &mut Criterion, length: usize, bitlength: usize) {
 
     // Setup
     const CONTEXT: u32 = 42;
-    let setup_data = get_setup_data(1, length, bitlength);
-    let (prover_keys, _) = Proof::setup(&setup_data.eval_keys, bitlength, length);
+    let (_, eval_keys) = AggOnlyEnc::setup(1, &mut OsRng);
+    let (prover_keys, _) = Proof::setup(&eval_keys, bitlength, length);
     let input: Vec<Scalar> = random_inputs(length, bitlength)
         .into_iter()
         .map(|x| Scalar::from(x))
@@ -52,10 +56,10 @@ fn bench_encode(c: &mut Criterion, length: usize, bitlength: usize) {
             b.iter(|| {
                 // Encode = encrypt + prove
                 let mut rng = OsRng;
-                let ciphertext = AggOnlyEnc::encrypt(&setup_data.eval_keys[0], CONTEXT, &input);
+                let ciphertext = AggOnlyEnc::encrypt(&eval_keys[0], CONTEXT, &input);
                 let proof = Proof::prove(
                     &prover_keys[0],
-                    &setup_data.eval_keys[0],
+                    &eval_keys[0],
                     CONTEXT,
                     &input,
                     &ciphertext,
@@ -76,15 +80,14 @@ fn bench_aggregate(c: &mut Criterion, num_clients: usize, length: usize, bitwidt
 
     // Setup
     const CONTEXT: u32 = 42;
-    let setup_data = get_setup_data(num_clients, length, bitwidth);
+    let (_sk, eval_keys) = AggOnlyEnc::setup(num_clients, &mut OsRng);
     let input: Vec<Scalar> = random_inputs(length, bitwidth)
         .into_iter()
         .map(|x| Scalar::from(x))
         .collect();
 
     // We can use the same input for all clients since the encryption is randomized
-    let ciphertexts: Vec<Ciphertext> = setup_data
-        .eval_keys
+    let ciphertexts: Vec<Ciphertext> = eval_keys
         .iter()
         .map(|ek| AggOnlyEnc::encrypt(ek, CONTEXT, &input))
         .collect();
@@ -118,21 +121,22 @@ fn bench_decode(
     let mut group = c.benchmark_group("decode");
     group.warm_up_time(std::time::Duration::from_millis(100));
     group.measurement_time(std::time::Duration::from_millis(500));
+    group.sample_size(10);
 
     // Setup
     const CONTEXT: u32 = 42;
-    let setup_data = get_setup_data(num_clients, length, bitwidth);
+    let (sk, _eval_keys) = AggOnlyEnc::setup(num_clients, &mut OsRng);
 
     // Randomly choose dropout indices
     let mut rng = OsRng;
     let (invert, dropouts) = match 2 * num_dropouts > num_clients {
         true => (
             true,
-            (0..num_clients).choose_multiple(&mut rng, num_dropouts),
+            (0..num_clients).choose_multiple(&mut rng, num_clients - num_dropouts),
         ),
         false => (
             false,
-            (0..num_clients).choose_multiple(&mut rng, num_clients),
+            (0..num_clients).choose_multiple(&mut rng, num_dropouts),
         ),
     };
 
@@ -145,11 +149,7 @@ fn bench_decode(
         |b, _| {
             b.iter(|| {
                 black_box(AggOnlyEnc::decrypt_mask(
-                    &setup_data.sk,
-                    CONTEXT,
-                    &dropouts,
-                    invert,
-                    length,
+                    &sk, CONTEXT, &dropouts, invert, length,
                 ));
             });
         },
@@ -165,15 +165,14 @@ fn bench_post_process(c: &mut Criterion, num_clients: usize, length: usize, bitw
 
     // Setup
     const CONTEXT: u32 = 42;
-    let setup_data = get_setup_data(num_clients, length, bitwidth);
+    let (sk, eval_keys) = AggOnlyEnc::setup(num_clients, &mut OsRng);
     let input: Vec<Scalar> = random_inputs(length, bitwidth)
         .into_iter()
         .map(|x| Scalar::from(x))
         .collect();
 
     // Create aggregated ciphertext
-    let ciphertexts: Vec<Ciphertext> = setup_data
-        .eval_keys
+    let ciphertexts: Vec<Ciphertext> = eval_keys
         .iter()
         .map(|ek| AggOnlyEnc::encrypt(ek, CONTEXT, &input))
         .collect();
@@ -187,7 +186,7 @@ fn bench_post_process(c: &mut Criterion, num_clients: usize, length: usize, bitw
         });
 
     // Pre-compute mask
-    let mask = AggOnlyEnc::decrypt_mask(&setup_data.sk, CONTEXT, &[], false, length);
+    let mask = AggOnlyEnc::decrypt_mask(&sk, CONTEXT, &[], false, length);
     let max_dlog = (1u64 << bitwidth) * num_clients as u64; // Account for sum of multiple values
 
     // Benchmark decrypt (post-processing)
@@ -205,113 +204,70 @@ fn bench_post_process(c: &mut Criterion, num_clients: usize, length: usize, bitw
     group.finish();
 }
 
-fn bench_secret_sharing_vs_elgamal(c: &mut Criterion, length: usize, bitlength: usize) {
-    let mut group = c.benchmark_group("secret_sharing_vs_elgamal");
-    group.warm_up_time(std::time::Duration::from_millis(100));
-    group.measurement_time(std::time::Duration::from_millis(500));
-    group.sample_size(10);
-
-    // Setup
-    let input = random_inputs(length, bitlength);
-
-    // Use a 128-bit prime field (2^128 - 159 is prime)
-    let field_modulus = 2u128.pow(128) - 159;
-
-    // Pre-generate randomness for secret sharing
-    let mut rng = OsRng;
-    let random_shares: Vec<u128> = (0..length)
-        .map(|_| rng.gen_range(0..field_modulus))
-        .collect();
-
-    // Benchmark secret sharing computation (just modular arithmetic)
-    group.bench_with_input(
-        BenchmarkId::new(
-            "secret_sharing",
-            format!("{length}_inputs_{bitlength}_bits"),
-        ),
-        &(length, bitlength),
-        |b, _| {
-            b.iter(|| {
-                // Just compute the other share: (x - random_share) mod field_modulus
-                let shares: Vec<_> = input
-                    .iter()
-                    .zip(random_shares.iter())
-                    .map(|(&x, &random_share)| {
-                        let other_share = (x as u128 * random_share) % field_modulus;
-                        (random_share, other_share)
-                    })
-                    .collect();
-                black_box(shares);
-            });
-        },
-    );
-
-    // Benchmark ElGamal exponentiation (just g^r computation)
-    group.bench_with_input(
-        BenchmarkId::new(
-            "elgamal_exponentiation",
-            format!("{length}_inputs_{bitlength}_bits"),
-        ),
-        &(length, bitlength),
-        |b, _| {
-            b.iter(|| {
-                // Just compute g^r (the main expensive operation in ElGamal)
-                let g_r = G::generator() + G::generator();
-                black_box(g_r);
-            });
-        },
-    );
-
-    group.finish();
-}
-
 fn setup(c: &mut Criterion) {
-    // Choice of prover doesn't matter here
-    //
-    // Parameters (num_clients, length)
     bench_setup(c, 1, 1);
     bench_setup(c, 10, 1);
     bench_setup(c, 100, 1);
     bench_setup(c, 1000, 1);
-    //bench_setup(c, 10000, 1);
 }
 
-fn client_encoding(c: &mut Criterion) {
-    // Parameters (length, bitlength)
-    bench_encode(c, 1, 1);
-    bench_encode(c, 1, 2);
-    bench_encode(c, 1, 4);
-    bench_encode(c, 1, 8);
-    bench_encode(c, 1, 16);
-    bench_encode(c, 1, 32);
-    bench_encode(c, 1, 64);
+fn encode(c: &mut Criterion) {
+    // Parameters (length, bitwidth)
+    let lengths = [1, 2, 4, 8, 16, 32, 64];
+    for l in lengths {
+        bench_encode(c, l, 1);
+    }
+
+    let bitwidths = [2, 4, 8, 16, 32, 64];
+    for b in bitwidths {
+        bench_encode(c, 1, b);
+    }
 }
 
 fn aggregate(c: &mut Criterion) {
     // Parameters (num_clients, length, bitwidth)
-    //bench_aggregate(c, 1, 1, 1);
-    //bench_aggregate(c, 1, 8, 1);
-    //bench_aggregate(c, 1, 16, 1);
-    //bench_aggregate(c, 1, 1, 8);
-    //bench_aggregate(c, 1, 8, 8);
-    //bench_aggregate(c, 1, 16, 8);
     bench_aggregate(c, 1, 16, 16);
 }
 
+// Needs to be run with: RUSTFLAGS='-C target-cpu=native'
 fn decode(c: &mut Criterion) {
-    // Parameters (num_clients, num_dropouts, length, bitwidth)
-    let num_clients = vec![100];
-    let num_dropouts = vec![0, 10, 50]; // 0, 10%, 50% dropout rates
-    let bitwidths = vec![1];
-    let lengths = vec![32, 64];
-    for n in num_clients.iter() {
-        for d in num_dropouts.iter() {
-            for b in bitwidths.iter() {
-                for l in lengths.iter() {
-                    bench_decode(c, *n, *d, *l, *b);
-                }
-            }
-        }
+    let mut num_clients = Vec::new();
+    let mut dropouts = Vec::new();
+
+    // First, baseline experiment with no dropout and varying clients
+    num_clients.extend([1, 100, 1000, 10000, 100000, 1000000, 10000000]);
+    dropouts.extend([0, 0, 0, 0, 0, 0, 0]);
+
+    // Then 10% dropout
+    num_clients.extend([100, 1000, 10000, 100000, 1000000, 10000000]);
+    dropouts.extend([10, 100, 1000, 10000, 100000, 1000000]);
+
+    // Then add in the experiments for growing dropout percentage with fixed
+    // number of clients
+    let mut dropout_percs = (0..=9).map(|i| i as f64 * 0.1).collect::<Vec<_>>();
+    dropout_percs.extend([0.99, 0.99995]);
+    num_clients.extend(std::iter::repeat(10_000_000).take(dropout_percs.len()));
+    dropouts.extend(
+        dropout_percs
+            .into_iter()
+            .map(|p| (p * 10_000_000 as f64).floor() as usize),
+    );
+
+    for (n, d) in num_clients.iter().zip(dropouts.iter()) {
+        bench_decode(c, *n, *d, 1, 1);
+    }
+
+    // Finally do experiments with varying bitwidth and length
+    let lengths = [8, 16, 32, 64];
+    for l in lengths {
+        bench_decode(c, 10_000_000, 0, l, 1);
+        bench_decode(c, 10_000_000, 1_000_000, l, 1);
+    }
+
+    let bitwidths = [8, 16, 32, 64];
+    for b in bitwidths {
+        bench_decode(c, 10_000_000, 0, 1, b);
+        bench_decode(c, 10_000_000, 1_000_000, 1, b);
     }
 }
 
@@ -323,19 +279,12 @@ fn post_process(c: &mut Criterion) {
     bench_post_process(c, 1000, 1, 8);
 }
 
-fn secret_sharing_vs_elgamal(c: &mut Criterion) {
-    // Parameters (length, bitlength)
-    bench_secret_sharing_vs_elgamal(c, 1, 1);
-    //bench_secret_sharing_vs_elgamal(c, 1, 8);
-}
-
 criterion_group!(
     benches,
-    setup,
-    client_encoding,
+    //setup,
+    encode,
     aggregate,
     decode,
     post_process,
-    secret_sharing_vs_elgamal,
 );
 criterion_main!(benches);

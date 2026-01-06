@@ -1,3 +1,4 @@
 /target
 
-/experiments/logs
+experiment.db
+experiment.db_decryptor

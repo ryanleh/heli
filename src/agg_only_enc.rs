@@ -2,6 +2,7 @@ use crate::crypto::*;
 use anyhow::Result;
 use group::Group;
 use rand_core::{CryptoRng, RngCore};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Aggregation-only encryption instantiated with
@@ -10,42 +11,42 @@ use serde::{Deserialize, Serialize};
 /// This implementation only supports basic sums, not general linear functions.
 pub struct AggOnlyEnc;
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SecretKey {
-    prf_key: Scalar,
-    keygen_prf: ScalarPRF,
+    pub(crate) prf_key: Scalar,
+    pub(crate) keygen_prf: ScalarPRF,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub struct EvalKey(Scalar);
+pub struct EvalKey(pub Scalar);
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Ciphertext(Vec<G>);
 
 impl AggOnlyEnc {
-    // Given the function arity, output a secret key and set of evaluation keys
+    // Given the function arity, output a secret key and set of evaluation keys.
+    // Used for benchmarking when we aren't producing user keys on-the-fly.
     pub fn setup<R: RngCore + CryptoRng>(arity: usize, rng: &mut R) -> (SecretKey, Vec<EvalKey>) {
-        // Initialize PRF for generating client keys
+        // Initialize the PRF
         let mut keygen_prf_key = [0u8; 32];
         rng.fill_bytes(&mut keygen_prf_key);
         let keygen_prf = ScalarPRF::new(&keygen_prf_key);
 
-        // Generate evaluation keys
+        // Compute evaluation keys and accumulate PRF key
         let mut prf_key = Scalar::ZERO;
         let eval_keys = (0..arity)
             .map(|i| {
-                let prf_key_share = keygen_prf.evaluate(i as u64);
-                prf_key += prf_key_share;
-                EvalKey(prf_key_share)
+                let share = keygen_prf.evaluate(i as u64);
+                prf_key += share;
+                EvalKey(share)
             })
             .collect();
 
-        (
-            SecretKey {
-                prf_key,
-                keygen_prf,
-            },
-            eval_keys,
-        )
+        let sk = SecretKey {
+            prf_key,
+            keygen_prf,
+        };
+        (sk, eval_keys)
     }
 
     // Encrypt an input under the provided context and randomness
@@ -76,7 +77,11 @@ impl AggOnlyEnc {
                 true => sk.keygen_prf.batch_evaluate(dropouts),
             },
         };
+
+        // Note that this is parallelized by default. If doing single-core benchmarks need to
+        // explicitly set the RAYON_NUM_THREADS environment variable
         (0..length)
+            .into_par_iter()
             .map(|i| KHPRF::evaluate_context(&key, context, i))
             .collect()
     }

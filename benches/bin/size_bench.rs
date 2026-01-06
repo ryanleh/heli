@@ -17,9 +17,10 @@ struct Config {
     bitlength: Vec<usize>,
 }
 
-fn random_input(length: usize, bitlength: usize) -> Vec<u64> {
-    (0..length)
-        .map(|_| OsRng.gen_range(0..1u128 << bitlength) as u64)
+pub fn random_inputs(len: usize, bitlength: usize) -> Vec<u64> {
+    let mut rng = OsRng;
+    (0..len)
+        .map(|_| rng.gen_range(0..(1 << bitlength)))
         .collect()
 }
 
@@ -36,7 +37,7 @@ fn measure_sizes(length: usize, bitlength: usize) {
         "Range"
     };
 
-    let input: Vec<Scalar> = random_input(length, bitlength)
+    let input: Vec<Scalar> = random_inputs(length, bitlength)
         .into_iter()
         .map(|x| Scalar::from(x))
         .collect();

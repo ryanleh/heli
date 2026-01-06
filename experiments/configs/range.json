@@ -1,0 +1,12 @@
+{
+    "num_clients": 100,
+    "threshold": 100,
+    "length": 4,
+    "prover": {
+        "type": "range",
+        "bitlength": 8
+    },
+    "aggregator_addr": "127.0.0.1:9000",
+    "decryptor_addr": "127.0.0.1:9001",
+    "db_path": "experiment.db"
+}

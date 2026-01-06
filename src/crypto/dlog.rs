@@ -30,7 +30,7 @@ pub fn compute_dlog(g: &G, challenge: &G, max_dlog: u64) -> Result<u64> {
         let guess_bytes = guess.compress().to_bytes().as_ref().to_vec();
         if let Some(&i) = giant_steps.get(&guess_bytes) {
             let res = i - j;
-            if res < max_dlog {
+            if res <= max_dlog {
                 return Ok(res);
             }
         }
@@ -65,7 +65,7 @@ mod tests {
         assert_eq!(result, n_big - 1);
 
         // Test value outside range
-        let scalar_out = Scalar::from(1000u64);
+        let scalar_out = Scalar::from(1001u64);
         assert!(compute_dlog(&g, &(g * scalar_out), max_dlog).is_err());
     }
 }
