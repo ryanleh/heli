@@ -24,7 +24,7 @@ impl KHPRF {
 
     // Compute the generator of the PRF
     pub fn compute_generator(context: u32, index: usize) -> G {
-        let full_context = (context as u64) << 32 + index as u64;
+        let full_context = ((context as u64) << 32) + index as u64;
         G::hash_from_bytes::<Sha3_512>(&full_context.to_le_bytes().as_ref())
     }
 }
