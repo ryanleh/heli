@@ -22,6 +22,8 @@ This repository contains several modules that implement the different building b
 
 * [`experiments`](src/experiments): End-to-end experiments.
 
+* [`artifact-eval`](src/artifact-eval): Scripts to recreate Figures 4, 5 from the Heli paper.
+
 ## Build guide
 
 Ensure that you have a C++ compiler and Rust installed. 
