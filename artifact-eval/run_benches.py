@@ -6,6 +6,9 @@ from typing import List, Dict, Any
 from dataclasses import dataclass
 import os
 
+# Cargo must run from the directory containing Cargo.toml (code/, parent of artifact-eval)
+_CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
 # This is the benchmarked time it took to encode/unwrap a single 
 # client submission (b=1, l=1) using github.com/divviup/janus. The
 # main overhead is the HPKE group exponentiation, so the report
@@ -129,7 +132,7 @@ def run_server_bin(
             ]
             cmd = [x for x in cmd if x]
             print(f"Running: {' '.join(cmd)}")
-            r = subprocess.run(cmd, env=_env(), capture_output=True, text=True)
+            r = subprocess.run(cmd, env=_env(), capture_output=True, text=True, cwd=_CODE_DIR)
             if r.returncode != 0:
                 print(f"Error: {r.stderr}")
                 continue
@@ -146,7 +149,7 @@ def run_server_bin(
             "-l", *[str(x) for x in lengths],
         ]
         print(f"Running: {' '.join(cmd)}")
-        r = subprocess.run(cmd, env=_env(), capture_output=True, text=True)
+        r = subprocess.run(cmd, env=_env(), capture_output=True, text=True, cwd=_CODE_DIR)
         if r.returncode != 0:
             print(f"Error: {r.stderr}")
             return []
@@ -160,7 +163,7 @@ def run_server_bin(
             "-b", *[str(x) for x in bitlengths],
         ]
         print(f"Running: {' '.join(cmd)}")
-        r = subprocess.run(cmd, env=_env(), capture_output=True, text=True)
+        r = subprocess.run(cmd, env=_env(), capture_output=True, text=True, cwd=_CODE_DIR)
         if r.returncode != 0:
             print(f"Error: {r.stderr}")
             return []
@@ -236,7 +239,7 @@ def run_light_cpu() -> List[DecodeResult]:
     """Light server CPU: criterion decode. Returns list of DecodeResult."""
     cmd = ["cargo", "criterion", "decode", "--message-format=json"]
     print(f"Running: {' '.join(cmd)}")
-    r = subprocess.run(cmd, capture_output=True, text=True, env=_env())
+    r = subprocess.run(cmd, capture_output=True, text=True, env=_env(), cwd=_CODE_DIR)
     if r.returncode != 0:
         print(f"Error running cargo bench decode:\n{r.stderr}\n{r.stdout}")
         return []
@@ -289,7 +292,7 @@ def run_client_cpu() -> List[EncodeResult]:
         "--message-format=json",
     ]
     print(f"Running: {' '.join(cmd)}")
-    r = subprocess.run(cmd, capture_output=True, text=True, env=_env())
+    r = subprocess.run(cmd, capture_output=True, text=True, env=_env(), cwd=_CODE_DIR)
     if r.returncode != 0:
         print(f"Error: {r.stderr}\n{r.stdout}")
         return []

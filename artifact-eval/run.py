@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
 Run all benches, update artifact-eval data CSVs with results, then generate PDF plots.
-Run from repo root with: python code/artifact-eval/run.py
-Or from code/: python artifact-eval/run.py
+Run from repo root: python code/artifact-eval/run.py
+Or from code/:    python artifact-eval/run.py
 """
 import os
-import sys
 
 import pandas as pd
+
+_SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
+_DATA_DIR = os.path.join(_SCRIPT_DIR, "data")
 
 from run_benches import (
     run_heavy_cpu,
@@ -99,6 +101,10 @@ def _update_client_df(client_df, encode_results, size_results):
 
 
 def main():
+    # Run cargo from code/ (parent of artifact-eval)
+    code_dir = os.path.join(_SCRIPT_DIR, "..")
+    os.chdir(os.path.abspath(code_dir))
+
     print("Running benches...")
     heavy_results = run_heavy_cpu()
     server_comm_list = run_server_comm()
