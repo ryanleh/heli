@@ -1,20 +1,20 @@
-"""
-Standalone copy of paper plotting. Reads from artifact-eval/data/ (server, client, dropout_10, dropout).
-"""
 from itertools import cycle
 import os
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.ticker import LogLocator
 
+# Tell matplotlib that there's no GUI
+matplotlib.use("Agg")
+
 
 def _setup_style():
     plt.style.use("seaborn-v0_8-colorblind")
-    plt.rcParams["font.family"] = "sans-serif"
-    plt.rcParams["font.sans-serif"] = "Helvetica"
+    # Commenting out since Ubuntu doesn't ship with Helvetica
+    #plt.rcParams["font.family"] = "sans-serif"
+    #plt.rcParams["font.sans-serif"] = "Helvetica"
     plt.rcParams["font.size"] = 20
     plt.rcParams["axes.titlesize"] = 20
     plt.rcParams["axes.labelsize"] = 20
@@ -36,7 +36,6 @@ def _get_colors():
     return colors
 
 
-_BASELINE_CSVS = ("server.csv", "client.csv", "dropout_10.csv", "dropout.csv")
 _NEW_CSVS = ("server_new.csv", "client_new.csv", "dropout_10_new.csv", "dropout_new.csv")
 
 
