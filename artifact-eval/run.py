@@ -95,7 +95,7 @@ def _update_client_df(client_df, encode_results, size_results):
         b, l = int(row["bitwidth"]), int(row["length"])
         key = (l, b)
         if key in encode_lookup:
-            client_df.at[idx, "us_e"] = encode_lookup[key]
+            client_df.at[idx, "us_c"] = encode_lookup[key]
         if key in size_lookup:
             client_df.at[idx, "us_s"] = size_lookup[key]
 

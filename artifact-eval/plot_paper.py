@@ -349,51 +349,6 @@ def run_all(out_dir, data_dir, use_bench_results=False):
     ax.grid(linestyle="--")
     save("server_comm_bitwidth_log.pdf", fig13)
 
-    # Plot 14: AWS cost (hardcoded)
-    fig14, ax = plt.subplots(figsize=(8, 4))
-    categories = ["Heli (this work)", "Whisper", "Prio"]
-    left_values = [113, 3, 15.5]
-    right_values = [0.000025, 3, 15.5]
-    color_cycle = cycle(plt.rcParams["axes.prop_cycle"].by_key()["color"])
-    new_colors = ["#CC5F2A"] + [next(color_cycle) for _ in range(2)]
-    log_min, log_max = -5, 2
-    total_range = log_max - log_min
-    left_mapped = -(np.log10(left_values) - log_min)
-    right_mapped = np.log10(right_values) - log_min
-    ax.barh(categories, left_mapped, color=new_colors, tick_label=categories)
-    ax.barh(categories, right_mapped, color=new_colors, tick_label=categories)
-    ax.set_xlim(-total_range, total_range)
-    ax.axvline(0, color="black", linewidth=1)
-    tick_exponents = np.arange(log_min, log_max + 1)[::2]
-    left_ticks = -(tick_exponents - log_min)
-    left_labels = [f"$10^{{{int(e)}}}$" for e in tick_exponents]
-    right_ticks = tick_exponents - log_min
-    right_labels = [f"$10^{{{int(e)}}}$" for e in tick_exponents]
-    ticks = np.concatenate([left_ticks[::-1], right_ticks[1:]])
-    labels = left_labels[::-1] + right_labels[1:]
-    ax.set_ylim(-0.6, 3.8)
-    ax.annotate("", xy=(5, 2.9), xytext=(2, 2.9), arrowprops=dict(facecolor="burlywood", edgecolor="burlywood", width=8, headwidth=25, headlength=20), ha="center", va="center")
-    ax.text(2, 3.2, "Higher", fontsize=20, color="burlywood", weight="bold")
-    ax.annotate("", xy=(-5, 2.9), xytext=(-2, 2.9), arrowprops=dict(facecolor="burlywood", edgecolor="burlywood", width=8, headwidth=25, headlength=20), ha="center", va="center")
-    ax.text(-4.1, 3.2, "Higher", fontsize=20, color="burlywood", weight="bold")
-    ax.text(-7.4, 1.9, "15.5", fontsize=15, color=new_colors[2], weight="bold")
-    ax.text(-5.9, 0.9, "3", fontsize=15, color=new_colors[1], weight="bold")
-    ax.text(-8.1, -0.15, "113", fontsize=15, color=new_colors[0], weight="bold")
-    ax.text(6.3, 1.9, "15.5", fontsize=15, color=new_colors[2], weight="bold")
-    ax.text(5.6, 0.9, "3", fontsize=15, color=new_colors[1], weight="bold")
-    ax.text(0.5, -0.15, "0.000025", fontsize=15, color=new_colors[0], weight="bold")
-    ax.spines["top"].set_visible(False)
-    ax.spines["left"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.set_xticks(ticks)
-    ax.set_xticklabels(labels)
-    ax.tick_params(axis="y", left=False, labelsize=20, pad=30)
-    ax.text(-5.1, 4, "  Server 1\nAWS Cost")
-    ax.text(2.1, 4, "  Server 2\nAWS Cost")
-    ax.set_xlabel("US Cents (log scale)")
-    plt.tight_layout()
-    save("aws_costs.pdf", fig14)
-
     # Plot 15: Dropout crossover (server CPU)
     fig15, ax = plt.subplots()
     data = dropout_data
