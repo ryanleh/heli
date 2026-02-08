@@ -80,7 +80,6 @@ _SIZE_LINE_RE = re.compile(
 
 @dataclass
 class SizeResult:
-    """Single size_bench result: length, bitlength, encoding_bytes, proof_bytes, total_kb."""
     length: int
     bitlength: int
     encoding_bytes: int
@@ -89,7 +88,6 @@ class SizeResult:
 
 
 def parse_size_bench_output(output: str) -> List[SizeResult]:
-    """Parse size-bench output lines."""
     results = []
     for line in output.split("\n"):
         m = _SIZE_LINE_RE.search(line)
@@ -112,9 +110,6 @@ def run_server_bin(
     configs: List[Dict[str, Any]],
     release: bool = True,
 ) -> List[Any]:
-    """
-    Run either verify-bench or size-bench (kind='size') over specified config.
-    """
     if kind == "verify":
         out_results: List[BenchmarkResult] = []
         for i, cfg in enumerate(configs):
@@ -171,12 +166,10 @@ def run_server_bin(
 
 
 def run_heavy_cpu() -> List[BenchmarkResult]:
-    """Heavy server CPU: verify-bench over configs. Returns list of BenchmarkResult."""
     return run_server_bin("verify", _configs())
 
 
 def run_server_comm() -> List[Dict[str, Any]]:
-    """Server-to-Server comm (KB). Returns list of {length, bitlength, us_c}."""
     configs = _configs()
     return [
         {
@@ -194,7 +187,6 @@ def run_server_comm() -> List[Dict[str, Any]]:
 
 @dataclass
 class DecodeResult:
-    """Single decode benchmark result (clients, dropouts, length, bitlength, mean_ms)."""
     clients: int
     dropouts: int
     length: int
@@ -233,7 +225,6 @@ def parse_criterion_decode(output: str) -> List[DecodeResult]:
 
 
 def run_light_cpu() -> List[DecodeResult]:
-    """Light server CPU: criterion decode. Returns list of DecodeResult."""
     cmd = ["cargo", "criterion", "decode", "--message-format=json"]
     print(f"Running: {' '.join(cmd)}")
     r = subprocess.run(cmd, capture_output=True, text=True, env=_env())
@@ -250,14 +241,12 @@ def run_light_cpu() -> List[DecodeResult]:
 
 @dataclass
 class EncodeResult:
-    """Single encode benchmark result: length, bitlength, mean_ms."""
     length: int
     bitlength: int
     mean_ms: float
 
 
 def parse_criterion_encode(output: str) -> List[EncodeResult]:
-    """Parse criterion JSON for encode benchmark group."""
     results = []
     for line in output.split("\n"):
         line = line.strip()
@@ -282,7 +271,6 @@ def parse_criterion_encode(output: str) -> List[EncodeResult]:
     return results
 
 def run_client_cpu() -> List[EncodeResult]:
-    """Client CPU: cargo bench client_encoding (encode). Returns list of EncodeResult."""
     cmd = [
         "cargo", "criterion",
         "encode",
@@ -301,7 +289,6 @@ def run_client_cpu() -> List[EncodeResult]:
 # ---------------------------------------------------------------------------
 
 def run_client_comm() -> List[SizeResult]:
-    """Client comm: size-bench. Returns list of SizeResult."""
     return run_server_bin("size", _configs())
 
 

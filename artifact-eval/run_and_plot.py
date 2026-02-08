@@ -1,16 +1,6 @@
-#!/usr/bin/env python3
-"""
-Run all benches, update artifact-eval data CSVs with results, then generate PDF plots.
-Run from repo root: python code/artifact-eval/run.py
-Or from code/:    python artifact-eval/run.py
-"""
 import os
-
 import pandas as pd
-
-_SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
-_DATA_DIR = os.path.join(_SCRIPT_DIR, "data")
-
+import plot
 from run_benches import (
     run_heavy_cpu,
     run_server_comm,
@@ -20,9 +10,12 @@ from run_benches import (
     unwrap_time_ms,
 )
 
+_SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
+_DATA_DIR = os.path.join(_SCRIPT_DIR, "data")
+
+
 
 def _update_server_df(server_df, heavy_results, server_comm_list, decode_results):
-    """Update server_df in place with us_* and related columns from bench results."""
     # (length, bitlength) -> mean_ms for 128 clients (from verify-bench)
     heavy_lookup = {}
     for r in heavy_results:
@@ -46,7 +39,6 @@ def _update_server_df(server_df, heavy_results, server_comm_list, decode_results
         key = (l, b)
         if key in heavy_lookup:
             server_df.at[idx, "us_v"] = round(heavy_lookup[key] * (c / 128.0), 2)
-            server_df.at[idx, "us_a"] = 0.0
         if key in comm_lookup:
             server_df.at[idx, "us_c"] = comm_lookup[key]
         dkey = (c, l, b)
@@ -55,7 +47,6 @@ def _update_server_df(server_df, heavy_results, server_comm_list, decode_results
 
 
 def _update_dropout_10_df(df, decode_results):
-    """Update dropout_10.csv cpu column from decode results (10% dropout, length=1, bitwidth=1)."""
     # (clients, dropouts, length, bitlength) -> mean_ms
     lookup = {}
     for r in decode_results:
@@ -65,11 +56,9 @@ def _update_dropout_10_df(df, decode_results):
         c = int(row["clients"])
         if c in lookup:
             df.at[idx, "cpu"] = round(lookup[c], 2)
-    # comm: no bench output, leave as-is
 
 
 def _update_dropout_df(df, decode_results):
-    """Update dropout.csv light column from decode results (10^7 clients, varying dropout %)."""
     clients_10m = 10_000_000
     # (dropouts, length, bitlength) for clients=10^7 -> mean_ms
     lookup = {}
@@ -81,11 +70,9 @@ def _update_dropout_df(df, decode_results):
         dropouts = round(pct / 100.0 * clients_10m)
         if dropouts in lookup:
             df.at[idx, "light"] = round(lookup[dropouts], 2)
-    # light_c, prio, etc.: no bench output, leave as-is
 
 
 def _update_client_df(client_df, encode_results, size_results):
-    """Update client_df in place with us_s, us_e from bench results."""
     # (length, bitlength) -> mean_ms encode
     encode_lookup = {(r.length, r.bitlength): r.mean_ms for r in encode_results}
     # (length, bitlength) -> total_kb
@@ -101,7 +88,6 @@ def _update_client_df(client_df, encode_results, size_results):
 
 
 def main():
-    # Run cargo from code/ (parent of artifact-eval)
     code_dir = os.path.join(_SCRIPT_DIR, "..")
     os.chdir(os.path.abspath(code_dir))
 
@@ -139,8 +125,7 @@ def main():
     plots_dir = os.path.join(_SCRIPT_DIR, "plots")
     os.makedirs(plots_dir, exist_ok=True)
     print("\nGenerating plots from this run's bench results...")
-    import plot_paper
-    plot_paper.run_all(out_dir=plots_dir, data_dir=_DATA_DIR, use_bench_results=True)
+    plot.run_all(out_dir=plots_dir, data_dir=_DATA_DIR, use_bench_results=True)
 
 
 if __name__ == "__main__":
