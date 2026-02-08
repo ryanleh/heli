@@ -2,3 +2,7 @@
 
 experiment.db
 experiment.db_decryptor
+
+*.pdf
+*.DS_Store
+__pycache__

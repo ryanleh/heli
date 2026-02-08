@@ -1,0 +1,5 @@
+# For run_and_plot.py and plot.py (bench + CSV update + plotting).
+# run_benches.py and estimate_e2e.py use only the standard library.
+pandas>=1.0
+matplotlib>=3.5
+numpy>=1.20

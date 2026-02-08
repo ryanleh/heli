@@ -80,7 +80,6 @@ _SIZE_LINE_RE = re.compile(
 
 @dataclass
 class SizeResult:
-    """Single size_bench result: length, bitlength, encoding_bytes, proof_bytes, total_kb."""
     length: int
     bitlength: int
     encoding_bytes: int
@@ -89,7 +88,6 @@ class SizeResult:
 
 
 def parse_size_bench_output(output: str) -> List[SizeResult]:
-    """Parse size-bench output lines."""
     results = []
     for line in output.split("\n"):
         m = _SIZE_LINE_RE.search(line)
@@ -112,9 +110,6 @@ def run_server_bin(
     configs: List[Dict[str, Any]],
     release: bool = True,
 ) -> List[Any]:
-    """
-    Run either verify-bench or size-bench (kind='size') over specified config.
-    """
     if kind == "verify":
         out_results: List[BenchmarkResult] = []
         for i, cfg in enumerate(configs):
@@ -170,46 +165,20 @@ def run_server_bin(
     raise ValueError("kind must be 'verify' or 'size'")
 
 
-def run_heavy_cpu():
-    """Heavy server CPU: verify-bench over configs."""
-    results = run_server_bin("verify", _configs())
-    print("\n\nHeavy CPU (core-ms):")
-    print("--------------------")
+def run_heavy_cpu() -> List[BenchmarkResult]:
+    return run_server_bin("verify", _configs())
 
-    # Left plot
-    assert(results[0].config['bitlength'] == 1 and results[0].config['length'] == 1)
-    for num_clients in [128, 1000, 10000, 1000000, 10000000]:
-        time = unwrap_time_ms * num_clients
-        time += round(results[0].mean_ms * (num_clients / 128.0), 2)
-        print(f"Clients={num_clients:<8}, b=1 , l=1: {time}ms")
 
-    # Middle / right plot
-    for result in results[1:]:
-        b = result.config['bitlength']
-        l = result.config['length']
-        time = unwrap_time_ms * 10_000_000
-        time += round(result.mean_ms * (10_000_000 / 128.0), 2)
-        print(f"Clients=10000000, b={b:<2}, l={l:<2}: {time}ms")
-
-def run_server_comm():
+def run_server_comm() -> List[Dict[str, Any]]:
     configs = _configs()
-    print("\n\nServer-to-Server comm. (KB):")
-    print("--------------------")
-    
-    # Left plot
-    assert(configs[0]['bitlength'] == 1 and configs[0]['length'] == 1)
-    for num_clients in [128, 1000, 10000, 1000000, 10000000]:
-        # Just the size of the decryption mask
-        comm = round((group_elem_bytes * configs[0]['length']) / 1024.0, 2)
-        print(f"Clients={num_clients:<8}, b=1 , l=1: {comm}KB")
-
-    # Middle / right plot
-    for config in configs:
-        # Just the size of the decryption mask
-        comm = round((group_elem_bytes * config['length']) / 1024.0, 2)
-        b = config['bitlength']
-        l = config['length']
-        print(f"Clients=10000000, b={b:<2}, l={l:<2}: {comm}KB")
+    return [
+        {
+            "length": c["length"],
+            "bitlength": c["bitlength"],
+            "us_c": round((group_elem_bytes * c["length"]) / 1024.0, 2),
+        }
+        for c in configs
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +187,6 @@ def run_server_comm():
 
 @dataclass
 class DecodeResult:
-    """Single decode benchmark result (clients, dropouts, length, bitlength, mean_ms)."""
     clients: int
     dropouts: int
     length: int
@@ -256,20 +224,14 @@ def parse_criterion_decode(output: str) -> List[DecodeResult]:
     return results
 
 
-def run_light_cpu():
+def run_light_cpu() -> List[DecodeResult]:
     cmd = ["cargo", "criterion", "decode", "--message-format=json"]
     print(f"Running: {' '.join(cmd)}")
     r = subprocess.run(cmd, capture_output=True, text=True, env=_env())
     if r.returncode != 0:
         print(f"Error running cargo bench decode:\n{r.stderr}\n{r.stdout}")
         return []
-    results = parse_criterion_decode(r.stdout)
-    
-    print("\n\nLight CPU (core-ms):")
-    print("--------------------")
-
-    for x in results:
-        print(f"Clients={x.clients:<8}, dropouts={x.dropouts:<8}, b={x.bitlength}, l={x.length}: {x.mean_ms} ms")
+    return parse_criterion_decode(r.stdout)
 
 # ---------------------------------------------------------------------------
 # client + cpu: cargo bench encode (client_encoding)
@@ -279,14 +241,12 @@ def run_light_cpu():
 
 @dataclass
 class EncodeResult:
-    """Single encode benchmark result: length, bitlength, mean_ms."""
     length: int
     bitlength: int
     mean_ms: float
 
 
 def parse_criterion_encode(output: str) -> List[EncodeResult]:
-    """Parse criterion JSON for encode benchmark group."""
     results = []
     for line in output.split("\n"):
         line = line.strip()
@@ -311,9 +271,8 @@ def parse_criterion_encode(output: str) -> List[EncodeResult]:
     return results
 
 def run_client_cpu() -> List[EncodeResult]:
-    """Client CPU: cargo bench client_encoding (encode), parse criterion JSON."""
     cmd = [
-        "cargo", "criterion", 
+        "cargo", "criterion",
         "encode",
         "--message-format=json",
     ]
@@ -322,28 +281,15 @@ def run_client_cpu() -> List[EncodeResult]:
     if r.returncode != 0:
         print(f"Error: {r.stderr}\n{r.stdout}")
         return []
-    results = parse_criterion_encode(r.stdout)
-
-    print("\n\nClient Encoding CPU (ms):")
-    print("--------------------")
-    for x in results:
-        print(f"b={x.bitlength:<2}, l={x.length:<2}: {x.mean_ms} ms")
+    return parse_criterion_encode(r.stdout)
 
 
 # ---------------------------------------------------------------------------
 # client + comm: size-bench (same configs)
 # ---------------------------------------------------------------------------
 
-def run_client_comm():
-    results = run_server_bin("size", _configs())
-
-    print("\n\nClient Encoding Size (KB):")
-    print("--------------------")
-
-    for result in results[1:]: # First and second entries are dups
-        b = result.bitlength
-        l = result.length
-        print(f"b={b:<2}, l={l:<2}: {result.total_kb}KB")
+def run_client_comm() -> List[SizeResult]:
+    return run_server_bin("size", _configs())
 
 
 
@@ -371,4 +317,43 @@ if __name__ == "__main__":
 
     for p in party_list:
         for m in metric_list:
-            RUNNERS[(p, m)]()
+            result = RUNNERS[(p, m)]()
+            if (p, m) == ("heavy", "cpu") and result:
+                print("\n\nHeavy CPU (core-ms):")
+                print("--------------------")
+                results = result
+                assert results[0].config["bitlength"] == 1 and results[0].config["length"] == 1
+                for num_clients in [128, 1000, 10000, 1000000, 10000000]:
+                    time = unwrap_time_ms * num_clients + round(
+                        results[0].mean_ms * (num_clients / 128.0), 2
+                    )
+                    print(f"Clients={num_clients:<8}, b=1 , l=1: {time}ms")
+                for r in results[1:]:
+                    b, l = r.config["bitlength"], r.config["length"]
+                    time = unwrap_time_ms * 10_000_000 + round(
+                        r.mean_ms * (10_000_000 / 128.0), 2
+                    )
+                    print(f"Clients=10000000, b={b:<2}, l={l:<2}: {time}ms")
+            elif (p, m) == ("heavy", "comm") and result:
+                print("\n\nServer-to-Server comm. (KB):")
+                print("--------------------")
+                for num_clients in [128, 1000, 10000, 1000000, 10000000]:
+                    comm = result[0]["us_c"]
+                    print(f"Clients={num_clients:<8}, b=1 , l=1: {comm}KB")
+                for row in result:
+                    print(f"Clients=10000000, b={row['bitlength']:<2}, l={row['length']:<2}: {row['us_c']}KB")
+            elif (p, m) == ("light", "cpu") and result:
+                print("\n\nLight CPU (core-ms):")
+                print("--------------------")
+                for x in result:
+                    print(f"Clients={x.clients:<8}, dropouts={x.dropouts:<8}, b={x.bitlength}, l={x.length}: {x.mean_ms} ms")
+            elif (p, m) == ("client", "cpu") and result:
+                print("\n\nClient Encoding CPU (ms):")
+                print("--------------------")
+                for x in result:
+                    print(f"b={x.bitlength:<2}, l={x.length:<2}: {x.mean_ms} ms")
+            elif (p, m) == ("client", "comm") and result:
+                print("\n\nClient Encoding Size (KB):")
+                print("--------------------")
+                for r in result[1:]:
+                    print(f"b={r.bitlength:<2}, l={r.length:<2}: {r.total_kb}KB")

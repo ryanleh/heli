@@ -1,0 +1,12 @@
+{
+    "num_clients": 10000000,
+    "threshold": 9000000,
+    "dropouts": 1000000,
+    "length": 1,
+    "prover": {
+        "type": "binary"
+    },
+    "aggregator_addr": "0.0.0.0:9000",
+    "decryptor_addr": "0.0.0.0:9001",
+    "db_path": "experiment.db"
+}

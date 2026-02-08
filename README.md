@@ -22,6 +22,8 @@ This repository contains several modules that implement the different building b
 
 * [`experiments`](src/experiments): End-to-end experiments.
 
+* [`artifact-eval`](src/artifact-eval): Scripts to recreate Figures 4, 5 from the Heli paper.
+
 ## Build guide
 
 Ensure that you have a C++ compiler and Rust installed. 
@@ -33,15 +35,14 @@ sudo apt install g++
 
 You can install Rust by following the directions [here](https://www.rust-lang.org/tools/install).
 
-Next, clone this repository and build the project:
+Next, ensure the following environment variable is set either in your current session (e.g., via `export`) or in your config file (e.g., in your `~/.bashrc` file):
+```bash
+RUSTFLAGS="-C target-cpu=native"
+```
+Then, clone this repository and build the project:
 
 ```bash
 cargo build --release
-```
-If you get a build error about "AES-NI", make sure you're running on a machine with
-support for AES-NI and specify the environment variable:
-```bash
-RUSTFLAGS="-c target-cpu=native"
 ```
 To run the test suite:
 ```bash
