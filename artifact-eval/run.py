@@ -7,17 +7,9 @@ Or from code/: python artifact-eval/run.py
 import os
 import sys
 
-# Run from code/ so cargo and benches.run_benches work
-_SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
-_CODE_DIR = os.path.join(_SCRIPT_DIR, "..")
-_DATA_DIR = os.path.join(_SCRIPT_DIR, "data")
-os.chdir(_CODE_DIR)
-if _CODE_DIR not in sys.path:
-    sys.path.insert(0, _CODE_DIR)
-
 import pandas as pd
 
-from benches.run_benches import (
+from run_benches import (
     run_heavy_cpu,
     run_server_comm,
     run_light_cpu,
