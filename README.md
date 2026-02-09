@@ -53,14 +53,20 @@ cargo test
 
 ### Micro-benchmarks
 
-To reproduce the microbenchmarks shown in Figures 4 and 5 of the Heli paper, install `cargo-criterion` via:
+To reproduce Figures 4 and 5 of the Heli paper, install `cargo-criterion` via:
 ```bash
 cargo install cargo-criterion
 ```
-Then run:
+download the necessary Python dependencies:
 ```bash
-python3 benches/run_benches.py
+cd artifact-eval/
+pip -r requirements.txt
 ```
+and run the following script:
+```bash
+python3 run_and_plot.py
+```
+Plots will appear in the `artifact-eval/plots` directory
 
 ### End-to-end experiments
 
