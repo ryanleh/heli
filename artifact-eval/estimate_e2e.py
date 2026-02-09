@@ -9,7 +9,7 @@ lengths = [1, 32, 128]
 total_client_upload_bytes = [36001408, 750241408, 2287531408]
 
 # Wall clock time (s) of aggregator during `aggregate` phase
-wall_clock_agg_s = [2.43, 46.91, 127]
+wall_clock_agg_s = [10.5, 46.91, 127]
 
 # Wall clock time (ms) of decryptor during `aggregate` phase
 wall_clock_dec_ms = [0.05, 0.1, 2.1]
