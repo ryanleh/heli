@@ -2,8 +2,7 @@ import math
 
 # TODO: The following variables should be replaced with your numbers
 
-# Total number of clients you benchmarked over
-num_clients = 100_000
+# Vector length
 length = 128
 
 # Total number of bytes uploaded to aggregator during `submit` phase
@@ -12,6 +11,9 @@ total_client_upload_bytes = 2287531408
 # Wall clock time (s) of aggregator during `aggregate` phase
 wall_clock_agg_s = 127
 
+# Wall clock time (ms) of decryptor during `aggregate` phase
+wall_clock_dec_ms = 5.72
+
 # Number of cores on your aggregator machine
 num_cores_agg = 16
 
@@ -19,6 +21,7 @@ num_cores_agg = 16
 num_cores_dec = 16
 
 if __name__ == "__main__":
+    num_clients = 100_000
     target_clients = 10_000_000
     exp_cores_agg = 96
     exp_cores_dec = 2
@@ -39,8 +42,12 @@ if __name__ == "__main__":
     sim_agg_s = round(sim_upload_time_s + sim_wall_clock_agg_s, 2)
     print(f"Simulated aggregator wall clock time: {sim_agg_s}s")
 
-    # TODO: Add in simulated decryptor runtime (you can just run the `decode`
-    # benchmark to get this exact number)
+    # Mask time remains the same, so the only difference is 
+    # dropout key computation (single-thread)
+    #
+    # 5.151 is difference in dropout time recovery from 100_000 -> 10000000
+    sim_wall_clock_dec_ms = wall_clock_dec_ms + 5.151
+    print(f"Simulated decryptor wall clock time: {sim_wall_clock_dec_ms}ms")
     
     # Compute the simulated server-to-server communication
     # NOTE: This doesn't scale linearly, so we just compute directly
