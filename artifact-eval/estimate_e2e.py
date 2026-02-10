@@ -1,21 +1,57 @@
 import math
 
-# TODO: The following variables should be replaced with your own numbers
-# ------------------------------------------
 # Vector length
 lengths = [1, 32, 128]
 
-# Total number of bytes uploaded to aggregator during `submit` phase
+# ------------------------------------------
+# ------------------------------------------
+# ------------------------------------------
+# TODO: Populate the variables below with your results from running the 
+# end-to-end workflow with the following configs, in order:
+#
+#    [simulated-1.json, simulated-32.json, simulated-128.json]
+
+"""
+Total number of bytes uploaded to the aggregator.
+
+Where to find: After running the `submit` phase, inspect the client output 
+for the following lines and take the `<bytes>` value:
+```
+    INFO exp_client: Report submission complete: 90000 reports in 1.011598432s (88968.11 reports/sec)
+    INFO exp_client: Sent <bytes>B (400.02B per-report)
+```
+"""
 total_client_upload_bytes = [36001408, 750241408, 2287531408]
 
-# Wall clock time (s) of aggregator during `aggregate` phase
-wall_clock_agg_s = [10.5, 46.91, 127]
+"""
+Wall clock time (s) of aggregator.
 
-# Wall clock time (ms) of decryptor during `aggregate` phase
+Where to find: After running the `aggregate` phase, inspect the aggregator 
+output for the following lines and take the `<seconds>` value:
+```
+    INFO heli::system::aggregator: 
+        Decrypt time: 65.021528ms
+        Wall-clock time: <seconds>s
+```
+"""
+wall_clock_agg_s = [2.9, 46.91, 127]
+
+"""
+# Wall clock time (ms) of decryptor.
+
+Where to find: After running the `aggregate` phase, inspect the decryptor 
+output for the following lines and take the `<milliseconds>` value:
+```
+    INFO heli::system::decryptor: Decrypt mask for context 65537: 90000 online clients, <milliseconds>ms
+```
+(You might need to translate units from µs -> ms for some configs)
+"""
 wall_clock_dec_ms = [0.05, 0.1, 2.1]
 
 # Number of cores on your aggregator machine
-num_cores_agg = 16
+num_cores_agg = 16 # This is from using a c7i.4xlarge machine
+# ------------------------------------------
+# ------------------------------------------
 # ------------------------------------------
 
 
