@@ -46,9 +46,9 @@ struct Args {
     #[arg(long, short = 'c', default_value = "1000")]
     max_concurrency: usize,
 
-    /// Clear the client database before running
+    /// Clear the client database (delete entire DB) before running
     #[arg(long)]
-    clear_clients: bool,
+    clear_db: bool,
 
     /// Clear stored reports before running
     #[arg(long)]
@@ -155,20 +155,6 @@ fn load_report_from_db(db: &Db, id: u32, context: u32) -> Result<HpkeEnvelope> {
 fn clear_reports_from_db(db: &Db) -> Result<()> {
     let keys: Vec<Vec<u8>> = db
         .scan_prefix(b"report_")
-        .keys()
-        .map(|res| res.map(|k| k.to_vec()))
-        .collect::<Result<_, _>>()?;
-
-    for key in keys {
-        db.remove(key)?;
-    }
-    db.flush()?;
-    Ok(())
-}
-
-fn clear_clients_from_db(db: &Db) -> Result<()> {
-    let keys: Vec<Vec<u8>> = db
-        .scan_prefix(b"client_")
         .keys()
         .map(|res| res.map(|k| k.to_vec()))
         .collect::<Result<_, _>>()?;
@@ -332,6 +318,8 @@ async fn run_sim_setup(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
         info!("Triggered simulated setup on decryptor");
 
         let num_to_create = clients_to_create.len();
+        let num_clients = config.num_clients;
+        let initial_count = clients.len();
         let aggregator_addr = config.aggregator_addr.clone();
         let db_clone = db.clone();
         let aggregator_keys_clone = aggregator_keys.clone();
@@ -356,8 +344,9 @@ async fn run_sim_setup(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
 
                 let prev = created_count.fetch_add(1, Ordering::SeqCst);
                 let current = prev + 1;
-                if current % 10000 == 0 || current >= num_to_create {
-                    info!("Created {}/{} simulated clients", current, num_to_create);
+                let total_done = initial_count + current;
+                if total_done % 100_000 == 0 || current >= num_to_create {
+                    info!("Created {}/{} simulated clients", total_done, num_clients);
                 }
             });
             db_clone.flush().expect("flush client db");
@@ -694,7 +683,7 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
                 Ok(()) => {
                     let prev = submitted_count.fetch_add(batch_size, Ordering::SeqCst);
                     let current = prev + batch_size;
-                    if current % 10000 == 0 || current >= num_reports {
+                    if current % 100_000 == 0 || current >= num_reports {
                         info!("Submitted {}/{} reports", current, num_reports);
                     }
                 }
@@ -812,13 +801,15 @@ async fn main() -> Result<()> {
     let config = ExperimentConfig::from_file(&args.config)?;
     info!("Loaded config: {:?}", config);
 
-    let db = Arc::new(sled::Config::default().path(CLIENT_DB_PATH).open()?);
-
-    // Clear clients if requested
-    if args.clear_clients {
-        clear_clients_from_db(&db)?;
-        info!("Cleared all clients from database");
-    }
+    let db = Arc::new(if args.clear_db {
+        if std::path::Path::new(CLIENT_DB_PATH).exists() {
+            std::fs::remove_dir_all(CLIENT_DB_PATH)?;
+        }
+        info!("Cleared database");
+        sled::Config::default().path(CLIENT_DB_PATH).open()?
+    } else {
+        sled::Config::default().path(CLIENT_DB_PATH).open()?
+    });
 
     // Clear reports if requested
     if args.clear_reports {
