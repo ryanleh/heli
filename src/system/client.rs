@@ -4,11 +4,12 @@ use crate::{
         Scalar,
         app_attest::{ATTESTATION, sign_challenge},
         hpke::{ServerKeys, hpke_encrypt, hpke_encrypt_with_context},
+        prf::ScalarPRF,
     },
     proofs::{Proof, ProverKey},
     system::{
         ProverType,
-        messages::{Message, make_request, read_message, write_message},
+        messages::{Message, SIMULATE_PRF_KEY, make_request, read_message, write_message},
     },
 };
 use anyhow::{Result, anyhow};
@@ -93,6 +94,44 @@ impl Client {
             eval_key,
             prover_key: pk,
         })
+    }
+
+    /// Trigger simulated setup: send SimulateSetup to the decryptor (no attestation).
+    /// Call once before creating clients with `new_simulated`. Decryptor and aggregator
+    /// will use the hardcoded PRF key to compute keys locally.
+    pub async fn trigger_simulate_setup(decryptor_addr: &str) -> Result<()> {
+        let mut socket = TcpStream::connect(decryptor_addr).await?;
+        write_message(&mut socket, &Message::SimulateSetup {}).await?;
+        let response = read_message(&mut socket).await?;
+        match response {
+            Message::Success {} => Ok(()),
+            Message::Error(e) => Err(anyhow!("Simulate setup failed: {}", e)),
+            _ => Err(anyhow!("Unexpected response: {:?}", response)),
+        }
+    }
+
+    /// Create a client for simulated mode: eval key is derived from the hardcoded PRF key.
+    /// Use after calling `trigger_simulate_setup`. No registration with decryptor.
+    pub fn new_simulated(
+        id: u32,
+        aggregator_addr: &str,
+        aggregator_pk: &ServerKeys,
+        prover: ProverType,
+    ) -> Self {
+        let prf = ScalarPRF::new(&SIMULATE_PRF_KEY);
+        let eval_key = EvalKey(prf.evaluate(id as u64));
+        let g_comm = Proof::get_g_comm();
+        let prover_key = match prover {
+            ProverType::Binary => ProverKey::Binary { g_comm },
+            ProverType::Range(bitlength) => ProverKey::Range { g_comm, bitlength },
+        };
+        Self {
+            aggregator_addr: aggregator_addr.to_string(),
+            aggregator_pk: aggregator_pk.pk.clone(),
+            id,
+            eval_key,
+            prover_key,
+        }
     }
 
     /// Generate a report and store it in pending state.

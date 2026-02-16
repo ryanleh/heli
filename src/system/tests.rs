@@ -312,3 +312,100 @@ async fn test_with_dropouts() -> Result<()> {
     config.threshold = num_clients - num_dropouts;
     test_end_to_end_impl(config, 1, num_dropouts).await
 }
+
+/// End-to-end test using simulated setup: no attestation, hardcoded PRF key.
+/// Client triggers SimulateSetup once; decryptor and aggregator compute keys locally.
+#[tokio::test]
+async fn test_end_to_end_simulated_setup() -> Result<()> {
+    init_tracing();
+
+    let config = TestConfig::binary(20, 4);
+    let db = sled::Config::default().temporary(true).open()?;
+
+    let decryptor_keys = ServerKeys::generate();
+    let aggregator_keys = ServerKeys::generate();
+
+    let aggregator = Aggregator::new(
+        &config.aggregator_addr,
+        config.num_clients,
+        config.threshold,
+        config.prover,
+        db,
+        aggregator_keys.clone(),
+    );
+    let aggregator_handle = tokio::spawn(async move {
+        if let Err(e) = aggregator.run().await {
+            panic!("Aggregator error: {}", e);
+        }
+    });
+
+    sleep(Duration::from_millis(100)).await;
+
+    let decryptor_db = sled::Config::default().temporary(true).open()?;
+    let decryptor = Decryptor::new(
+        &config.decryptor_addr,
+        &config.aggregator_addr,
+        config.num_clients,
+        config.threshold,
+        decryptor_keys.clone(),
+        decryptor_db,
+    );
+    let decryptor_handle = tokio::spawn(async move {
+        if let Err(e) = decryptor.run().await {
+            panic!("Decryptor error: {}", e);
+        }
+    });
+
+    sleep(Duration::from_millis(100)).await;
+
+    // Simulated setup: one RPC to decryptor, decryptor and aggregator do local setup
+    Client::trigger_simulate_setup(&config.decryptor_addr).await?;
+
+    // Wait for decryptor→aggregator SimulateSetup to complete
+    sleep(Duration::from_millis(200)).await;
+
+    // Create clients from hardcoded key (no registration)
+    let clients: Vec<Client> = (0..config.num_clients)
+        .map(|id| {
+            Client::new_simulated(
+                id as u32,
+                &config.aggregator_addr,
+                &aggregator_keys,
+                config.prover,
+            )
+        })
+        .collect();
+
+    // One round: submit reports and aggregate
+    let mut rng = OsRng;
+    let mut expected_sums = vec![0u64; config.length];
+    let mut client_inputs: Vec<Vec<u64>> = Vec::new();
+    for _ in 0..config.num_clients {
+        let inputs: Vec<u64> = (0..config.length).map(|_| rng.gen_range(0..2)).collect();
+        for (j, &val) in inputs.iter().enumerate() {
+            expected_sums[j] += val;
+        }
+        client_inputs.push(inputs);
+    }
+
+    for (i, client) in clients.iter().enumerate() {
+        client.report(0, &client_inputs[i]).await?;
+    }
+
+    let mut socket = TcpStream::connect(&config.aggregator_addr).await?;
+    write_message(&mut socket, &Message::AggregationRequest { context: 0 }).await?;
+    let response = read_message(&mut socket).await?;
+
+    let result = match response {
+        Message::AggregationResponse { result } => result,
+        Message::Error(e) => return Err(anyhow!("Aggregation failed: {}", e)),
+        _ => return Err(anyhow!("Unexpected response")),
+    };
+
+    assert_eq!(result, expected_sums, "Simulated setup e2e: results don't match");
+
+    decryptor_handle.abort();
+    aggregator_handle.abort();
+
+    Ok(())
+}

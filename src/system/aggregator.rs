@@ -3,6 +3,7 @@ use crate::{
     crypto::{
         G,
         hpke::{ServerKeys, hpke_decrypt},
+        prf::ScalarPRF,
     },
     proofs::{Proof, VerifierKey},
     system::{ProverType, messages::*},
@@ -202,46 +203,71 @@ impl Aggregator {
             info!("Key commitments already exist, skipping setup");
             write_message(&mut socket, &Message::SetupAlreadyComplete {}).await?;
         } else {
-            // Normal setup: receive key commitments from decryptor
+            // Normal setup: receive key commitments from decryptor or SimulateSetup
             write_message(&mut socket, &Message::Success {}).await?;
 
             let mut setup_start: Option<std::time::Instant> = None;
-            let mut received_commitments = 0;
+            let mut received_commitments = 0usize;
             let mut key_commitments = vec![G::generator(); state.num_clients];
 
-            // Receive commitments for each client
-            while received_commitments < state.num_clients {
-                let message = match read_message(&mut socket).await {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        return Err(anyhow!("Decryptor connection closed: {}", e));
-                    }
-                };
-
-                // Start timing on first message
+            let first_message = read_message(&mut socket).await?;
+            if matches!(first_message, Message::SimulateSetup {}) {
+                // Simulated setup: compute key commitments locally from hardcoded PRF key
+                setup_start = Some(std::time::Instant::now());
+                let num_clients = state.num_clients;
+                let g_comm = Proof::get_g_comm();
+                key_commitments = tokio::task::spawn_blocking(move || {
+                    let prf = ScalarPRF::new(&SIMULATE_PRF_KEY);
+                    (0..num_clients)
+                        .map(|i| g_comm * prf.evaluate(i as u64))
+                        .collect::<Vec<_>>()
+                })
+                .await?;
+                info!(
+                    "Simulated setup: computed {} key commitments locally in {:?}",
+                    num_clients,
+                    setup_start.as_ref().unwrap().elapsed()
+                );
+                write_message(&mut socket, &Message::Success {}).await?;
+            } else if let Message::KeyCommsBatch { key_comms } = first_message {
+                // Start timing on first key commitment message received
                 if setup_start.is_none() {
                     setup_start = Some(std::time::Instant::now());
                 }
-
-                let key_comms_batch = match message {
-                    Message::KeyCommsBatch { key_comms } => key_comms,
-                    _ => {
-                        let _ =
-                            send_error_message(&mut socket, &format!("Invalid message type")).await;
-                        return Err(anyhow!("Invalid message type from decryptor"));
-                    }
-                };
-
-                // Add key comms to vector
-                received_commitments += key_comms_batch.len();
-                for (idx, key_comm) in key_comms_batch.into_iter() {
+                received_commitments += key_comms.len();
+                for (idx, key_comm) in key_comms.into_iter() {
                     key_commitments[idx as usize] = key_comm;
                 }
-
-                // Send success response
                 if let Err(e) = write_message(&mut socket, &Message::Success {}).await {
                     return Err(anyhow!("Failed to send response to decryptor: {}", e));
                 }
+
+                // Receive remaining batches
+                while received_commitments < state.num_clients {
+                    let message = read_message(&mut socket).await?;
+                    if setup_start.is_none() {
+                        setup_start = Some(std::time::Instant::now());
+                    }
+                    let key_comms_batch = match message {
+                        Message::KeyCommsBatch { key_comms } => key_comms,
+                        _ => {
+                            let _ = send_error_message(&mut socket, &format!("Invalid message type"))
+                                .await;
+                            return Err(anyhow!("Invalid message type from decryptor"));
+                        }
+                    };
+                    received_commitments += key_comms_batch.len();
+                    for (idx, key_comm) in key_comms_batch.into_iter() {
+                        key_commitments[idx as usize] = key_comm;
+                    }
+                    if let Err(e) = write_message(&mut socket, &Message::Success {}).await {
+                        return Err(anyhow!("Failed to send response to decryptor: {}", e));
+                    }
+                }
+            } else {
+                let _ =
+                    send_error_message(&mut socket, &format!("Invalid message type")).await;
+                return Err(anyhow!("Invalid message type from decryptor"));
             }
 
             // Write key commitments to the database

@@ -15,6 +15,7 @@ use heli::{
 };
 use keys::{aggregator_keys, decryptor_keys};
 use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sled::{Db, IVec};
 use std::{
@@ -37,7 +38,7 @@ struct Args {
     /// Path to the experiment config JSON file
     config: PathBuf,
 
-    /// Run mode: setup (register clients), generate (generate reports), submit (submit reports), or aggregate (trigger aggregation)
+    /// Run mode: setup (register clients), sim-setup (simulated setup, no attestation), generate, submit, or aggregate
     #[arg(long, default_value = "setup")]
     mode: String,
 
@@ -294,6 +295,78 @@ async fn run_setup(config: &ExperimentConfig, max_concurrency: usize, db: Arc<Db
         (bytes_recv() as f64 / clients.len() as f64),
     );
     reset_byte_counters();
+
+    Ok(())
+}
+
+/// Simulated setup: one RPC to decryptor (SimulateSetup), then create all clients locally from hardcoded PRF key.
+/// No attestation; use for fast e2e with large N.
+async fn run_sim_setup(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
+    let aggregator_keys = Arc::new(aggregator_keys());
+    let prover_type = config.prover.to_prover_type();
+
+    info!("=== Simulated Setup (no attestation) ===");
+    info!("Setting up {} clients...", config.num_clients);
+
+    let setup_start = Instant::now();
+    let mut clients = Vec::new();
+    let mut clients_to_create = Vec::new();
+
+    for i in 0..config.num_clients {
+        match load_client_from_db(&db, i as u32, &config.aggregator_addr, &aggregator_keys) {
+            Ok(client) => clients.push(client),
+            Err(_) => clients_to_create.push(i),
+        }
+    }
+
+    if clients_to_create.is_empty() {
+        info!("Loaded all {} clients from DB", clients.len());
+    } else {
+        info!(
+            "Loaded {} clients from DB, creating {} via sim-setup",
+            clients.len(),
+            clients_to_create.len()
+        );
+
+        Client::trigger_simulate_setup(&config.decryptor_addr).await?;
+        info!("Triggered simulated setup on decryptor");
+
+        let num_to_create = clients_to_create.len();
+        let aggregator_addr = config.aggregator_addr.clone();
+        let db_clone = db.clone();
+        let aggregator_keys_clone = aggregator_keys.clone();
+
+        // Parallel create + insert; flush once at the end (save_client_to_db flushes every time = very slow)
+        tokio::task::spawn_blocking(move || {
+            clients_to_create.par_iter().for_each(|&i| {
+                let client = Client::new_simulated(
+                    i as u32,
+                    &aggregator_addr,
+                    &aggregator_keys_clone,
+                    prover_type,
+                );
+                let stored = StoredClient {
+                    id: client.id,
+                    eval_key: client.eval_key.clone(),
+                    prover_key: client.prover_key.clone(),
+                };
+                let key = format!("client_{}", i);
+                let value = bincode::serialize(&stored).expect("serialize client");
+                db_clone.insert(key.as_bytes(), IVec::from(value)).expect("insert client");
+            });
+            db_clone.flush().expect("flush client db");
+        })
+        .await?;
+
+        info!("Created {} simulated clients (parallel, single flush)", num_to_create);
+    }
+
+    let setup_time = setup_start.elapsed();
+    info!(
+        "Sim-setup complete: {} clients in {:?}",
+        config.num_clients,
+        setup_time
+    );
 
     Ok(())
 }
@@ -598,11 +671,12 @@ async fn main() -> Result<()> {
 
     match args.mode.as_str() {
         "setup" => run_setup(&config, args.max_concurrency, db).await,
+        "sim-setup" => run_sim_setup(&config, db).await,
         "generate" => run_generate(&config, db).await,
         "submit" => run_submit(&config, args.max_concurrency, db).await,
         "aggregate" => run_aggregate(&config).await,
         _ => Err(anyhow::anyhow!(
-            "Invalid mode: {}. Must be 'setup', 'generate', 'submit', or 'aggregate'",
+            "Invalid mode: {}. Must be 'setup', 'sim-setup', 'generate', 'submit', or 'aggregate'",
             args.mode
         )),
     }
