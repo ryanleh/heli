@@ -38,7 +38,7 @@ struct Args {
     /// Path to the experiment config JSON file
     config: PathBuf,
 
-    /// Run mode: setup (register clients), sim-setup (simulated setup, no attestation), generate, submit, or aggregate
+    /// Run mode: setup, sim-setup, generate, sim-generate (one batch only), submit, or aggregate
     #[arg(long, default_value = "setup")]
     mode: String,
 
@@ -372,6 +372,10 @@ async fn run_sim_setup(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
 }
 
 async fn run_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
+    // Clear sim_generate so submit uses full report list
+    let _ = db.remove(b"sim_generate");
+    db.flush()?;
+
     let aggregator_keys = Arc::new(aggregator_keys());
 
     // Load clients from DB
@@ -487,6 +491,95 @@ async fn run_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
     Ok(())
 }
 
+/// Generate reports for only the first BATCH_REPORT_SIZE clients; set flag so submit duplicates them to fill num_clients.
+async fn run_sim_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
+    let aggregator_keys = Arc::new(aggregator_keys());
+    let n = BATCH_REPORT_SIZE.min(config.num_clients);
+
+    let mut clients = Vec::new();
+    for i in 0..n {
+        match load_client_from_db(&db, i as u32, &config.aggregator_addr, &aggregator_keys) {
+            Ok(client) => clients.push(client),
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "Client {} not found in DB. Run 'setup' or 'sim-setup' first.",
+                    i
+                ));
+            }
+        }
+    }
+
+    info!("Sim-generate: loaded {} clients, generating {} reports", clients.len(), n);
+
+    let bitwidth = match &config.prover {
+        ProverConfig::Binary => 1,
+        ProverConfig::Range { bitlength } => *bitlength,
+    };
+    let max_value = 1 << bitwidth;
+    let context = encode_context(config.length, bitwidth);
+    let length = config.length;
+
+    let generation_start = Instant::now();
+    let generated_count = Arc::new(AtomicUsize::new(0));
+    let db_clone = db.clone();
+
+    let clients: Vec<Arc<Client>> = clients.into_iter().map(Arc::new).collect();
+    let mut join_set = JoinSet::new();
+    for client in &clients {
+        let client = client.clone();
+        let generated_count = generated_count.clone();
+        let db_clone = db_clone.clone();
+
+        join_set.spawn(tokio::task::spawn_blocking(move || {
+            let mut rng = StdRng::from_entropy();
+            let inputs: Vec<u64> = (0..length).map(|_| rng.gen_range(0..max_value)).collect();
+
+            match client.generate_report(context, &inputs) {
+                Ok(Message::EncryptedClientReport {
+                    id,
+                    context,
+                    envelope,
+                }) => {
+                    if let Err(e) = save_report_to_db(&db_clone, id, context, envelope) {
+                        error!("Failed to save report for client {}: {:?}", id, e);
+                        return false;
+                    }
+                    let count = generated_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    if count % 1000 == 0 || count == n {
+                        info!("Generated {}/{} reports", count, n);
+                    }
+                    true
+                }
+                Ok(_) => {
+                    error!("Unexpected message type from generate_report");
+                    false
+                }
+                Err(e) => {
+                    error!("Failed to generate report for client {}: {:?}", client.id, e);
+                    false
+                }
+            }
+        }));
+    }
+
+    while join_set.join_next().await.is_some() {}
+
+    db.insert(b"sim_generate", b"1")?;
+    db.flush()?;
+
+    let generation_time = generation_start.elapsed();
+    let generated = generated_count.load(Ordering::SeqCst);
+    info!(
+        "Sim-generate complete: {} reports in {:?} (submit will send {} reports, duplicated from {} unique)",
+        generated,
+        generation_time,
+        config.num_clients,
+        BATCH_REPORT_SIZE
+    );
+
+    Ok(())
+}
+
 async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<Db>) -> Result<()> {
     // Semaphore to limit concurrent connections
     let semaphore = Arc::new(Semaphore::new(max_concurrency));
@@ -503,22 +596,47 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
     };
     let context = encode_context(config.length, bitwidth);
 
+    let sim_generate = db.get(b"sim_generate")?.as_deref() == Some(b"1");
+
     let mut reports = Vec::new();
-    for i in 0..config.num_clients {
-        match load_report_from_db(&db, i as u32, context) {
-            Ok(envelope) => reports.push((i as u32, context, envelope)),
-            Err(_) => {}
+    if sim_generate {
+        // Duplicate the first BATCH_REPORT_SIZE reports to fill num_clients; ids are 0..num_clients-1 (many duplicates).
+        for i in 0..config.num_clients {
+            let src_id = (i % BATCH_REPORT_SIZE) as u32;
+            match load_report_from_db(&db, src_id, context) {
+                Ok(envelope) => reports.push((i as u32, context, envelope)),
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "sim_generate set but report for client {} (source id {}) not found. Run 'sim-generate' first.",
+                        i,
+                        src_id
+                    ));
+                }
+            }
         }
+        info!(
+            "Loaded {} reports from DB (sim_generate: duplicating {} unique to {} total)",
+            reports.len(),
+            BATCH_REPORT_SIZE,
+            config.num_clients
+        );
+    } else {
+        for i in 0..config.num_clients {
+            match load_report_from_db(&db, i as u32, context) {
+                Ok(envelope) => reports.push((i as u32, context, envelope)),
+                Err(_) => {}
+            }
+        }
+        info!("Loaded {} reports from DB", reports.len());
+    }
+
+    if reports.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No reports found in DB. Run 'generate' or 'sim-generate' first."
+        ));
     }
 
     let num_reports = reports.len();
-    info!("Loaded {} reports from DB", num_reports);
-
-    if num_reports == 0 {
-        return Err(anyhow::anyhow!(
-            "No reports found in DB. Run 'generate' mode first."
-        ));
-    }
 
     // Collect all reports into batches
     let aggregator_addr = config.aggregator_addr.clone();
@@ -534,6 +652,18 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
             })
             .collect();
         batches.push(batch);
+    }
+
+    if sim_generate {
+        let mut socket = TcpStream::connect(&aggregator_addr).await?;
+        write_message(&mut socket, &Message::SimulatedBatchComing {}).await?;
+        let response = read_message(&mut socket).await?;
+        if !matches!(response, Message::Success {}) {
+            return Err(anyhow::anyhow!(
+                "Aggregator did not accept SimulatedBatchComing: {:?}",
+                response
+            ));
+        }
     }
 
     info!(
@@ -568,13 +698,33 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
         });
     }
 
-    // Wait for all submissions to complete
-    while join_set.join_next().await.is_some() {}
+    // Wait for all submissions to complete and collect any errors
+    let mut any_batch_failed = false;
+    while let Some(res) = join_set.join_next().await {
+        if res.is_err() {
+            any_batch_failed = true;
+        }
+    }
 
     let submission_time = submission_start.elapsed();
     let submitted = submitted_count.load(Ordering::SeqCst);
     let bytes_sent_total = bytes_sent();
     let bytes_recv_total = bytes_recv();
+
+    if submitted != num_reports {
+        return Err(anyhow::anyhow!(
+            "Submitted {}/{} reports. Some batches failed to reach the aggregator. \
+             Ensure the aggregator is running and config aggregator_addr ({}) is correct.",
+            submitted,
+            num_reports,
+            aggregator_addr
+        ));
+    }
+    if any_batch_failed {
+        return Err(anyhow::anyhow!(
+            "One or more batch tasks panicked. Submitted count may be wrong."
+        ));
+    }
 
     info!(
         "Report submission complete: {} reports in {:?} ({:.2} reports/sec)",
@@ -673,10 +823,11 @@ async fn main() -> Result<()> {
         "setup" => run_setup(&config, args.max_concurrency, db).await,
         "sim-setup" => run_sim_setup(&config, db).await,
         "generate" => run_generate(&config, db).await,
+        "sim-generate" => run_sim_generate(&config, db).await,
         "submit" => run_submit(&config, args.max_concurrency, db).await,
         "aggregate" => run_aggregate(&config).await,
         _ => Err(anyhow::anyhow!(
-            "Invalid mode: {}. Must be 'setup', 'sim-setup', 'generate', 'submit', or 'aggregate'",
+            "Invalid mode: {}. Must be 'setup', 'sim-setup', 'generate', 'sim-generate', 'submit', or 'aggregate'",
             args.mode
         )),
     }

@@ -63,6 +63,9 @@ pub enum Message {
         reports: Vec<(u32, u32, HpkeEnvelope)>, // (id, context, envelope)
     },
 
+    /// Client sends this before submitting batches from sim-generate; aggregator then treats aggregation failure as success (dummy result).
+    SimulatedBatchComing {},
+
     DecryptorInit {},
     /// Sent by aggregator when setup is already complete (key commitments exist)
     SetupAlreadyComplete {},

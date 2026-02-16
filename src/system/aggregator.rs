@@ -42,6 +42,8 @@ pub struct AggregatorState {
     db: Db,
     hpke_keys: ServerKeys,
     current_ctx: RwLock<Option<u32>>,
+    /// Set when client sends SimulatedBatchComing; aggregation failure then returns dummy result. Cleared after responding to AggregationRequest.
+    simulated_round: std::sync::atomic::AtomicBool,
 
     // Channels for communicating decryption masks and aggregation results
     request_send: OnceCell<mpsc::Sender<Message>>,
@@ -78,6 +80,7 @@ impl Aggregator {
             db,
             hpke_keys,
             current_ctx: RwLock::new(None),
+            simulated_round: std::sync::atomic::AtomicBool::new(false),
             request_send: OnceCell::new(),
             mask_recv: Mutex::new(None),
             reporting_start: OnceCell::new(),
@@ -151,6 +154,10 @@ impl Aggregator {
                         .ok();
                 }
             },
+            Message::SimulatedBatchComing {} => {
+                state.simulated_round.store(true, Ordering::SeqCst);
+                write_message(&mut socket, &Message::Success {}).await.ok();
+            }
             Message::BatchEncryptedClientReports { reports } => {
                 match Self::store_batch_client_reports(state, reports).await {
                     Ok(()) => {
@@ -167,16 +174,40 @@ impl Aggregator {
                 }
             }
             Message::AggregationRequest { context } => {
-                match Self::aggregate(state, context).await {
+                let request_start = std::time::Instant::now();
+                info!("Aggregation request for context {}", context);
+                match Self::aggregate(state.clone(), context).await {
                     Ok(result) => {
+                        state.simulated_round.store(false, Ordering::SeqCst);
                         write_message(&mut socket, &Message::AggregationResponse { result })
                             .await
                             .ok();
                     }
                     Err(e) => {
-                        send_error_message(&mut socket, &format!("Aggregation failed: {}", e))
+                        if state.simulated_round.load(Ordering::SeqCst) {
+                            info!("Simulated round");
+                            info!(
+                                "\n\tDecrypt time: {:?}\n\tWall-clock time: {:?}",
+                                Duration::ZERO,
+                                request_start.elapsed()
+                            );
+                            let length = (context & 0xFFFF) as usize;
+                            let dummy = vec![0u64; length.min(1_000_000)];
+                            state.simulated_round.store(false, Ordering::SeqCst);
+                            write_message(
+                                &mut socket,
+                                &Message::AggregationResponse { result: dummy },
+                            )
                             .await
                             .ok();
+                        } else {
+                            send_error_message(
+                                &mut socket,
+                                &format!("Aggregation failed: {}", e),
+                            )
+                            .await
+                            .ok();
+                        }
                     }
                 }
             }
@@ -411,11 +442,12 @@ impl Aggregator {
 
         // If we've received enough client reports for aggregation, report stats
         let num = state.num_reported.fetch_add(batch_size, Ordering::SeqCst);
-        if num + batch_size >= state.threshold && num < state.threshold {
+        let total = num + batch_size;
+        if total >= state.threshold && num < state.threshold {
             let elapsed = state.reporting_start.get().unwrap().elapsed();
             info!(
                 "Received enough reports for aggregation ({}) in {elapsed:?}",
-                num
+                total
             );
         }
 
@@ -491,7 +523,7 @@ impl Aggregator {
         let client_ranges_clone = client_ranges.clone();
         let timing_send_clone = timing_send.clone();
 
-        let (online_clients, aggregate) =
+        let block_result =
             tokio::task::spawn_blocking(move || -> Result<(Vec<u32>, Option<Ciphertext>)> {
                 let results: Vec<_> = client_ranges_clone
                     .into_par_iter()
@@ -602,8 +634,43 @@ impl Aggregator {
 
                 Ok((online_clients, aggregate_opt))
             })
-            .await??;
+            .await;
 
+        // Always collect and log report-processing timing (even when spawn_blocking failed, so simulated rounds get timing)
+        drop(timing_send);
+        let mut total_load_time = Duration::ZERO;
+        let mut total_decode_time = Duration::ZERO;
+        let mut total_decrypt_time = Duration::ZERO;
+        let mut total_verify_time = Duration::ZERO;
+        let mut total_aggregate_time = Duration::ZERO;
+        while let Some(timing) = timing_recv.recv().await {
+            total_load_time += timing.load;
+            total_decode_time += timing.decode;
+            total_decrypt_time += timing.decrypt;
+            total_verify_time += timing.verify;
+            total_aggregate_time += timing.aggregate;
+        }
+        let online_count = block_result
+            .as_ref()
+            .ok()
+            .and_then(|r| r.as_ref().ok())
+            .map(|(c, _)| c.len())
+            .unwrap_or(0);
+        info!(
+            "Aggregation (report processing) for context {}: {} online clients",
+            context,
+            online_count
+        );
+        info!(
+            "\n\tLoad time {:?}\n\tDecode time: {:?}\n\tHPKE-decryption time: {:?}\n\tVerify time: {:?}\n\tAggregate time: {:?}",
+            total_load_time,
+            total_decode_time,
+            total_decrypt_time,
+            total_verify_time,
+            total_aggregate_time
+        );
+
+        let (online_clients, aggregate) = block_result??;
         let aggregate = aggregate.ok_or(anyhow!("No valid reports"))?;
 
         // Request decryption mask from the decryptor
@@ -657,36 +724,6 @@ impl Aggregator {
         let decrypt_elapsed = decrypt_start.elapsed();
         let wall_clock_elapsed = wall_clock_start.elapsed();
 
-        // Read all timing values from the channel and compute totals
-        let mut total_load_time = Duration::ZERO;
-        let mut total_decode_time = Duration::ZERO;
-        let mut total_decrypt_time = Duration::ZERO;
-        let mut total_verify_time = Duration::ZERO;
-        let mut total_aggregate_time = Duration::ZERO;
-
-        drop(timing_send);
-        while let Some(timing) = timing_recv.recv().await {
-            total_load_time += timing.load;
-            total_decode_time += timing.decode;
-            total_decrypt_time += timing.decrypt;
-            total_verify_time += timing.verify;
-            total_aggregate_time += timing.aggregate;
-        }
-
-        // Log timing breakdown
-        info!(
-            "Aggregation complete for context {}: {} online clients",
-            context,
-            online_clients.len()
-        );
-        info!(
-            "\n\tLoad time {:?}\n\tDecode time: {:?}\n\tHPKE-decryption time {:?}\n\tVerify time: {:?}\n\tAggregate time: {:?}",
-            total_load_time,
-            total_decode_time,
-            total_decrypt_time,
-            total_verify_time,
-            total_aggregate_time
-        );
         info!(
             "\n\tDecrypt time: {:?}\n\tWall-clock time: {:?}",
             decrypt_elapsed, wall_clock_elapsed
