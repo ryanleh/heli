@@ -485,7 +485,7 @@ impl Aggregator {
     }
 
     async fn aggregate(state: Arc<AggregatorState>, context: u32) -> Result<Vec<u64>> {
-        // Check that context matches current_ctx
+        // Check that context matches current_ctx (or in simulated mode allow proceeding with request context)
         let current_ctx = state.current_ctx.read().await;
         match *current_ctx {
             Some(expected_ctx) if expected_ctx == context => {
@@ -499,9 +499,12 @@ impl Aggregator {
                 ));
             }
             None => {
-                return Err(anyhow!(
-                    "No context set yet - need client submissions first"
-                ));
+                if !state.simulated_round.load(Ordering::SeqCst) {
+                    return Err(anyhow!(
+                        "No context set yet - need client submissions first"
+                    ));
+                }
+                // Simulated mode: proceed with request context so verification/timing still runs (reports keyed by context in DB)
             }
         }
         drop(current_ctx);
