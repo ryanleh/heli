@@ -210,6 +210,12 @@ impl Aggregator {
                         }
                     }
                 }
+                // Reset for next round so new reports can use a new context (success or failure)
+                {
+                    let mut current_ctx = state.current_ctx.write().await;
+                    *current_ctx = None;
+                }
+                state.num_reported.store(0, Ordering::SeqCst);
             }
             _ => {
                 send_error_message(&mut socket, &format!("Invalid request"))
@@ -731,13 +737,6 @@ impl Aggregator {
         info!("Sent {:?}B", bytes_sent());
         info!("Recv {:?}B", bytes_recv());
         reset_byte_counters();
-
-        // Reset for next round so new reports can use a new context
-        {
-            let mut current_ctx = state.current_ctx.write().await;
-            *current_ctx = None;
-        }
-        state.num_reported.store(0, Ordering::SeqCst);
 
         Ok(result)
     }

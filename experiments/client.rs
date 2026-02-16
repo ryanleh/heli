@@ -336,7 +336,6 @@ async fn run_sim_setup(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
         let db_clone = db.clone();
         let aggregator_keys_clone = aggregator_keys.clone();
 
-        // Parallel create + insert; flush once at the end (save_client_to_db flushes every time = very slow)
         tokio::task::spawn_blocking(move || {
             clients_to_create.par_iter().for_each(|&i| {
                 let client = Client::new_simulated(
