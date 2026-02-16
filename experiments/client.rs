@@ -335,6 +335,7 @@ async fn run_sim_setup(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
         let aggregator_addr = config.aggregator_addr.clone();
         let db_clone = db.clone();
         let aggregator_keys_clone = aggregator_keys.clone();
+        let created_count = Arc::new(AtomicUsize::new(0));
 
         tokio::task::spawn_blocking(move || {
             clients_to_create.par_iter().for_each(|&i| {
@@ -352,6 +353,12 @@ async fn run_sim_setup(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
                 let key = format!("client_{}", i);
                 let value = bincode::serialize(&stored).expect("serialize client");
                 db_clone.insert(key.as_bytes(), IVec::from(value)).expect("insert client");
+
+                let prev = created_count.fetch_add(1, Ordering::SeqCst);
+                let current = prev + 1;
+                if current % 10000 == 0 || current >= num_to_create {
+                    info!("Created {}/{} simulated clients", current, num_to_create);
+                }
             });
             db_clone.flush().expect("flush client db");
         })
@@ -685,9 +692,10 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
 
             match result {
                 Ok(()) => {
-                    let count = submitted_count.fetch_add(batch_size, Ordering::SeqCst);
-                    if count % 10000 == 0 || count >= num_reports {
-                        info!("Submitted {}/{} reports", count, num_reports);
+                    let prev = submitted_count.fetch_add(batch_size, Ordering::SeqCst);
+                    let current = prev + batch_size;
+                    if current % 10000 == 0 || current >= num_reports {
+                        info!("Submitted {}/{} reports", current, num_reports);
                     }
                 }
                 Err(e) => {
