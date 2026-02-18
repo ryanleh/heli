@@ -619,99 +619,55 @@ impl Aggregator {
             (online, agg, decrypt_time, verify_time, agg_time)
         }
 
-        let result = tokio::task::spawn_blocking(move || {
-            let mut total_load = std::time::Duration::ZERO;
-            let mut total_decrypt = std::time::Duration::ZERO;
-            let mut total_verify = std::time::Duration::ZERO;
-            let mut total_agg = std::time::Duration::ZERO;
+        // Use a channel to pipeline loading and processing
+        // Loader thread fills the channel, processor thread(s) drain it
+        let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<Vec<(u32, Vec<u8>)>>(4);
 
-            let mut all_online = Vec::new();
-            let mut aggregate: Option<Ciphertext> = None;
+        // Spawn loader thread
+        let loader_db = db.clone();
+        let loader_handle = std::thread::spawn(move || -> (std::time::Duration, usize) {
+            let mut total_load = std::time::Duration::ZERO;
+            let prefix = format!("r/{context:08x}/");
 
             if simulated {
-                // For simulated mode: load unique reports in chunks, process immediately
-                // Each unique report is duplicated across multiple client IDs
-                let prefix = format!("r/{context:08x}/");
-                let mut unique_reports: Vec<Vec<u8>> = Vec::new();
-                let mut next_client_id: usize = 0;
-                let total_chunks = (num_to_process + load_chunk_size - 1) / load_chunk_size;
-                let mut chunks_processed = 0;
+                // Load all unique reports first
+                let load_start = Instant::now();
+                let unique_reports: Vec<Vec<u8>> = loader_db.scan_prefix(prefix.as_bytes())
+                    .filter_map(|r| r.ok())
+                    .map(|(_, data)| data.to_vec())
+                    .collect();
+                total_load = load_start.elapsed();
 
-                for item in db.scan_prefix(prefix.as_bytes()) {
-                    let load_start = Instant::now();
-                    if let Ok((_, data)) = item {
-                        unique_reports.push(data.to_vec());
-                    }
-                    total_load += load_start.elapsed();
-
-                    // Process chunks as soon as we have enough unique reports
-                    while next_client_id < num_to_process && !unique_reports.is_empty() {
-                        let chunk_end = (next_client_id + load_chunk_size).min(num_to_process);
-                        
-                        // Build chunk by duplicating from unique reports (via modulo)
-                        // (each report can be used multiple times via modulo)
-                        let reports: Vec<(u32, Vec<u8>)> = (next_client_id..chunk_end).map(|i| {
-                            let id = i as u32;
-                            let src_idx = i % unique_reports.len();
-                            (id, unique_reports[src_idx].clone())
-                        }).collect();
-
-                        let (online, agg, dt, vt, at) = process_chunk(&hpke_sk, &vk, context, reports);
-                        total_decrypt += dt;
-                        total_verify += vt;
-                        total_agg += at;
-                        all_online.extend(online);
-                        aggregate = match (aggregate, agg) {
-                            (Some(a), Some(b)) => Some(a + b),
-                            (Some(a), None) => Some(a),
-                            (None, b) => b,
-                        };
-
-                        next_client_id = chunk_end;
-                        chunks_processed += 1;
-
-                        if chunks_processed % 10 == 0 || chunks_processed == total_chunks {
-                            info!("Processed chunk {}/{} ({} reports so far)", chunks_processed, total_chunks, all_online.len());
-                        }
-                    }
+                if unique_reports.is_empty() {
+                    return (total_load, 0);
                 }
 
-                // Process any remaining clients if we've loaded all unique reports
-                while next_client_id < num_to_process && !unique_reports.is_empty() {
-                    let chunk_end = (next_client_id + load_chunk_size).min(num_to_process);
+                info!("Loaded {} unique reports in {:?}, generating {} simulated reports", 
+                      unique_reports.len(), total_load, num_to_process);
+
+                // Generate chunks by duplicating from unique reports
+                let total_chunks = (num_to_process + load_chunk_size - 1) / load_chunk_size;
+                for chunk_idx in 0..total_chunks {
+                    let chunk_start = chunk_idx * load_chunk_size;
+                    let chunk_end = (chunk_start + load_chunk_size).min(num_to_process);
                     
-                    let reports: Vec<(u32, Vec<u8>)> = (next_client_id..chunk_end).map(|i| {
+                    let reports: Vec<(u32, Vec<u8>)> = (chunk_start..chunk_end).map(|i| {
                         let id = i as u32;
                         let src_idx = i % unique_reports.len();
                         (id, unique_reports[src_idx].clone())
                     }).collect();
 
-                    let (online, agg, dt, vt, at) = process_chunk(&hpke_sk, &vk, context, reports);
-                    total_decrypt += dt;
-                    total_verify += vt;
-                    total_agg += at;
-                    all_online.extend(online);
-                    aggregate = match (aggregate, agg) {
-                        (Some(a), Some(b)) => Some(a + b),
-                        (Some(a), None) => Some(a),
-                        (None, b) => b,
-                    };
-
-                    next_client_id = chunk_end;
-                    chunks_processed += 1;
-
-                    if chunks_processed % 10 == 0 || chunks_processed == total_chunks {
-                        info!("Processed chunk {}/{} ({} reports so far)", chunks_processed, total_chunks, all_online.len());
+                    if chunk_tx.send(reports).is_err() {
+                        break;
                     }
                 }
-
-                info!("Loaded {} unique reports", unique_reports.len());
+                (total_load, unique_reports.len())
             } else {
-                // Stream from scan_prefix, process in chunks
-                let prefix = format!("r/{context:08x}/");
+                // Stream from DB, send chunks as they fill up
                 let mut chunk = Vec::with_capacity(load_chunk_size);
+                let mut total_loaded = 0usize;
 
-                for item in db.scan_prefix(prefix.as_bytes()) {
+                for item in loader_db.scan_prefix(prefix.as_bytes()) {
                     let load_start = Instant::now();
                     if let Ok((key, data)) = item {
                         if let Some(id) = std::str::from_utf8(&key).ok()
@@ -719,39 +675,58 @@ impl Aggregator {
                             .and_then(|h| u32::from_str_radix(h, 16).ok())
                         {
                             chunk.push((id, data.to_vec()));
+                            total_loaded += 1;
                         }
                     }
                     total_load += load_start.elapsed();
 
                     if chunk.len() >= load_chunk_size {
-                        let (online, agg, dt, vt, at) = process_chunk(&hpke_sk, &vk, context, std::mem::take(&mut chunk));
-                        total_decrypt += dt;
-                        total_verify += vt;
-                        total_agg += at;
-                        all_online.extend(online);
-                        aggregate = match (aggregate, agg) {
-                            (Some(a), Some(b)) => Some(a + b),
-                            (Some(a), None) => Some(a),
-                            (None, b) => b,
-                        };
+                        if chunk_tx.send(std::mem::take(&mut chunk)).is_err() {
+                            break;
+                        }
                         chunk = Vec::with_capacity(load_chunk_size);
                     }
                 }
 
-                // Process remaining
+                // Send remaining
                 if !chunk.is_empty() {
-                    let (online, agg, dt, vt, at) = process_chunk(&hpke_sk, &vk, context, chunk);
-                    total_decrypt += dt;
-                    total_verify += vt;
-                    total_agg += at;
-                    all_online.extend(online);
-                    aggregate = match (aggregate, agg) {
-                        (Some(a), Some(b)) => Some(a + b),
-                        (Some(a), None) => Some(a),
-                        (None, b) => b,
-                    };
+                    chunk_tx.send(chunk).ok();
+                }
+                (total_load, total_loaded)
+            }
+        });
+
+        // Process chunks as they arrive (in the current blocking context)
+        let result = tokio::task::spawn_blocking(move || {
+            let mut total_decrypt = std::time::Duration::ZERO;
+            let mut total_verify = std::time::Duration::ZERO;
+            let mut total_agg = std::time::Duration::ZERO;
+
+            let mut all_online = Vec::new();
+            let mut aggregate: Option<Ciphertext> = None;
+            let mut chunks_processed = 0usize;
+
+            while let Ok(reports) = chunk_rx.recv() {
+                let (online, agg, dt, vt, at) = process_chunk(&hpke_sk, &vk, context, reports);
+                total_decrypt += dt;
+                total_verify += vt;
+                total_agg += at;
+                all_online.extend(online);
+                aggregate = match (aggregate, agg) {
+                    (Some(a), Some(b)) => Some(a + b),
+                    (Some(a), None) => Some(a),
+                    (None, b) => b,
+                };
+
+                chunks_processed += 1;
+                if chunks_processed % 10 == 0 {
+                    info!("Processed {} chunks ({} reports so far)", chunks_processed, all_online.len());
                 }
             }
+
+            // Wait for loader to finish and get timing
+            let (total_load, num_loaded) = loader_handle.join().unwrap();
+            info!("Loader finished: {} reports loaded in {:?}", num_loaded, total_load);
 
             info!("\n\tLoad: {:?}\n\tDecrypt: {:?}\n\tVerify: {:?}\n\tAggregate: {:?}",
                 total_load, total_decrypt, total_verify, total_agg);
