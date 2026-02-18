@@ -65,11 +65,11 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-async fn send_batch_reports_no_ack(socket: &mut TcpStream, reports: Vec<(u32, u32, HpkeEnvelope)>) -> Result<()> {
+async fn send_batch_reports(socket: &mut TcpStream, context: u32, reports: Vec<(u32, Vec<u8>)>) -> Result<()> {
     if reports.is_empty() {
         return Ok(());
     }
-    write_message(socket, &Message::BatchEncryptedClientReports { reports }).await?;
+    write_message(socket, &Message::BatchEncryptedClientReports { context, reports }).await?;
     Ok(())
 }
 
@@ -598,17 +598,14 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
 
     let num_reports = reports.len();
 
-    // Collect all reports into batches
+    // Collect all reports into packed batches (pre-serialized for efficiency)
     let aggregator_addr = config.aggregator_addr.clone();
-    let mut batches = Vec::new();
+    let mut batches: Vec<Vec<(u32, Vec<u8>)>> = Vec::new();
     for chunk in reports.chunks(BATCH_REPORT_SIZE) {
         let batch: Vec<_> = chunk
             .iter()
-            .map(|(id, ctx, env)| {
-                let env_bytes = bincode::serialize(env).unwrap();
-                let env_clone: heli::crypto::hpke::HpkeEnvelope =
-                    bincode::deserialize(&env_bytes).unwrap();
-                (*id, *ctx, env_clone)
+            .map(|(id, _ctx, env)| {
+                (*id, bincode::serialize(env).unwrap())
             })
             .collect();
         batches.push(batch);
@@ -661,7 +658,7 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
 
     // Partition batches across N persistent connections
     let num_connections = max_concurrency.min(batches.len());
-    let mut batch_groups: Vec<Vec<Vec<(u32, u32, HpkeEnvelope)>>> = (0..num_connections).map(|_| Vec::new()).collect();
+    let mut batch_groups: Vec<Vec<Vec<(u32, Vec<u8>)>>> = (0..num_connections).map(|_| Vec::new()).collect();
     for (i, batch) in batches.into_iter().enumerate() {
         batch_groups[i % num_connections].push(batch);
     }
@@ -691,13 +688,13 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
 
             for batch in group {
                 let batch_size = batch.len();
-                if let Err(e) = send_batch_reports_no_ack(&mut socket, batch).await {
+                if let Err(e) = send_batch_reports(&mut socket, context, batch).await {
                     error!("Failed to send batch: {e}");
                     return;
                 }
                 let prev = submitted_count.fetch_add(batch_size, Ordering::SeqCst);
                 let current = prev + batch_size;
-                if current % 100_000 == 0 || current >= num_reports {
+                if current % 102_400 == 0 || current >= num_reports {
                     info!("Submitted {}/{} reports", current, num_reports);
                 }
             }

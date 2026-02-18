@@ -110,8 +110,8 @@ impl Aggregator {
             Message::EncryptedClientReport { id, context, envelope } => {
                 Self::respond(&mut socket, Self::store_client_report(state, id, context, envelope).await).await;
             }
-            Message::BatchEncryptedClientReports { reports } => {
-                Self::respond(&mut socket, Self::store_batch_client_reports(state, reports).await).await;
+            Message::BatchEncryptedClientReports { context, reports } => {
+                Self::respond(&mut socket, Self::store_batch_client_reports(state, context, reports).await).await;
             }
             Message::BatchStreamStart { num_batches } => {
                 Self::handle_batch_stream(&mut socket, state, num_batches).await;
@@ -132,12 +132,14 @@ impl Aggregator {
         for _ in 0..num_batches {
             let message = match read_message(socket).await {
                 Ok(msg) => msg,
-                Err(_) => return,
+                Err(_) => break,
             };
-            if let Message::BatchEncryptedClientReports { reports } = message {
-                Self::store_batch_client_reports(state.clone(), reports).await.ok();
+            if let Message::BatchEncryptedClientReports { context, reports } = message {
+                Self::store_batch_client_reports(state.clone(), context, reports).await.ok();
             }
         }
+        // Flush DB once at end of stream
+        state.db.flush_async().await.ok();
     }
 
     async fn respond(socket: &mut TcpStream, result: Result<()>) {
@@ -320,36 +322,27 @@ impl Aggregator {
 
     async fn store_batch_client_reports(
         state: Arc<AggregatorState>,
-        reports: Vec<(u32, u32, crate::crypto::hpke::HpkeEnvelope)>,
+        context: u32,
+        reports: Vec<(u32, Vec<u8>)>,
     ) -> Result<()> {
         if reports.is_empty() {
             return Ok(());
         }
 
-        let context = reports[0].1;
         Self::require_context_registered(&state, context)?;
         Self::set_or_check_context(&state, context).await?;
-
-        // Verify all reports share the same context
-        let expected = state.current_ctx.read().await.unwrap();
-        for (_, ctx, _) in &reports {
-            if *ctx != expected {
-                return Err(anyhow!("Context mismatch: expected {expected}, got {ctx}"));
-            }
-        }
-
         Self::start_reporting_timer(&state).await;
 
         let batch_size = reports.len();
         let db = state.db.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            for (id, ctx, envelope) in reports {
-                let key = format!("r/{ctx:08x}/{id:08x}");
-                db.insert(key.as_bytes(), bincode::serialize(&envelope)?)?;
-            }
-            db.flush()?;
-            Ok(())
-        }).await??;
+
+        // Use sled's Batch for atomic bulk insert
+        let mut batch = sled::Batch::default();
+        for (id, envelope_bytes) in reports {
+            let key = format!("r/{context:08x}/{id:08x}");
+            batch.insert(key.as_bytes(), envelope_bytes);
+        }
+        db.apply_batch(batch)?;
 
         Self::maybe_log_threshold_reached(&state, batch_size).await;
         Ok(())

@@ -58,12 +58,14 @@ pub enum Message {
         envelope: HpkeEnvelope,
     },
 
-    // Batch of HPKE-encrypted ClientReports (for efficient bulk upload)
+    /// Batch of HPKE-encrypted ClientReports for bulk upload.
+    /// Each entry is (id, serialized_envelope_bytes).
     BatchEncryptedClientReports {
-        reports: Vec<(u32, u32, HpkeEnvelope)>, // (id, context, envelope)
+        context: u32,
+        reports: Vec<(u32, Vec<u8>)>, // (id, serialized_envelope)
     },
 
-    /// Indicates how many BatchEncryptedClientReports will follow on this connection.
+    /// Indicates how many BatchEncryptedClientReportsPacked will follow on this connection.
     /// Server reads exactly this many batches then closes.
     BatchStreamStart {
         num_batches: usize,
