@@ -65,12 +65,11 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-async fn send_batch_reports(reports: Vec<(u32, u32, HpkeEnvelope)>, aggregator_addr: &str) -> Result<()> {
+async fn send_batch_reports_no_ack(socket: &mut TcpStream, reports: Vec<(u32, u32, HpkeEnvelope)>) -> Result<()> {
     if reports.is_empty() {
         return Ok(());
     }
-    let mut socket = TcpStream::connect(aggregator_addr).await?;
-    make_request(&mut socket, &Message::BatchEncryptedClientReports { reports }).await?;
+    write_message(socket, &Message::BatchEncryptedClientReports { reports }).await?;
     Ok(())
 }
 
@@ -546,10 +545,6 @@ async fn run_sim_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> 
 }
 
 async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<Db>) -> Result<()> {
-    // Semaphore to limit concurrent connections
-    let semaphore = Arc::new(Semaphore::new(max_concurrency));
-    info!("Max concurrency: {}", max_concurrency);
-
     info!("=== Report Submission ===");
     let submission_start = Instant::now();
     let submitted_count = Arc::new(AtomicUsize::new(0));
@@ -658,45 +653,53 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
     }
 
     info!(
-        "Sending {} batches (batch size: {})",
+        "Sending {} batches (batch size: {}) over {} connections",
         batches.len(),
-        BATCH_REPORT_SIZE
+        BATCH_REPORT_SIZE,
+        max_concurrency
     );
 
-    // Send batches concurrently
+    // Partition batches across N persistent connections
+    let num_connections = max_concurrency.min(batches.len());
+    let mut batch_groups: Vec<Vec<Vec<(u32, u32, HpkeEnvelope)>>> = (0..num_connections).map(|_| Vec::new()).collect();
+    for (i, batch) in batches.into_iter().enumerate() {
+        batch_groups[i % num_connections].push(batch);
+    }
+
+    // Spawn a task per connection that streams all its batches without waiting for acks
     let mut join_set = JoinSet::new();
-    for batch in batches.into_iter() {
+    for group in batch_groups {
         let aggregator_addr = aggregator_addr.clone();
         let submitted_count = submitted_count.clone();
-        let semaphore = semaphore.clone();
-        let batch_size = batch.len();
 
         join_set.spawn(async move {
-            let _permit = semaphore.acquire().await.unwrap();
-            let result = send_batch_reports(batch, &aggregator_addr).await;
-
-            match result {
-                Ok(()) => {
-                    let prev = submitted_count.fetch_add(batch_size, Ordering::SeqCst);
-                    let current = prev + batch_size;
-                    if current % 100_000 == 0 || current >= num_reports {
-                        info!("Submitted {}/{} reports", current, num_reports);
-                    }
-                }
+            let mut socket = match TcpStream::connect(&aggregator_addr).await {
+                Ok(s) => s,
                 Err(e) => {
-                    error!("Failed to send batch of {} reports: {:?}", batch_size, e);
+                    error!("Failed to connect: {e}");
+                    return;
+                }
+            };
+            // Disable Nagle's algorithm for lower latency
+            socket.set_nodelay(true).ok();
+
+            for batch in group {
+                let batch_size = batch.len();
+                if let Err(e) = send_batch_reports_no_ack(&mut socket, batch).await {
+                    error!("Failed to send batch: {e}");
+                    return;
+                }
+                let prev = submitted_count.fetch_add(batch_size, Ordering::SeqCst);
+                let current = prev + batch_size;
+                if current % 100_000 == 0 || current >= num_reports {
+                    info!("Submitted {}/{} reports", current, num_reports);
                 }
             }
         });
     }
 
-    // Wait for all submissions to complete and collect any errors
-    let mut any_batch_failed = false;
-    while let Some(res) = join_set.join_next().await {
-        if res.is_err() {
-            any_batch_failed = true;
-        }
-    }
+    // Wait for all connections to finish sending
+    while join_set.join_next().await.is_some() {}
 
     let submission_time = submission_start.elapsed();
     let submitted = submitted_count.load(Ordering::SeqCst);
@@ -710,11 +713,6 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
             submitted,
             num_reports,
             aggregator_addr
-        ));
-    }
-    if any_batch_failed {
-        return Err(anyhow::anyhow!(
-            "One or more batch tasks panicked. Submitted count may be wrong."
         ));
     }
 

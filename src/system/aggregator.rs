@@ -194,6 +194,8 @@ impl Aggregator {
             }
         }
 
+        info!("Aggregation wall-clock time: {:?}", start.elapsed());
+
         // Reset for next round
         *state.current_ctx.write().await = None;
         *state.reporting_start.write().await = None;
@@ -502,7 +504,7 @@ impl Aggregator {
 
         match result {
             Ok(r) => Ok(r),
-            Err(e) if simulated => {
+            Err(_) if simulated => {
                 info!("Simulated round - returning dummy result");
                 let length = (context & 0xFFFF) as usize;
                 Ok(vec![0u64; length.min(128)])
