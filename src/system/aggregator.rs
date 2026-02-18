@@ -629,27 +629,58 @@ impl Aggregator {
             let mut aggregate: Option<Ciphertext> = None;
 
             if simulated {
-                // For simulated mode: load unique reports once, then process duplicated in chunks
-                let load_start = Instant::now();
+                // For simulated mode: load unique reports in chunks, process immediately
+                // Each unique report is duplicated across multiple client IDs
                 let prefix = format!("r/{context:08x}/");
-                let unique_reports: Vec<Vec<u8>> = db.scan_prefix(prefix.as_bytes())
-                    .filter_map(|r| r.ok())
-                    .map(|(_, data)| data.to_vec())
-                    .collect();
-                total_load = load_start.elapsed();
-                info!("Loaded {} unique reports in {:?}", unique_reports.len(), total_load);
+                let mut unique_reports: Vec<Vec<u8>> = Vec::new();
+                let mut next_client_id: usize = 0;
+                let total_chunks = (num_to_process + load_chunk_size - 1) / load_chunk_size;
+                let mut chunks_processed = 0;
 
-                if unique_reports.is_empty() {
-                    return Ok((all_online, aggregate));
+                for item in db.scan_prefix(prefix.as_bytes()) {
+                    let load_start = Instant::now();
+                    if let Ok((_, data)) = item {
+                        unique_reports.push(data.to_vec());
+                    }
+                    total_load += load_start.elapsed();
+
+                    // Process chunks as soon as we have enough unique reports
+                    while next_client_id < num_to_process && !unique_reports.is_empty() {
+                        let chunk_end = (next_client_id + load_chunk_size).min(num_to_process);
+                        
+                        // Build chunk by duplicating from unique reports (via modulo)
+                        // (each report can be used multiple times via modulo)
+                        let reports: Vec<(u32, Vec<u8>)> = (next_client_id..chunk_end).map(|i| {
+                            let id = i as u32;
+                            let src_idx = i % unique_reports.len();
+                            (id, unique_reports[src_idx].clone())
+                        }).collect();
+
+                        let (online, agg, dt, vt, at) = process_chunk(&hpke_sk, &vk, context, reports);
+                        total_decrypt += dt;
+                        total_verify += vt;
+                        total_agg += at;
+                        all_online.extend(online);
+                        aggregate = match (aggregate, agg) {
+                            (Some(a), Some(b)) => Some(a + b),
+                            (Some(a), None) => Some(a),
+                            (None, b) => b,
+                        };
+
+                        next_client_id = chunk_end;
+                        chunks_processed += 1;
+
+                        if chunks_processed % 10 == 0 || chunks_processed == total_chunks {
+                            info!("Processed chunk {}/{} ({} reports so far)", chunks_processed, total_chunks, all_online.len());
+                        }
+                    }
                 }
 
-                // Process in chunks, duplicating from unique reports
-                let total_chunks = (num_to_process + load_chunk_size - 1) / load_chunk_size;
-                for chunk_idx in 0..total_chunks {
-                    let chunk_start = chunk_idx * load_chunk_size;
-                    let chunk_end = (chunk_start + load_chunk_size).min(num_to_process);
+                // Process any remaining clients if we've loaded all unique reports
+                while next_client_id < num_to_process && !unique_reports.is_empty() {
+                    let chunk_end = (next_client_id + load_chunk_size).min(num_to_process);
                     
-                    let reports: Vec<(u32, Vec<u8>)> = (chunk_start..chunk_end).map(|i| {
+                    let reports: Vec<(u32, Vec<u8>)> = (next_client_id..chunk_end).map(|i| {
                         let id = i as u32;
                         let src_idx = i % unique_reports.len();
                         (id, unique_reports[src_idx].clone())
@@ -666,10 +697,15 @@ impl Aggregator {
                         (None, b) => b,
                     };
 
-                    if (chunk_idx + 1) % 10 == 0 || chunk_idx + 1 == total_chunks {
-                        info!("Processed chunk {}/{} ({} reports so far)", chunk_idx + 1, total_chunks, all_online.len());
+                    next_client_id = chunk_end;
+                    chunks_processed += 1;
+
+                    if chunks_processed % 10 == 0 || chunks_processed == total_chunks {
+                        info!("Processed chunk {}/{} ({} reports so far)", chunks_processed, total_chunks, all_online.len());
                     }
                 }
+
+                info!("Loaded {} unique reports", unique_reports.len());
             } else {
                 // Stream from scan_prefix, process in chunks
                 let prefix = format!("r/{context:08x}/");
