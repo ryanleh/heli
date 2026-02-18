@@ -164,13 +164,20 @@ impl Aggregator {
     async fn handle_batch_stream(socket: &mut TcpStream, state: Arc<AggregatorState>, num_batches: usize) {
         let mut total_reports = 0usize;
         let mut context_set = false;
+        let mut batches_received = 0usize;
 
-        for _ in 0..num_batches {
+        // If num_batches is 0, stream until connection closes; otherwise read exactly num_batches
+        loop {
+            if num_batches > 0 && batches_received >= num_batches {
+                break;
+            }
+
             let message = match read_message(socket).await {
                 Ok(msg) => msg,
-                Err(_) => break,
+                Err(_) => break, // Connection closed or error
             };
             if let Message::BatchEncryptedClientReports { context, reports } = message {
+                batches_received += 1;
                 if reports.is_empty() {
                     continue;
                 }
