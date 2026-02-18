@@ -61,6 +61,8 @@ pub struct AggregatorState {
     mask_recv: Mutex<Option<mpsc::Receiver<Message>>>,
     reporting_start: RwLock<Option<Instant>>,
     num_reported: AtomicUsize,
+    // Channel for funneling all report writes through a single thread
+    report_write_tx: mpsc::UnboundedSender<(u32, Vec<(u32, Vec<u8>)>)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -81,6 +83,14 @@ impl Aggregator {
         db: Db,
         hpke_keys: ServerKeys,
     ) -> Self {
+        let (report_write_tx, report_write_rx) = mpsc::unbounded_channel();
+
+        // Spawn dedicated writer thread
+        let writer_db = db.clone();
+        std::thread::spawn(move || {
+            Self::report_writer_thread(writer_db, report_write_rx);
+        });
+
         let state = Arc::new(AggregatorState {
             num_clients,
             threshold,
@@ -91,9 +101,28 @@ impl Aggregator {
             mask_recv: Mutex::new(None),
             reporting_start: RwLock::new(None),
             num_reported: AtomicUsize::new(0),
+            report_write_tx,
         });
 
         Self { addr: addr.to_string(), state }
+    }
+
+    fn report_writer_thread(db: Db, mut rx: mpsc::UnboundedReceiver<(u32, Vec<(u32, Vec<u8>)>)>) {
+        let mut key = [0u8; 19];
+        key[0] = b'r';
+        key[1] = b'/';
+        key[10] = b'/';
+
+        while let Some((context, reports)) = rx.blocking_recv() {
+            let mut batch = sled::Batch::default();
+            hex_encode_u32(context, &mut key[2..10]);
+
+            for (id, envelope_bytes) in reports {
+                hex_encode_u32(id, &mut key[11..19]);
+                batch.insert(&key[..], envelope_bytes);
+            }
+            db.apply_batch(batch).ok();
+        }
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -165,31 +194,13 @@ impl Aggregator {
                     context_set = true;
                 }
 
-                let batch_size = reports.len();
-                let db = state.db.clone();
-
-                // Use spawn_blocking to avoid blocking the async runtime
-                tokio::task::spawn_blocking(move || {
-                    let mut batch = sled::Batch::default();
-                    let mut key = [0u8; 19];
-                    key[0] = b'r';
-                    key[1] = b'/';
-                    key[10] = b'/';
-                    hex_encode_u32(context, &mut key[2..10]);
-
-                    for (id, envelope_bytes) in reports {
-                        hex_encode_u32(id, &mut key[11..19]);
-                        batch.insert(&key[..], envelope_bytes);
-                    }
-                    db.apply_batch(batch).ok();
-                }).await.ok();
-
-                total_reports += batch_size;
+                total_reports += reports.len();
+                // Send to dedicated writer thread - won't block
+                state.report_write_tx.send((context, reports)).ok();
             }
         }
 
-        // Flush and update counters once at end
-        state.db.flush_async().await.ok();
+        // Update counters
         if total_reports > 0 {
             Self::maybe_log_threshold_reached(&state, total_reports).await;
         }
