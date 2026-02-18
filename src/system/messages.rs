@@ -63,6 +63,12 @@ pub enum Message {
         reports: Vec<(u32, u32, HpkeEnvelope)>, // (id, context, envelope)
     },
 
+    /// Indicates how many BatchEncryptedClientReports will follow on this connection.
+    /// Server reads exactly this many batches then closes.
+    BatchStreamStart {
+        num_batches: usize,
+    },
+
     /// Register context config before sending reports. Required once per context.
     /// Sets proof type (binary or range with bitlength) and whether reports are simulated.
     /// For simulated runs, includes the list of dropped-out client IDs.

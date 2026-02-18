@@ -113,6 +113,9 @@ impl Aggregator {
             Message::BatchEncryptedClientReports { reports } => {
                 Self::respond(&mut socket, Self::store_batch_client_reports(state, reports).await).await;
             }
+            Message::BatchStreamStart { num_batches } => {
+                Self::handle_batch_stream(&mut socket, state, num_batches).await;
+            }
             Message::SetContextConfig { context, binary, bitlength, simulated, sim_dropouts } => {
                 Self::respond(&mut socket, Self::set_context_config(state, context, binary, bitlength, simulated, sim_dropouts).await).await;
             }
@@ -121,6 +124,18 @@ impl Aggregator {
             }
             _ => {
                 send_error_message(&mut socket, "Invalid request").await.ok();
+            }
+        }
+    }
+
+    async fn handle_batch_stream(socket: &mut TcpStream, state: Arc<AggregatorState>, num_batches: usize) {
+        for _ in 0..num_batches {
+            let message = match read_message(socket).await {
+                Ok(msg) => msg,
+                Err(_) => return,
+            };
+            if let Message::BatchEncryptedClientReports { reports } = message {
+                Self::store_batch_client_reports(state.clone(), reports).await.ok();
             }
         }
     }

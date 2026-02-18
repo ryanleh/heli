@@ -666,11 +666,12 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
         batch_groups[i % num_connections].push(batch);
     }
 
-    // Spawn a task per connection that streams all its batches without waiting for acks
+    // Spawn a task per connection that streams all its batches
     let mut join_set = JoinSet::new();
     for group in batch_groups {
         let aggregator_addr = aggregator_addr.clone();
         let submitted_count = submitted_count.clone();
+        let num_batches = group.len();
 
         join_set.spawn(async move {
             let mut socket = match TcpStream::connect(&aggregator_addr).await {
@@ -680,8 +681,13 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
                     return;
                 }
             };
-            // Disable Nagle's algorithm for lower latency
             socket.set_nodelay(true).ok();
+
+            // Tell server how many batches to expect
+            if let Err(e) = write_message(&mut socket, &Message::BatchStreamStart { num_batches }).await {
+                error!("Failed to send BatchStreamStart: {e}");
+                return;
+            }
 
             for batch in group {
                 let batch_size = batch.len();
