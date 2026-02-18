@@ -593,38 +593,44 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
     let load_start = Instant::now();
 
     // Load reports as raw bytes (skip deserialize/serialize round-trip)
+    // Use spawn_blocking to avoid blocking the tokio runtime during heavy I/O
     let batches: Vec<Vec<(u32, Vec<u8>)>> = if sim_generate {
-        // Load dropout count stored during sim-generate
-        let dropouts = db.get(b"sim_dropouts")?
-            .map(|v| usize::from_le_bytes(v.as_ref().try_into().unwrap_or([0; 8])))
-            .unwrap_or(config.dropouts);
-        let num_participating = config.num_clients - dropouts;
+        let db = db.clone();
+        let dropouts = config.dropouts;
+        let num_clients = config.num_clients;
 
-        // Load unique reports once
-        let unique_count = BATCH_REPORT_SIZE.min(num_participating);
-        let unique_reports: Vec<Vec<u8>> = (0..unique_count)
-            .map(|i| {
-                load_report_bytes_from_db(&db, i as u32, context)
-                    .map_err(|_| anyhow!("sim_generate set but report {} not found. Run 'sim-generate' first.", i))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        tokio::task::spawn_blocking(move || -> Result<Vec<Vec<(u32, Vec<u8>)>>> {
+            let dropouts = db.get(b"sim_dropouts")?
+                .map(|v| usize::from_le_bytes(v.as_ref().try_into().unwrap_or([0; 8])))
+                .unwrap_or(dropouts);
+            let num_participating = num_clients - dropouts;
 
-        info!(
-            "Loaded {} unique reports, duplicating to {} participating ({} dropouts)",
-            unique_reports.len(), num_participating, dropouts
-        );
+            let unique_count = BATCH_REPORT_SIZE.min(num_participating);
+            let unique_reports: Vec<Vec<u8>> = (0..unique_count)
+                .map(|i| {
+                    load_report_bytes_from_db(&db, i as u32, context)
+                        .map_err(|_| anyhow!("sim_generate set but report {} not found. Run 'sim-generate' first.", i))
+                })
+                .collect::<Result<Vec<_>>>()?;
 
-        // Build batches by duplicating
-        (0..num_participating)
-            .collect::<Vec<_>>()
-            .chunks(BATCH_REPORT_SIZE)
-            .map(|chunk| {
-                chunk.iter().map(|&i| {
-                    let src_id = i % BATCH_REPORT_SIZE;
-                    (i as u32, unique_reports[src_id].clone())
-                }).collect()
-            })
-            .collect()
+            info!(
+                "Loaded {} unique reports, duplicating to {} participating ({} dropouts)",
+                unique_reports.len(), num_participating, dropouts
+            );
+
+            let batches = (0..num_participating)
+                .collect::<Vec<_>>()
+                .chunks(BATCH_REPORT_SIZE)
+                .map(|chunk| {
+                    chunk.iter().map(|&i| {
+                        let src_id = i % BATCH_REPORT_SIZE;
+                        (i as u32, unique_reports[src_id].clone())
+                    }).collect()
+                })
+                .collect();
+            Ok(batches)
+        })
+        .await??
     } else {
         // Load all reports in parallel
         let reports = load_all_reports_parallel(&db, context, config.num_clients).await;
