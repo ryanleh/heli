@@ -165,20 +165,26 @@ impl Aggregator {
                     context_set = true;
                 }
 
-                // Direct insert without spawn_blocking - we're already in our own task
-                let mut batch = sled::Batch::default();
-                let mut key = [0u8; 19];
-                key[0] = b'r';
-                key[1] = b'/';
-                key[10] = b'/';
-                hex_encode_u32(context, &mut key[2..10]);
+                let batch_size = reports.len();
+                let db = state.db.clone();
 
-                for (id, envelope_bytes) in reports {
-                    hex_encode_u32(id, &mut key[11..19]);
-                    batch.insert(&key[..], envelope_bytes);
-                    total_reports += 1;
-                }
-                state.db.apply_batch(batch).ok();
+                // Use spawn_blocking to avoid blocking the async runtime
+                tokio::task::spawn_blocking(move || {
+                    let mut batch = sled::Batch::default();
+                    let mut key = [0u8; 19];
+                    key[0] = b'r';
+                    key[1] = b'/';
+                    key[10] = b'/';
+                    hex_encode_u32(context, &mut key[2..10]);
+
+                    for (id, envelope_bytes) in reports {
+                        hex_encode_u32(id, &mut key[11..19]);
+                        batch.insert(&key[..], envelope_bytes);
+                    }
+                    db.apply_batch(batch).ok();
+                }).await.ok();
+
+                total_reports += batch_size;
             }
         }
 
