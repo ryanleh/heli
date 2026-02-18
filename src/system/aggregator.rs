@@ -1,5 +1,6 @@
 use crate::{
     agg_only_enc::{AggOnlyEnc, Ciphertext},
+    BATCH_REPORT_SIZE,
     crypto::{
         G,
         hpke::{ServerKeys, hpke_decrypt},
@@ -621,7 +622,8 @@ impl Aggregator {
 
         // Use a channel to pipeline loading and processing
         // Loader thread fills the channel, processor thread(s) drain it
-        let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<Vec<(u32, Vec<u8>)>>(4);
+        const CHUNK_BUFFER_SIZE: usize = 4;
+        let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<Vec<(u32, Vec<u8>)>>(CHUNK_BUFFER_SIZE);
 
         // Spawn loader thread
         let loader_db = db.clone();
@@ -629,71 +631,42 @@ impl Aggregator {
             let mut total_load = std::time::Duration::ZERO;
             let prefix = format!("r/{context:08x}/");
 
-            if simulated {
-                // Load all unique reports first
+            // Both modes: stream from DB, parse ID from key
+            let mut chunk = Vec::with_capacity(load_chunk_size);
+            let mut total_loaded = 0usize;
+
+            for item in loader_db.scan_prefix(prefix.as_bytes()) {
                 let load_start = Instant::now();
-                let unique_reports: Vec<Vec<u8>> = loader_db.scan_prefix(prefix.as_bytes())
-                    .filter_map(|r| r.ok())
-                    .map(|(_, data)| data.to_vec())
-                    .collect();
-                total_load = load_start.elapsed();
-
-                if unique_reports.is_empty() {
-                    return (total_load, 0);
+                if let Ok((key, data)) = item {
+                    if let Some(id) = std::str::from_utf8(&key).ok()
+                        .and_then(|s| s.rsplit('/').next())
+                        .and_then(|h| u32::from_str_radix(h, 16).ok())
+                    {
+                        if simulated {
+                            chunk.push((id % (BATCH_REPORT_SIZE as u32), data.to_vec()));
+                        } else {
+                            chunk.push((id, data.to_vec()));
+                        }
+                        total_loaded += 1;
+                    }
                 }
+                total_load += load_start.elapsed();
 
-                info!("Loaded {} unique reports in {:?}, generating {} simulated reports", 
-                      unique_reports.len(), total_load, num_to_process);
-
-                // Generate chunks by duplicating from unique reports
-                let total_chunks = (num_to_process + load_chunk_size - 1) / load_chunk_size;
-                for chunk_idx in 0..total_chunks {
-                    let chunk_start = chunk_idx * load_chunk_size;
-                    let chunk_end = (chunk_start + load_chunk_size).min(num_to_process);
-                    
-                    let reports: Vec<(u32, Vec<u8>)> = (chunk_start..chunk_end).map(|i| {
-                        let id = i as u32;
-                        let src_idx = i % unique_reports.len();
-                        (id, unique_reports[src_idx].clone())
-                    }).collect();
-
-                    if chunk_tx.send(reports).is_err() {
+                if chunk.len() >= load_chunk_size {
+                    if chunk_tx.send(std::mem::take(&mut chunk)).is_err() {
                         break;
                     }
+                    chunk = Vec::with_capacity(load_chunk_size);
                 }
-                (total_load, unique_reports.len())
-            } else {
-                // Stream from DB, send chunks as they fill up
-                let mut chunk = Vec::with_capacity(load_chunk_size);
-                let mut total_loaded = 0usize;
-
-                for item in loader_db.scan_prefix(prefix.as_bytes()) {
-                    let load_start = Instant::now();
-                    if let Ok((key, data)) = item {
-                        if let Some(id) = std::str::from_utf8(&key).ok()
-                            .and_then(|s| s.rsplit('/').next())
-                            .and_then(|h| u32::from_str_radix(h, 16).ok())
-                        {
-                            chunk.push((id, data.to_vec()));
-                            total_loaded += 1;
-                        }
-                    }
-                    total_load += load_start.elapsed();
-
-                    if chunk.len() >= load_chunk_size {
-                        if chunk_tx.send(std::mem::take(&mut chunk)).is_err() {
-                            break;
-                        }
-                        chunk = Vec::with_capacity(load_chunk_size);
-                    }
-                }
-
-                // Send remaining
-                if !chunk.is_empty() {
-                    chunk_tx.send(chunk).ok();
-                }
-                (total_load, total_loaded)
             }
+
+            // Send remaining
+            if !chunk.is_empty() {
+                chunk_tx.send(chunk).ok();
+            }
+
+            info!("Loader: {} reports from DB in {:?}", total_loaded, total_load);
+            (total_load, total_loaded)
         });
 
         // Process chunks as they arrive (in the current blocking context)
