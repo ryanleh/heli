@@ -50,23 +50,28 @@ async fn main() -> Result<()> {
     }
 
     // Open the database
+    info!("Opening database at {}", config.db_path);
     let db = sled::open(&config.db_path)?;
+    info!("Database opened, {} total keys", db.len());
 
     // Clear reports if requested
     if args.clear_reports {
         info!("Clearing reports from database");
-        let keys: Vec<Vec<u8>> = db
-            .scan_prefix(b"r/")
-            .keys()
-            .map(|res| res.map(|k| k.to_vec()))
-            .collect::<Result<_, _>>()?;
-
-        let num_keys = keys.len();
-        for key in keys {
-            db.remove(key)?;
+        let mut count = 0usize;
+        let mut batch = sled::Batch::default();
+        for key_result in db.scan_prefix(b"r/").keys() {
+            if let Ok(key) = key_result {
+                batch.remove(key);
+                count += 1;
+                if count % 100_000 == 0 {
+                    info!("Queued {} keys for deletion...", count);
+                }
+            }
         }
+        info!("Applying batch delete of {} keys...", count);
+        db.apply_batch(batch)?;
         db.flush()?;
-        info!("Cleared {} report keys", num_keys);
+        info!("Cleared {} report keys", count);
     }
 
     // Load HPKE keys

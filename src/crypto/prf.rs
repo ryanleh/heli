@@ -75,19 +75,49 @@ impl ScalarPRF {
         }
         let mut accum = [0u64; 5];
         for idx in indices.into_iter() {
-            // Compute the PRF eval
-            let aes_blocks = self.evaluate_aes(*idx as u64);
-            let limbs = [
-                u64::from_le_bytes(aes_blocks[0][0..8].try_into().unwrap()),
-                u64::from_le_bytes(aes_blocks[0][8..16].try_into().unwrap()),
-                u64::from_le_bytes(aes_blocks[1][0..8].try_into().unwrap()),
-                u64::from_le_bytes(aes_blocks[1][8..16].try_into().unwrap()),
-            ];
-
-            // Add to accumulator
-            Self::add_u256(&mut accum, limbs);
+            self.accumulate_eval(&mut accum, *idx as u64);
         }
+        Self::finalize_accum(accum)
+    }
 
+    /// Computes the sum of PRF evaluations for bitpacked indices (fused unpack + evaluate).
+    /// This avoids allocating a Vec<usize> for the unpacked indices.
+    pub fn batch_evaluate_packed(&self, packed: &[u8], count: usize, num_clients: usize) -> Scalar {
+        if count == 0 {
+            return Scalar::ZERO;
+        }
+        let bits_per_index = if num_clients <= 1 { 1 } else { (usize::BITS - (num_clients - 1).leading_zeros()) as usize };
+        let mut accum = [0u64; 5];
+        
+        for i in 0..count {
+            // Unpack single index
+            let bit_offset = i * bits_per_index;
+            let mut idx = 0u64;
+            for b in 0..bits_per_index {
+                let global_bit = bit_offset + b;
+                if (packed[global_bit / 8] >> (global_bit % 8)) & 1 == 1 {
+                    idx |= 1 << b;
+                }
+            }
+            // Immediately evaluate and accumulate
+            self.accumulate_eval(&mut accum, idx);
+        }
+        Self::finalize_accum(accum)
+    }
+
+    #[inline]
+    fn accumulate_eval(&self, accum: &mut [u64; 5], idx: u64) {
+        let aes_blocks = self.evaluate_aes(idx);
+        let limbs = [
+            u64::from_le_bytes(aes_blocks[0][0..8].try_into().unwrap()),
+            u64::from_le_bytes(aes_blocks[0][8..16].try_into().unwrap()),
+            u64::from_le_bytes(aes_blocks[1][0..8].try_into().unwrap()),
+            u64::from_le_bytes(aes_blocks[1][8..16].try_into().unwrap()),
+        ];
+        Self::add_u256(accum, limbs);
+    }
+
+    fn finalize_accum(accum: [u64; 5]) -> Scalar {
         // Reduce accumulator to group element. The API only supports 256-bit
         // and 512-bit inputs, so we map to 512-bits.
         let mut accum_bytes = [0u8; 64];

@@ -367,11 +367,6 @@ impl Decryptor {
             };
 
             let wall_start = Instant::now();
-            
-            // Unpack dropout indices
-            let unpack_start = Instant::now();
-            let dropouts = unpack_indices(&dropouts_packed, dropout_count, num_clients);
-            let unpack_time = unpack_start.elapsed();
 
             // Validate context
             {
@@ -384,7 +379,7 @@ impl Decryptor {
             }
 
             // Check threshold
-            let online = if invert { dropouts.len() } else { state.num_clients - dropouts.len() };
+            let online = if invert { dropout_count } else { num_clients - dropout_count };
             if online < state.threshold {
                 return Err(anyhow!("Threshold not met: {online} < {}", state.threshold));
             }
@@ -393,14 +388,15 @@ impl Decryptor {
             let sk = state.secret_key.get().ok_or_else(|| anyhow!("Setup incomplete"))?.clone();
 
             // Compute mask with detailed timing (inlined from AggOnlyEnc::decrypt_mask)
+            // Uses fused unpack+evaluate to avoid allocating Vec<usize> for dropouts
             let (mask, dropout_key_time, mask_compute_time) = tokio::task::spawn_blocking(move || {
-                // Phase 1: Compute dropout-adjusted key
+                // Phase 1: Compute dropout-adjusted key (fused unpack + batch evaluate)
                 let dropout_key_start = Instant::now();
-                let key = match dropouts.len() {
+                let key = match dropout_count {
                     0 => sk.prf_key,
                     _ => match invert {
-                        false => sk.prf_key - sk.keygen_prf.batch_evaluate(&dropouts),
-                        true => sk.keygen_prf.batch_evaluate(&dropouts),
+                        false => sk.prf_key - sk.keygen_prf.batch_evaluate_packed(&dropouts_packed, dropout_count, num_clients),
+                        true => sk.keygen_prf.batch_evaluate_packed(&dropouts_packed, dropout_count, num_clients),
                     },
                 };
                 let dropout_key_time = dropout_key_start.elapsed();
@@ -423,11 +419,10 @@ impl Decryptor {
 
             info!(
                 "Decrypt mask for context {context}: {online} online clients\n\t\
-                 Unpack dropouts: {:?}\n\t\
-                 Dropout key: {:?}\n\t\
+                 Dropout key (fused unpack+eval): {:?}\n\t\
                  Mask computation: {:?}\n\t\
                  Total: {:?}",
-                unpack_time, dropout_key_time, mask_compute_time, wall_start.elapsed()
+                dropout_key_time, mask_compute_time, wall_start.elapsed()
             );
             info!("Sent {}B, Recv {}B", bytes_sent(), bytes_recv());
             reset_byte_counters();
