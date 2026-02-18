@@ -79,6 +79,7 @@ async fn main() -> Result<()> {
         config.prover.to_prover_type(),
         db,
         hpke_keys,
+        config.agg_chunk_size,
     );
 
     info!("Starting aggregator on {}", config.aggregator_addr);

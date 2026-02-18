@@ -28,6 +28,14 @@ pub struct ExperimentConfig {
 
     /// Path to the sled database
     pub db_path: String,
+
+    /// Number of reports to load before starting verification (default: 100000)
+    #[serde(default = "default_agg_chunk_size")]
+    pub agg_chunk_size: usize,
+}
+
+fn default_agg_chunk_size() -> usize {
+    100_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

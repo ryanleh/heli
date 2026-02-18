@@ -63,6 +63,8 @@ pub struct AggregatorState {
     num_reported: AtomicUsize,
     // Channel for funneling all report writes through a single thread (std channel for use with std::thread)
     report_write_tx: std::sync::mpsc::Sender<(u32, Vec<(u32, Vec<u8>)>)>,
+    // Number of reports to load before starting verification
+    agg_chunk_size: usize,
 }
 
 impl Aggregator {
@@ -73,6 +75,7 @@ impl Aggregator {
         _prover: ProverType,
         db: Db,
         hpke_keys: ServerKeys,
+        agg_chunk_size: usize,
     ) -> Self {
         let (report_write_tx, report_write_rx) = std::sync::mpsc::channel();
 
@@ -93,6 +96,7 @@ impl Aggregator {
             reporting_start: RwLock::new(None),
             num_reported: AtomicUsize::new(0),
             report_write_tx,
+            agg_chunk_size,
         });
 
         Self { addr: addr.to_string(), state }
@@ -512,9 +516,7 @@ impl Aggregator {
 
         let db = state.db.clone();
         let hpke_sk = state.hpke_keys.sk.clone();
-
-        // How many reports to load before starting processing
-        const LOAD_CHUNK_SIZE: usize = 100_000;
+        let load_chunk_size = state.agg_chunk_size;
 
         let result = tokio::task::spawn_blocking(move || {
             let mut total_load = std::time::Duration::ZERO;
@@ -541,7 +543,8 @@ impl Aggregator {
                 }
 
                 // Process in chunks, duplicating from unique reports
-                for chunk in client_ids.chunks(LOAD_CHUNK_SIZE) {
+                let total_chunks = (client_ids.len() + load_chunk_size - 1) / load_chunk_size;
+                for (chunk_idx, chunk) in client_ids.chunks(load_chunk_size).enumerate() {
                     let reports: Vec<(u32, Vec<u8>)> = chunk.iter().map(|&id| {
                         let src_idx = (id as usize) % unique_reports.len();
                         (id, unique_reports[src_idx].clone())
@@ -557,11 +560,15 @@ impl Aggregator {
                         (Some(a), None) => Some(a),
                         (None, b) => b,
                     };
+
+                    if (chunk_idx + 1) % 10 == 0 || chunk_idx + 1 == total_chunks {
+                        info!("Processed chunk {}/{} ({} reports so far)", chunk_idx + 1, total_chunks, all_online.len());
+                    }
                 }
             } else {
                 // Stream from scan_prefix, process in chunks
                 let prefix = format!("r/{context:08x}/");
-                let mut chunk = Vec::with_capacity(LOAD_CHUNK_SIZE);
+                let mut chunk = Vec::with_capacity(load_chunk_size);
 
                 for item in db.scan_prefix(prefix.as_bytes()) {
                     let load_start = Instant::now();
@@ -575,7 +582,7 @@ impl Aggregator {
                     }
                     total_load += load_start.elapsed();
 
-                    if chunk.len() >= LOAD_CHUNK_SIZE {
+                    if chunk.len() >= load_chunk_size {
                         let (online, agg, dt, vt, at) = process_chunk(&hpke_sk, &vk, context, std::mem::take(&mut chunk));
                         total_decrypt += dt;
                         total_verify += vt;
@@ -586,7 +593,7 @@ impl Aggregator {
                             (Some(a), None) => Some(a),
                             (None, b) => b,
                         };
-                        chunk = Vec::with_capacity(LOAD_CHUNK_SIZE);
+                        chunk = Vec::with_capacity(load_chunk_size);
                     }
                 }
 
