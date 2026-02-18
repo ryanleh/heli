@@ -1,14 +1,15 @@
 use crate::{
-    agg_only_enc::{AggOnlyEnc, EvalKey, SecretKey},
+    agg_only_enc::{EvalKey, SecretKey},
     crypto::{
         G, Scalar,
         app_attest::{verify_app_attest, verify_sig},
         hpke::*,
-        prf::ScalarPRF,
+        prf::{ScalarPRF, KHPRF},
     },
     proofs::Proof,
     system::messages::{Message, *},
 };
+use rayon::prelude::*;
 
 use anyhow::{Result, anyhow};
 use rand_core::{OsRng, RngCore};
@@ -365,8 +366,12 @@ impl Decryptor {
                 continue;
             };
 
-            let start = Instant::now();
+            let wall_start = Instant::now();
+            
+            // Unpack dropout indices
+            let unpack_start = Instant::now();
             let dropouts = unpack_indices(&dropouts_packed, dropout_count, num_clients);
+            let unpack_time = unpack_start.elapsed();
 
             // Validate context
             {
@@ -384,15 +389,46 @@ impl Decryptor {
                 return Err(anyhow!("Threshold not met: {online} < {}", state.threshold));
             }
 
-            // Generate and send decryption mask
-            let sk = state.secret_key.get().ok_or_else(|| anyhow!("Setup incomplete"))?;
-            let mask = AggOnlyEnc::decrypt_mask(sk, context, &dropouts, invert, length);
+            // Get secret key
+            let sk = state.secret_key.get().ok_or_else(|| anyhow!("Setup incomplete"))?.clone();
+
+            // Compute mask with detailed timing (inlined from AggOnlyEnc::decrypt_mask)
+            let (mask, dropout_key_time, mask_compute_time) = tokio::task::spawn_blocking(move || {
+                // Phase 1: Compute dropout-adjusted key
+                let dropout_key_start = Instant::now();
+                let key = match dropouts.len() {
+                    0 => sk.prf_key,
+                    _ => match invert {
+                        false => sk.prf_key - sk.keygen_prf.batch_evaluate(&dropouts),
+                        true => sk.keygen_prf.batch_evaluate(&dropouts),
+                    },
+                };
+                let dropout_key_time = dropout_key_start.elapsed();
+
+                // Phase 2: Compute the actual mask (parallel KHPRF evaluations)
+                let mask_start = Instant::now();
+                let mask: Vec<G> = (0..length)
+                    .into_par_iter()
+                    .map(|i| KHPRF::evaluate_context(&key, context, i))
+                    .collect();
+                let mask_compute_time = mask_start.elapsed();
+
+                (mask, dropout_key_time, mask_compute_time)
+            }).await?;
+
             write_message(socket, &Message::DecryptMaskResponse { mask }).await?;
 
             // Reset for next round
             *state.current_ctx.write().await = None;
 
-            info!("Decrypt mask for context {context}: {online} online clients, {:?}", start.elapsed());
+            info!(
+                "Decrypt mask for context {context}: {online} online clients\n\t\
+                 Unpack dropouts: {:?}\n\t\
+                 Dropout key: {:?}\n\t\
+                 Mask computation: {:?}\n\t\
+                 Total: {:?}",
+                unpack_time, dropout_key_time, mask_compute_time, wall_start.elapsed()
+            );
             info!("Sent {}B, Recv {}B", bytes_sent(), bytes_recv());
             reset_byte_counters();
         }
