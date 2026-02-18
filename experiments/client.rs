@@ -134,21 +134,14 @@ fn load_report_bytes_from_db(db: &Db, id: u32, context: u32) -> Result<Vec<u8>> 
     Ok(data.to_vec())
 }
 
-/// Load all reports for a context using parallel iteration
-async fn load_all_reports_parallel(db: &Db, context: u32, num_clients: usize) -> Vec<(u32, Vec<u8>)> {
-    use rayon::prelude::*;
-    let db = db.clone();
-    tokio::task::spawn_blocking(move || {
-        (0..num_clients)
-            .into_par_iter()
-            .filter_map(|i| {
-                let id = i as u32;
-                load_report_bytes_from_db(&db, id, context).ok().map(|bytes| (id, bytes))
-            })
-            .collect()
-    })
-    .await
-    .unwrap_or_default()
+/// Load all reports for a context
+fn load_all_reports(db: &Db, context: u32, num_clients: usize) -> Vec<(u32, Vec<u8>)> {
+    (0..num_clients)
+        .filter_map(|i| {
+            let id = i as u32;
+            load_report_bytes_from_db(db, id, context).ok().map(|bytes| (id, bytes))
+        })
+        .collect()
 }
 
 fn clear_reports_from_db(db: &Db) -> Result<()> {
@@ -633,7 +626,7 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
         .await??
     } else {
         // Load all reports in parallel
-        let reports = load_all_reports_parallel(&db, context, config.num_clients).await;
+        let reports = load_all_reports(&db, context, config.num_clients);
         info!("Loaded {} reports from DB", reports.len());
 
         if reports.is_empty() {
