@@ -32,6 +32,19 @@ use tokio::{
 use tracing::{debug, error, info};
 
 const VERIFY_BATCH_SIZE: usize = 128;
+const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+
+#[inline]
+fn hex_encode_u32(val: u32, out: &mut [u8]) {
+    out[0] = HEX_CHARS[((val >> 28) & 0xF) as usize];
+    out[1] = HEX_CHARS[((val >> 24) & 0xF) as usize];
+    out[2] = HEX_CHARS[((val >> 20) & 0xF) as usize];
+    out[3] = HEX_CHARS[((val >> 16) & 0xF) as usize];
+    out[4] = HEX_CHARS[((val >> 12) & 0xF) as usize];
+    out[5] = HEX_CHARS[((val >> 8) & 0xF) as usize];
+    out[6] = HEX_CHARS[((val >> 4) & 0xF) as usize];
+    out[7] = HEX_CHARS[(val & 0xF) as usize];
+}
 
 pub struct Aggregator {
     addr: String,
@@ -129,17 +142,51 @@ impl Aggregator {
     }
 
     async fn handle_batch_stream(socket: &mut TcpStream, state: Arc<AggregatorState>, num_batches: usize) {
+        let mut total_reports = 0usize;
+        let mut context_set = false;
+
         for _ in 0..num_batches {
             let message = match read_message(socket).await {
                 Ok(msg) => msg,
                 Err(_) => break,
             };
             if let Message::BatchEncryptedClientReports { context, reports } = message {
-                Self::store_batch_client_reports(state.clone(), context, reports).await.ok();
+                if reports.is_empty() {
+                    continue;
+                }
+
+                // First batch sets up context
+                if !context_set {
+                    if Self::require_context_registered(&state, context).is_err() {
+                        continue;
+                    }
+                    Self::set_or_check_context(&state, context).await.ok();
+                    Self::start_reporting_timer(&state).await;
+                    context_set = true;
+                }
+
+                // Direct insert without spawn_blocking - we're already in our own task
+                let mut batch = sled::Batch::default();
+                let mut key = [0u8; 19];
+                key[0] = b'r';
+                key[1] = b'/';
+                key[10] = b'/';
+                hex_encode_u32(context, &mut key[2..10]);
+
+                for (id, envelope_bytes) in reports {
+                    hex_encode_u32(id, &mut key[11..19]);
+                    batch.insert(&key[..], envelope_bytes);
+                    total_reports += 1;
+                }
+                state.db.apply_batch(batch).ok();
             }
         }
-        // Flush DB once at end of stream
+
+        // Flush and update counters once at end
         state.db.flush_async().await.ok();
+        if total_reports > 0 {
+            Self::maybe_log_threshold_reached(&state, total_reports).await;
+        }
     }
 
     async fn respond(socket: &mut TcpStream, result: Result<()>) {
@@ -336,13 +383,23 @@ impl Aggregator {
         let batch_size = reports.len();
         let db = state.db.clone();
 
-        // Use sled's Batch for atomic bulk insert
-        let mut batch = sled::Batch::default();
-        for (id, envelope_bytes) in reports {
-            let key = format!("r/{context:08x}/{id:08x}");
-            batch.insert(key.as_bytes(), envelope_bytes);
-        }
-        db.apply_batch(batch)?;
+        // Build batch in blocking task to avoid blocking async runtime
+        tokio::task::spawn_blocking(move || {
+            let mut batch = sled::Batch::default();
+            // Pre-allocate key buffer: "r/" + 8 hex + "/" + 8 hex = 19 bytes
+            let mut key = [0u8; 19];
+            key[0] = b'r';
+            key[1] = b'/';
+            key[10] = b'/';
+            // Write context once
+            hex_encode_u32(context, &mut key[2..10]);
+            
+            for (id, envelope_bytes) in reports {
+                hex_encode_u32(id, &mut key[11..19]);
+                batch.insert(&key[..], envelope_bytes);
+            }
+            db.apply_batch(batch)
+        }).await??;
 
         Self::maybe_log_threshold_reached(&state, batch_size).await;
         Ok(())
