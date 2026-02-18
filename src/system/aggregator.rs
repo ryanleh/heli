@@ -1,5 +1,4 @@
 use crate::{
-    BATCH_REPORT_SIZE,
     agg_only_enc::{AggOnlyEnc, Ciphertext},
     crypto::{
         G,
@@ -341,12 +340,37 @@ impl Aggregator {
             _ => return Err(anyhow!("Expected SimulateSetup or KeyCommsBatch")),
         }
 
-        // Persist key commitments
+        // Persist key commitments - serialize in parallel chunks for speed
         let db = state.db.clone();
+        let num_clients = state.num_clients;
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let serialized = bincode::serialize(&key_commitments)?;
+            use rayon::prelude::*;
+            
+            let serialize_start = Instant::now();
+            
+            // Serialize chunks in parallel
+            const CHUNK_SIZE: usize = 100_000;
+            let serialized_chunks: Vec<Vec<u8>> = key_commitments
+                .par_chunks(CHUNK_SIZE)
+                .map(|chunk| bincode::serialize(chunk).unwrap())
+                .collect();
+            
+            // Combine chunks with length prefixes for deserialization
+            let total_len: usize = serialized_chunks.iter().map(|c| c.len()).sum();
+            let mut serialized = Vec::with_capacity(total_len + 8 + serialized_chunks.len() * 8);
+            serialized.extend_from_slice(&(num_clients as u64).to_le_bytes());
+            for chunk in serialized_chunks {
+                serialized.extend_from_slice(&(chunk.len() as u64).to_le_bytes());
+                serialized.extend(chunk);
+            }
+            
+            info!("Serialized {} key commitments in {:?}", num_clients, serialize_start.elapsed());
+            
+            let write_start = Instant::now();
             db.insert(b"kc", serialized)?;
             db.flush()?;
+            info!("Wrote key commitments to DB in {:?}", write_start.elapsed());
+            
             Ok(())
         }).await??;
 
@@ -480,9 +504,8 @@ impl Aggregator {
 
     fn get_vk(state: Arc<AggregatorState>, context: u32) -> Result<VerifierKey> {
         let g_comm = Proof::get_g_comm();
-        let key_commitments: Vec<G> = bincode::deserialize(
-            &state.db.get(b"kc")?.ok_or_else(|| anyhow!("No key commitments in DB"))?,
-        )?;
+        let data = state.db.get(b"kc")?.ok_or_else(|| anyhow!("No key commitments in DB"))?;
+        let key_commitments = Self::deserialize_key_commitments(&data)?;
 
         let (is_binary, bitlength) = Self::get_proof_type_from_db(&state, context)?
             .ok_or_else(|| anyhow!("Proof type not found for context {context:08x}"))?;
@@ -492,6 +515,35 @@ impl Aggregator {
         } else {
             VerifierKey::Range { g_comm, key_commitments, bitlength: bitlength.unwrap() }
         })
+    }
+
+    fn deserialize_key_commitments(data: &[u8]) -> Result<Vec<G>> {
+        use rayon::prelude::*;
+        
+        // Format: num_clients (u64) + [chunk_len (u64) + chunk_data]*
+        let num_clients = u64::from_le_bytes(data[0..8].try_into()?) as usize;
+        let mut offset = 8;
+        let mut chunks_data = Vec::new();
+        
+        while offset < data.len() {
+            let chunk_len = u64::from_le_bytes(data[offset..offset+8].try_into()?) as usize;
+            offset += 8;
+            chunks_data.push(&data[offset..offset+chunk_len]);
+            offset += chunk_len;
+        }
+        
+        // Deserialize chunks in parallel
+        let chunks: Vec<Vec<G>> = chunks_data
+            .into_par_iter()
+            .map(|chunk_data| bincode::deserialize(chunk_data).unwrap())
+            .collect();
+        
+        let mut result = Vec::with_capacity(num_clients);
+        for chunk in chunks {
+            result.extend(chunk);
+        }
+        
+        Ok(result)
     }
 
     // --- Aggregation ---
@@ -504,19 +556,68 @@ impl Aggregator {
 
         // Build list of client IDs to process
         let num_to_process = if simulated {
-            state.num_reported.load(Ordering::SeqCst)
+            // For simulated mode, get participating count from stored dropout info
+            let dropouts = Self::get_sim_dropouts(&state, context).unwrap_or_default();
+            state.num_clients - dropouts.len()
         } else {
             state.num_clients
         };
-        let client_ids: Vec<u32> = if simulated {
-            (0..num_to_process).map(|i| (i % BATCH_REPORT_SIZE) as u32).collect()
-        } else {
-            (0..num_to_process as u32).collect()
-        };
+        info!("Processing {} reports (simulated: {})", num_to_process, simulated);
 
         let db = state.db.clone();
         let hpke_sk = state.hpke_keys.sk.clone();
         let load_chunk_size = state.agg_chunk_size;
+
+        fn process_chunk(
+            hpke_sk: &<hpke::kem::X25519HkdfSha256 as hpke::Kem>::PrivateKey,
+            vk: &VerifierKey,
+            context: u32,
+            reports: Vec<(u32, Vec<u8>)>,
+        ) -> (Vec<u32>, Option<Ciphertext>, std::time::Duration, std::time::Duration, std::time::Duration) {
+            // Parallel decrypt
+            let decrypt_start = Instant::now();
+            let decrypted: Vec<_> = reports.into_par_iter().filter_map(|(id, data)| {
+                let envelope: crate::crypto::hpke::HpkeEnvelope = bincode::deserialize(&data).ok()?;
+                let (report_bytes, _) = hpke_decrypt(hpke_sk, &envelope, b"", b"").ok()?;
+                let Message::ClientReport { proof, ciphertext } = bincode::deserialize(&report_bytes).ok()? else {
+                    return None;
+                };
+                Some((id, proof, ciphertext))
+            }).collect();
+            let decrypt_time = decrypt_start.elapsed();
+
+            // Parallel verify in batches
+            let verify_start = Instant::now();
+            let verify_chunks: Vec<_> = decrypted.chunks(VERIFY_BATCH_SIZE).collect();
+            let verified: Vec<_> = verify_chunks.into_par_iter().filter_map(|chunk| {
+                let ids: Vec<u32> = chunk.iter().map(|(id, _, _)| *id).collect();
+                let proofs: Vec<_> = chunk.iter().map(|(_, p, _)| p.clone()).collect();
+                let cts: Vec<_> = chunk.iter().map(|(_, _, c)| c.clone()).collect();
+                
+                let mut seed = [0u8; 32];
+                OsRng.fill_bytes(&mut seed);
+                Proof::batch_verify(vk, &cts, context, &proofs, &ids, &mut ChaCha20Rng::from_seed(seed))
+                    .ok().map(|_| (ids, cts))
+            }).collect();
+            let verify_time = verify_start.elapsed();
+
+            // Aggregate
+            let agg_start = Instant::now();
+            let mut online = Vec::new();
+            let mut agg: Option<Ciphertext> = None;
+            for (ids, cts) in verified {
+                online.extend(ids);
+                let chunk_agg = cts.into_iter().reduce(|a, b| a + b);
+                agg = match (agg, chunk_agg) {
+                    (Some(a), Some(b)) => Some(a + b),
+                    (Some(a), None) => Some(a),
+                    (None, b) => b,
+                };
+            }
+            let agg_time = agg_start.elapsed();
+
+            (online, agg, decrypt_time, verify_time, agg_time)
+        }
 
         let result = tokio::task::spawn_blocking(move || {
             let mut total_load = std::time::Duration::ZERO;
@@ -543,10 +644,14 @@ impl Aggregator {
                 }
 
                 // Process in chunks, duplicating from unique reports
-                let total_chunks = (client_ids.len() + load_chunk_size - 1) / load_chunk_size;
-                for (chunk_idx, chunk) in client_ids.chunks(load_chunk_size).enumerate() {
-                    let reports: Vec<(u32, Vec<u8>)> = chunk.iter().map(|&id| {
-                        let src_idx = (id as usize) % unique_reports.len();
+                let total_chunks = (num_to_process + load_chunk_size - 1) / load_chunk_size;
+                for chunk_idx in 0..total_chunks {
+                    let chunk_start = chunk_idx * load_chunk_size;
+                    let chunk_end = (chunk_start + load_chunk_size).min(num_to_process);
+                    
+                    let reports: Vec<(u32, Vec<u8>)> = (chunk_start..chunk_end).map(|i| {
+                        let id = i as u32;
+                        let src_idx = i % unique_reports.len();
                         (id, unique_reports[src_idx].clone())
                     }).collect();
 
@@ -616,57 +721,6 @@ impl Aggregator {
                 total_load, total_decrypt, total_verify, total_agg);
             Ok::<_, anyhow::Error>((all_online, aggregate))
         }).await;
-
-        fn process_chunk(
-            hpke_sk: &<hpke::kem::X25519HkdfSha256 as hpke::Kem>::PrivateKey,
-            vk: &VerifierKey,
-            context: u32,
-            reports: Vec<(u32, Vec<u8>)>,
-        ) -> (Vec<u32>, Option<Ciphertext>, std::time::Duration, std::time::Duration, std::time::Duration) {
-            // Parallel decrypt
-            let decrypt_start = Instant::now();
-            let decrypted: Vec<_> = reports.into_par_iter().filter_map(|(id, data)| {
-                let envelope: crate::crypto::hpke::HpkeEnvelope = bincode::deserialize(&data).ok()?;
-                let (report_bytes, _) = hpke_decrypt(hpke_sk, &envelope, b"", b"").ok()?;
-                let Message::ClientReport { proof, ciphertext } = bincode::deserialize(&report_bytes).ok()? else {
-                    return None;
-                };
-                Some((id, proof, ciphertext))
-            }).collect();
-            let decrypt_time = decrypt_start.elapsed();
-
-            // Parallel verify in batches
-            let verify_start = Instant::now();
-            let verify_chunks: Vec<_> = decrypted.chunks(VERIFY_BATCH_SIZE).collect();
-            let verified: Vec<_> = verify_chunks.into_par_iter().filter_map(|chunk| {
-                let ids: Vec<u32> = chunk.iter().map(|(id, _, _)| *id).collect();
-                let proofs: Vec<_> = chunk.iter().map(|(_, p, _)| p.clone()).collect();
-                let cts: Vec<_> = chunk.iter().map(|(_, _, c)| c.clone()).collect();
-                
-                let mut seed = [0u8; 32];
-                OsRng.fill_bytes(&mut seed);
-                Proof::batch_verify(vk, &cts, context, &proofs, &ids, &mut ChaCha20Rng::from_seed(seed))
-                    .ok().map(|_| (ids, cts))
-            }).collect();
-            let verify_time = verify_start.elapsed();
-
-            // Aggregate
-            let agg_start = Instant::now();
-            let mut online = Vec::new();
-            let mut agg: Option<Ciphertext> = None;
-            for (ids, cts) in verified {
-                online.extend(ids);
-                let chunk_agg = cts.into_iter().reduce(|a, b| a + b);
-                agg = match (agg, chunk_agg) {
-                    (Some(a), Some(b)) => Some(a + b),
-                    (Some(a), None) => Some(a),
-                    (None, b) => b,
-                };
-            }
-            let agg_time = agg_start.elapsed();
-
-            (online, agg, decrypt_time, verify_time, agg_time)
-        }
 
         let online_count = result.as_ref().ok().and_then(|r| r.as_ref().ok()).map(|(c, _)| c.len()).unwrap_or(0);
         info!("Aggregation for context {context}: {online_count} online clients (simulated: {simulated})");
