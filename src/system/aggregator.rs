@@ -20,7 +20,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Mutex, OnceCell, RwLock, mpsc},
@@ -42,15 +42,14 @@ pub struct AggregatorState {
     db: Db,
     hpke_keys: ServerKeys,
     current_ctx: RwLock<Option<u32>>,
-    /// Set when client sends SimulatedBatchComing; aggregation failure then returns dummy result. Cleared after responding to AggregationRequest.
-    simulated_round: std::sync::atomic::AtomicBool,
+    simulated_round: std::sync::atomic::AtomicBool, // Used with simulated reports
 
     // Channels for communicating decryption masks and aggregation results
     request_send: OnceCell<mpsc::Sender<Message>>,
     mask_recv: Mutex<Option<mpsc::Receiver<Message>>>,
 
-    // Benchmarking state (only works for single round)
-    reporting_start: OnceCell<std::time::Instant>,
+    // Benchmarking state
+    reporting_start: RwLock<Option<time::Instant>>,
     num_reported: AtomicUsize,
 }
 
@@ -83,7 +82,7 @@ impl Aggregator {
             simulated_round: std::sync::atomic::AtomicBool::new(false),
             request_send: OnceCell::new(),
             mask_recv: Mutex::new(None),
-            reporting_start: OnceCell::new(),
+            reporting_start: Mutex::new(None),
             num_reported: AtomicUsize::new(0),
         });
 
@@ -122,8 +121,6 @@ impl Aggregator {
         };
 
         // Handle the request
-        //
-        // TODO: Better error handling + formatting
         match message {
             Message::DecryptorInit {} => {
                 // Channel for asking for + receiving decryption masks
@@ -174,7 +171,7 @@ impl Aggregator {
                 }
             }
             Message::AggregationRequest { context } => {
-                let request_start = std::time::Instant::now();
+                let request_start = time::Instant::now();
                 info!("Aggregation request for context {}", context);
                 match Self::aggregate(state.clone(), context).await {
                     Ok(result) => {
@@ -243,19 +240,20 @@ impl Aggregator {
             // Normal setup: receive key commitments from decryptor or SimulateSetup
             write_message(&mut socket, &Message::Success {}).await?;
 
-            let mut setup_start: Option<std::time::Instant> = None;
+            let mut setup_start: time::Instant;
             let mut received_commitments = 0usize;
             let mut key_commitments = vec![G::generator(); state.num_clients];
 
             let first_message = read_message(&mut socket).await?;
             if matches!(first_message, Message::SimulateSetup {}) {
                 // Simulated setup: compute key commitments locally from hardcoded PRF key
-                setup_start = Some(std::time::Instant::now());
+                setup_start = time::Instant::now();
                 let num_clients = state.num_clients;
                 let g_comm = Proof::get_g_comm();
                 key_commitments = tokio::task::spawn_blocking(move || {
                     let prf = ScalarPRF::new(&SIMULATE_PRF_KEY);
                     (0..num_clients)
+                        .into_par_iter()
                         .map(|i| g_comm * prf.evaluate(i as u64))
                         .collect::<Vec<_>>()
                 })
@@ -267,10 +265,7 @@ impl Aggregator {
                 );
                 write_message(&mut socket, &Message::Success {}).await?;
             } else if let Message::KeyCommsBatch { key_comms } = first_message {
-                // Start timing on first key commitment message received
-                if setup_start.is_none() {
-                    setup_start = Some(std::time::Instant::now());
-                }
+                setup_start = time::Instant::now();
                 received_commitments += key_comms.len();
                 for (idx, key_comm) in key_comms.into_iter() {
                     key_commitments[idx as usize] = key_comm;
@@ -282,9 +277,6 @@ impl Aggregator {
                 // Receive remaining batches
                 while received_commitments < state.num_clients {
                     let message = read_message(&mut socket).await?;
-                    if setup_start.is_none() {
-                        setup_start = Some(std::time::Instant::now());
-                    }
                     let key_comms_batch = match message {
                         Message::KeyCommsBatch { key_comms } => key_comms,
                         _ => {
@@ -319,16 +311,14 @@ impl Aggregator {
             })
             .await??;
 
-            if let Some(start) = setup_start {
-                let setup_elapsed = start.elapsed();
-                info!(
-                    "Setup complete: received {} key commitments in {:?}",
-                    num_clients, setup_elapsed
-                );
-                info!("Sent {:?}B", bytes_sent());
-                info!("Recv {:?}B", bytes_recv());
-                reset_byte_counters();
-            }
+            let setup_elapsed = start.elapsed();
+            info!(
+                "Setup complete: received {} key commitments in {:?}",
+                num_clients, setup_elapsed
+            );
+            info!("Sent {:?}B", bytes_sent());
+            info!("Recv {:?}B", bytes_recv());
+            reset_byte_counters();
         }
 
         // Process requests for decryption masks
@@ -365,7 +355,7 @@ impl Aggregator {
         }
 
         if !state.reporting_start.initialized() {
-            state.reporting_start.set(std::time::Instant::now())?;
+            state.reporting_start.set(time::Instant::now())?;
         }
 
         // Store the HPKE envelope directly in the database
@@ -429,7 +419,7 @@ impl Aggregator {
         }
 
         if !state.reporting_start.initialized() {
-            state.reporting_start.set(std::time::Instant::now())?;
+            state.reporting_start.set(time::Instant::now())?;
         }
 
         // Store all HPKE envelopes in the database in a single batch operation
@@ -510,7 +500,7 @@ impl Aggregator {
         drop(current_ctx);
 
         // Record wall-clock aggregation time
-        let wall_clock_start = std::time::Instant::now();
+        let wall_clock_start = time::Instant::now();
 
         // Initialize the verification key
         let vk = Self::get_vk(state.clone())?;
@@ -548,7 +538,7 @@ impl Aggregator {
                         let mut decrypt_time = Duration::ZERO;
                         for id in start..=end {
                             // Read from DB
-                            let load_start = std::time::Instant::now();
+                            let load_start = time::Instant::now();
                             let key = format!("r/{context:08x}/{id:08x}");
                             let value = match state_clone.db.get(key.as_bytes())? {
                                 Some(v) => v,
@@ -557,7 +547,7 @@ impl Aggregator {
                             load_time += load_start.elapsed();
 
                             // HPKE decrypt
-                            let decrypt_start = std::time::Instant::now();
+                            let decrypt_start = time::Instant::now();
                             let envelope: crate::crypto::hpke::HpkeEnvelope =
                                 bincode::deserialize(&value)?;
                             let (report_bytes, _) = hpke_decrypt(&hpke_sk, &envelope, b"", b"")?;
@@ -566,7 +556,7 @@ impl Aggregator {
                             // Decode
                             //
                             // NOTE: This is a rather big overhead at the moment for some reason
-                            let decode_start = std::time::Instant::now();
+                            let decode_start = time::Instant::now();
                             let report: Message = bincode::deserialize(&report_bytes)?;
                             let (proof, ciphertext) = match report {
                                 Message::ClientReport {
@@ -588,7 +578,7 @@ impl Aggregator {
                         }
 
                         // Batch verify
-                        let verify_start = std::time::Instant::now();
+                        let verify_start = time::Instant::now();
 
                         // Seed a new (fast) RNG we can send across threads
                         let mut seed = [0u8; 32];
@@ -606,7 +596,7 @@ impl Aggregator {
                         let verify_time = verify_start.elapsed();
 
                         // Aggregate
-                        let aggregate_start = std::time::Instant::now();
+                        let aggregate_start = time::Instant::now();
                         let chunk_aggregate = chunk_ciphertexts
                             .into_iter()
                             .reduce(|a, b| a + b)
@@ -683,7 +673,7 @@ impl Aggregator {
         let aggregate = aggregate.ok_or(anyhow!("No valid reports"))?;
 
         // Request decryption mask from the decryptor
-        let decrypt_start = std::time::Instant::now();
+        let decrypt_start = time::Instant::now();
         let request_send = state
             .request_send
             .get()

@@ -96,10 +96,9 @@ impl Client {
         })
     }
 
-    /// Trigger simulated setup: send SimulateSetup to the decryptor (no attestation).
-    /// Call once before creating clients with `new_simulated`. Decryptor and aggregator
-    /// will use the hardcoded PRF key to compute keys locally.
-    pub async fn trigger_simulate_setup(decryptor_addr: &str) -> Result<()> {
+    // Simulated registration for benchmarking. No verification is performed, keys are derived
+    // from a hardcoded PRF.
+    pub async fn trigger_sim_setup(decryptor_addr: &str) -> Result<()> {
         let mut socket = TcpStream::connect(decryptor_addr).await?;
         write_message(&mut socket, &Message::SimulateSetup {}).await?;
         let response = read_message(&mut socket).await?;
@@ -110,8 +109,7 @@ impl Client {
         }
     }
 
-    /// Create a client for simulated mode: eval key is derived from the hardcoded PRF key.
-    /// Use after calling `trigger_simulate_setup`. No registration with decryptor.
+    // Derive a client from a hardcoded PRF.
     pub fn new_simulated(
         id: u32,
         aggregator_addr: &str,

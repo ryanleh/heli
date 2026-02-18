@@ -9,12 +9,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// Hardcoded PRF key for simulated setup (no attestation). All parties use this to
-/// derive eval keys and key commitments locally so setup is instant for large N.
+/// Hardcoded PRF key for simulated setup (no attestation). 
 pub const SIMULATE_PRF_KEY: [u8; 32] = [
     0x73, 0x69, 0x6d, 0x75, 0x6c, 0x61, 0x74, 0x65, 0x5f, 0x68, 0x65, 0x6c, 0x69, 0x5f, 0x65, 0x32,
     0x65, 0x5f, 0x74, 0x65, 0x73, 0x74, 0x5f, 0x6b, 0x65, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-]; // "simulate_heli_e2e_test_key" + zero-pad
+];
 
 // Global byte counters for network traffic
 static BYTES_SENT: AtomicU64 = AtomicU64::new(0);
@@ -45,6 +44,7 @@ pub enum Message {
         id: u32,
         eval_key: EvalKey,
     },
+    SimulateSetup {},
 
     ClientReport {
         ciphertext: Ciphertext,
@@ -63,15 +63,16 @@ pub enum Message {
         reports: Vec<(u32, u32, HpkeEnvelope)>, // (id, context, envelope)
     },
 
-    /// Client sends this before submitting batches from sim-generate; aggregator then treats aggregation failure as success (dummy result).
+    /// Client sends this when running `sim-generate` to inform the aggregator
+    /// that submissions are simulated
     SimulatedBatchComing {},
 
+    // Decryptor sends this to initialize connection with aggregator
     DecryptorInit {},
+
     /// Sent by aggregator when setup is already complete (key commitments exist)
     SetupAlreadyComplete {},
-    /// Trigger simulated setup: no attestation; each party uses SIMULATE_PRF_KEY locally.
-    /// Client -> Decryptor, then Decryptor -> Aggregator.
-    SimulateSetup {},
+
     KeyCommsBatch {
         key_comms: Vec<(u32, G)>, // (idx, key_comm)
     },

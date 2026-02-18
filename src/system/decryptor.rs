@@ -31,12 +31,6 @@ pub struct Decryptor {
 /// Batch size for sending key commitments to the aggregator
 const BATCH_SIZE: usize = 1024;
 
-/// What to send to the aggregator during setup: key commitment batches (normal) or a Simulate signal.
-enum SetupToAggregator {
-    KeyCommsBatch(Vec<(u32, G)>),
-    Simulate,
-}
-
 pub(crate) struct DecryptorState {
     num_clients: usize,
     threshold: usize,
@@ -46,15 +40,18 @@ pub(crate) struct DecryptorState {
     db: Db,
 
     // State for one-time setup
-    keygen_prf: Arc<ScalarPRF>,
+    keygen_prf: RwLock<ScalarPRF>,
     next_client_index: AtomicUsize,
-    ek_send: mpsc::UnboundedSender<(u32, Scalar)>, // TODO: Test speed of bounded
+    ek_send: mpsc::UnboundedSender<ClientKey>,
     sk_recv: Mutex<Option<oneshot::Receiver<Scalar>>>,
-    /// Sends key commitment batches (normal setup) or Simulate (simulated setup) to aggregator_task
-    setup_send: mpsc::UnboundedSender<SetupToAggregator>,
 
     // Benchmarking stuff
     setup_start: OnceCell<std::time::Instant>,
+}
+
+enum ClientKey {
+    Simulate, // Triggers simulated setup
+    Key(u32, Scalar),
 }
 
 // NOTE: Lots of small race conditions here
@@ -80,70 +77,21 @@ impl Decryptor {
         // Channel for communicating secret key after setup
         let (sk_send, sk_recv) = oneshot::channel();
 
-        // Channel for setup: key commitment batches (normal) or Simulate (simulated setup)
-        let (setup_send, setup_recv) = mpsc::unbounded_channel();
-        let setup_send_for_key_agg = setup_send.clone();
+        // Channel for streaming key commitments to aggregator
+        let (kc_send, kc_recv) = mpsc::unbounded_channel();
 
-        // Only spawn the key aggregation task if we don't have a saved key
-        if saved_secret_key.is_none() {
-            // Spawn task for aggregating evaluation keys and computing key commitments
-            tokio::spawn(async move {
-                let g_comm = Proof::get_g_comm();
-                let mut prf_key = Scalar::ZERO;
-                let mut key_comms: Vec<(u32, G)> = Vec::new();
-
-                // Receive all of the evaluation keys
-                let mut received_count = 0;
-                while received_count < num_clients {
-                    match ek_recv.recv().await {
-                        Some((client_idx, ek)) => {
-                            // Accumulate PRF key
-                            prf_key += ek;
-
-                            // Compute key commitment: g_comm * ek
-                            let key_comm = g_comm * ek;
-                            key_comms.push((client_idx, key_comm));
-                            received_count += 1;
-
-                            // If batch is full or this is the last key, send key_comms to the
-                            // aggregator
-                            if key_comms.len() >= BATCH_SIZE || received_count == num_clients {
-                                let to_send = std::mem::take(&mut key_comms);
-                                if let Err(e) =
-                                    setup_send_for_key_agg.send(SetupToAggregator::KeyCommsBatch(to_send))
-                                {
-                                    error!("Error when sending key commitments: {}", e);
-                                }
-                            }
-                        }
-                        None => {
-                            error!("Evaluation key channel closed early");
-                            break;
-                        }
-                    }
-                }
-
-                // Return the final aggregate key
-                if let Err(e) = sk_send.send(prf_key) {
-                    error!("Failed to return secret key: {:?}", e);
-                }
-            });
-        }
-
-        // Initialize or load the keygen PRF
-        let keygen_prf = if let Some(ref sk) = saved_secret_key {
-            sk.keygen_prf.clone()
+        // Initialize or load keys + PRFs
+        let secret_key_cell = OnceCell::new();
+        let keygen_prf = if let Some(sk) = saved_secret_key {
+            info!("Loaded secret key from database");
+            let keygen_prf = sk.keygen_prf.clone();
+            secret_key_cell.set(sk).ok();
+            keygen_prf
         } else {
             let mut keygen_prf_key = [0u8; 32];
             OsRng.fill_bytes(&mut keygen_prf_key);
             ScalarPRF::new(&keygen_prf_key)
         };
-
-        let secret_key_cell = OnceCell::new();
-        if let Some(sk) = saved_secret_key {
-            info!("Loaded secret key from database");
-            secret_key_cell.set(sk).ok();
-        }
 
         let state = Arc::new(DecryptorState {
             num_clients,
@@ -152,19 +100,110 @@ impl Decryptor {
             secret_key: secret_key_cell,
             current_ctx: RwLock::new(None),
             db,
-            keygen_prf: Arc::new(keygen_prf),
+            keygen_prf: RwLock::new(keygen_prf),
             next_client_index: AtomicUsize::new(0),
             ek_send,
             sk_recv: Mutex::new(Some(sk_recv)),
-            setup_send,
             setup_start: OnceCell::new(),
         });
+
+        // If we don't have a saved key, spawn a task to compute the new one
+        if saved_secret_key.is_none() {
+            // Spawn task for aggregating evaluation keys and computing key commitments
+            let n_clients = num_clients;
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                let prf_key = match ek_recv.recv().await {
+                    Simulate => {
+                        // If simulating, generate all of the key commitments using the hardcoded
+                        // PRF key
+                        let prf_key = match tokio::task::spawn_blocking(move || {
+                            let keygen_prf = ScalarPRF::new(&SIMULATE_PRF_KEY);
+                            let mut key = Scalar::ZERO;
+                            for i in 0..num_clients {
+                                key += keygen_prf.evaluate(i as u64);
+                            }
+                            prf_key,
+                        }).await
+                        {
+                            Ok(sk) => sk,
+                            Err(e) => {
+                                error!("Simulated setup spawn_blocking failed: {:?}", e);
+                                return;
+                            }
+                        };
+
+
+                // Save to database
+                state
+                    .db
+                    .insert(b"secret_key", bincode::serialize(&secret_key)?)?;
+                state.db.flush()?;
+                info!("Saved secret key to database");
+
+                // Set the secret key
+                state
+                    .secret_key
+                    .set(secret_key)
+                    .map_err(|_| anyhow!("Failed to set secret key"))?;
+
+                        prf_key
+                    },
+                    Key(client_idx, ek) => {
+                        let g_comm = Proof::get_g_comm();
+                        let mut key_comms: Vec<(u32, G)> = Vec::with_capacity(n_clients);
+                        let mut prf_key = Scalar::ZERO;
+
+                        // Add in the initial key
+                        let mut prf_key += ek;
+                        key_comms.push((client_idx, g_comm * ek));
+                        let mut received_count = 1;
+
+                        // Receive the rest of the evaluation keys
+                        while received_count < num_clients {
+                            match ek_recv.recv().await {
+                                Some((client_idx, ek)) => {
+                                    // Accumulate PRF key
+                                    prf_key += ek;
+
+                                    // Compute key commitment: g_comm * ek
+                                    let key_comm = g_comm * ek;
+                                    key_comms.push((client_idx, key_comm));
+                                    received_count += 1;
+
+                                    // If batch is full or this is the last key, send key_comms to the
+                                    // aggregator
+                                    if key_comms.len() >= BATCH_SIZE || received_count == num_clients {
+                                        let to_send = std::mem::take(&mut key_comms);
+                                        if let Err(e) =
+                                            kc_send.send(SetupToAggregator::KeyCommsBatch(to_send))
+                                        {
+                                            error!("Error when sending key commitments: {}", e);
+                                        }
+                                    }
+                                }
+                                None => {
+                                    error!("Evaluation key channel closed early");
+                                    break;
+                                }
+                            }
+                        }
+                        prf_key
+                    }
+                };
+                
+                // Return the final aggregate key
+                if let Err(e) = sk_send.send(prf_key) {
+                    error!("Failed to return secret key: {:?}", e);
+                }
+            });
+        }
 
         // Spawn task to communicate with the aggregator
         let aggregator_addr = aggregator_addr.to_string();
         let state_clone = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = Self::aggregator_task(aggregator_addr, state_clone, setup_recv).await {
+            if let Err(e) = Self::aggregator_task(aggregator_addr, state_clone, kc_recv).await {
                 error!("Error communicating with aggregator: {e:?}");
             }
         });
@@ -193,6 +232,18 @@ impl Decryptor {
                             }
                         };
                         if matches!(first, Message::SimulateSetup {}) {
+
+                            // TODO: If we get simulate send something on the channel to emulate
+
+                            // Send the key share to the aggregating thread
+                            if let Err(e) = state.ek_send.send((client_index as u32, ek)) {
+                                error!(
+                                    "Failed to send client {} eval key to aggregator thread: {}",
+                                    client_index, e
+                                );
+                                return Err(anyhow!("Internal error: failed to update secret key"));
+                            }
+
                             if let Err(e) =
                                 Self::handle_simulate_setup(&mut socket, state_clone).await
                             {
