@@ -19,7 +19,6 @@ struct TestConfig {
     num_clients: usize,
     threshold: usize,
     length: usize,
-    bitlength: usize,
     decryptor_addr: String,
     aggregator_addr: String,
     prover: ProverType,
@@ -31,7 +30,6 @@ impl TestConfig {
             num_clients,
             threshold: num_clients,
             length,
-            bitlength: 1,
             decryptor_addr: format!("127.0.0.1:{}", 18000 + rand::random::<u16>() % 1000),
             aggregator_addr: format!("127.0.0.1:{}", 19000 + rand::random::<u16>() % 1000),
             prover: ProverType::Binary,
@@ -43,7 +41,6 @@ impl TestConfig {
             num_clients,
             threshold: num_clients,
             length,
-            bitlength,
             decryptor_addr: format!("127.0.0.1:{}", 20000 + rand::random::<u16>() % 1000),
             aggregator_addr: format!("127.0.0.1:{}", 21000 + rand::random::<u16>() % 1000),
             prover: ProverType::Range(bitlength),
@@ -247,6 +244,28 @@ async fn test_end_to_end_impl(
             }
         }
 
+        // Register context config before reports
+        let (binary, bitlength) = match config.prover {
+            ProverType::Binary => (true, None),
+            ProverType::Range(bl) => (false, Some(bl)),
+        };
+        let mut reg_socket = TcpStream::connect(&config.aggregator_addr).await?;
+        write_message(
+            &mut reg_socket,
+            &Message::SetContextConfig {
+                context: round,
+                binary,
+                bitlength,
+                simulated: false,
+                sim_dropouts: vec![],
+            },
+        )
+        .await?;
+        let reg_resp = read_message(&mut reg_socket).await?;
+        if !matches!(reg_resp, Message::Success {}) {
+            return Err(anyhow!("SetContextConfig failed: {:?}", reg_resp));
+        }
+
         // Clients submit reports for this round
         for i in 0..num_submitting {
             clients[i].report(round, &client_inputs[i]).await?;
@@ -359,7 +378,7 @@ async fn test_end_to_end_simulated_setup() -> Result<()> {
     sleep(Duration::from_millis(100)).await;
 
     // Simulated setup: one RPC to decryptor, decryptor and aggregator do local setup
-    Client::trigger_simulate_setup(&config.decryptor_addr).await?;
+    Client::trigger_sim_setup(&config.decryptor_addr).await?;
 
     // Wait for decryptor→aggregator SimulateSetup to complete
     sleep(Duration::from_millis(200)).await;
@@ -386,6 +405,27 @@ async fn test_end_to_end_simulated_setup() -> Result<()> {
             expected_sums[j] += val;
         }
         client_inputs.push(inputs);
+    }
+
+    let (binary, bitlength) = match config.prover {
+        ProverType::Binary => (true, None),
+        ProverType::Range(bl) => (false, Some(bl)),
+    };
+    let mut reg_socket = TcpStream::connect(&config.aggregator_addr).await?;
+    write_message(
+        &mut reg_socket,
+        &Message::SetContextConfig {
+            context: 0,
+            binary,
+            bitlength,
+            simulated: false,
+            sim_dropouts: vec![],
+        },
+    )
+    .await?;
+    let reg_resp = read_message(&mut reg_socket).await?;
+    if !matches!(reg_resp, Message::Success {}) {
+        return Err(anyhow!("SetContextConfig failed: {:?}", reg_resp));
     }
 
     for (i, client) in clients.iter().enumerate() {

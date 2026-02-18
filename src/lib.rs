@@ -7,6 +7,9 @@
 #![deny(unused_comparisons, bare_trait_objects, unused_must_use)]
 #![forbid(unsafe_code)]
 
+/// Number of unique reports generated in simulated mode.
+pub const BATCH_REPORT_SIZE: usize = 1024;
+
 /// Crypto primitives: ElGamal encryption, PRFs
 pub mod crypto;
 

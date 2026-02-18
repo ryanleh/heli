@@ -63,9 +63,16 @@ pub enum Message {
         reports: Vec<(u32, u32, HpkeEnvelope)>, // (id, context, envelope)
     },
 
-    /// Client sends this when running `sim-generate` to inform the aggregator
-    /// that submissions are simulated
-    SimulatedBatchComing {},
+    /// Register context config before sending reports. Required once per context.
+    /// Sets proof type (binary or range with bitlength) and whether reports are simulated.
+    /// For simulated runs, includes the list of dropped-out client IDs.
+    SetContextConfig {
+        context: u32,
+        binary: bool,
+        bitlength: Option<usize>,
+        simulated: bool,
+        sim_dropouts: Vec<u32>,
+    },
 
     // Decryptor sends this to initialize connection with aggregator
     DecryptorInit {},
@@ -78,7 +85,9 @@ pub enum Message {
     },
     DecryptMaskRequest {
         context: u32,
-        dropouts: Vec<usize>,
+        num_clients: usize,
+        dropout_count: usize,
+        dropouts_packed: Vec<u8>, // Bitpacked indices using ceil(log2(num_clients)) bits each
         invert: bool,
         length: usize,
     },
@@ -184,4 +193,48 @@ pub fn take_byte_counters() -> (u64, u64) {
     let sent = BYTES_SENT.swap(0, Ordering::Relaxed);
     let recv = BYTES_RECV.swap(0, Ordering::Relaxed);
     (sent, recv)
+}
+
+/// Returns the number of bits needed to represent indices for num_clients (min 1).
+fn bits_for_num_clients(num_clients: usize) -> usize {
+    if num_clients <= 1 { 1 } else { (usize::BITS - (num_clients - 1).leading_zeros()) as usize }
+}
+
+/// Pack a list of indices into a bitpacked byte vector.
+/// Each index uses ceil(log2(num_clients)) bits.
+pub fn pack_indices(indices: &[usize], num_clients: usize) -> Vec<u8> {
+    let bits_per_index = bits_for_num_clients(num_clients);
+    let total_bits = indices.len() * bits_per_index;
+    let num_bytes = (total_bits + 7) / 8;
+    let mut packed = vec![0u8; num_bytes];
+
+    for (i, &idx) in indices.iter().enumerate() {
+        let bit_offset = i * bits_per_index;
+        for b in 0..bits_per_index {
+            if (idx >> b) & 1 == 1 {
+                let global_bit = bit_offset + b;
+                packed[global_bit / 8] |= 1 << (global_bit % 8);
+            }
+        }
+    }
+    packed
+}
+
+/// Unpack indices from a bitpacked byte vector.
+pub fn unpack_indices(packed: &[u8], count: usize, num_clients: usize) -> Vec<usize> {
+    let bits_per_index = bits_for_num_clients(num_clients);
+    let mut indices = Vec::with_capacity(count);
+
+    for i in 0..count {
+        let bit_offset = i * bits_per_index;
+        let mut idx = 0usize;
+        for b in 0..bits_per_index {
+            let global_bit = bit_offset + b;
+            if (packed[global_bit / 8] >> (global_bit % 8)) & 1 == 1 {
+                idx |= 1 << b;
+            }
+        }
+        indices.push(idx);
+    }
+    indices
 }
