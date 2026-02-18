@@ -73,6 +73,21 @@ async fn send_batch_reports(socket: &mut TcpStream, context: u32, reports: Vec<(
     Ok(())
 }
 
+async fn connect_with_retry(addr: &str, max_retries: usize) -> Result<TcpStream> {
+    let mut delay = std::time::Duration::from_millis(10);
+    for attempt in 0..max_retries {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(_) if attempt + 1 < max_retries => {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(1));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    unreachable!()
+}
+
 fn encode_context(length: usize, bitwidth: usize) -> u32 {
     ((bitwidth.min(0xFFFF) as u32) << 16) | (length.min(0xFFFF) as u32)
 }
@@ -109,14 +124,26 @@ fn load_client_from_db(
     })
 }
 
-fn save_report_to_db(db: &Db, id: u32, context: u32, envelope: HpkeEnvelope) -> Result<()> {
-    db.insert(format!("report_{id}_{context}").as_bytes(), bincode::serialize(&envelope)?)?;
+fn save_report_to_db(db: &Db, id: u32, context: u32, envelope: &HpkeEnvelope) -> Result<()> {
+    db.insert(format!("report_{id}_{context}").as_bytes(), bincode::serialize(envelope)?)?;
     Ok(())
 }
 
-fn load_report_from_db(db: &Db, id: u32, context: u32) -> Result<HpkeEnvelope> {
+fn load_report_bytes_from_db(db: &Db, id: u32, context: u32) -> Result<Vec<u8>> {
     let data = db.get(format!("report_{id}_{context}").as_bytes())?.ok_or_else(|| anyhow!("Report not found"))?;
-    Ok(bincode::deserialize(&data)?)
+    Ok(data.to_vec())
+}
+
+/// Load all reports for a context using parallel iteration
+fn load_all_reports_parallel(db: &Db, context: u32, num_clients: usize) -> Vec<(u32, Vec<u8>)> {
+    use rayon::prelude::*;
+    (0..num_clients)
+        .into_par_iter()
+        .filter_map(|i| {
+            let id = i as u32;
+            load_report_bytes_from_db(db, id, context).ok().map(|bytes| (id, bytes))
+        })
+        .collect()
 }
 
 fn clear_reports_from_db(db: &Db) -> Result<()> {
@@ -425,7 +452,7 @@ async fn run_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
                     context,
                     envelope,
                 }) => {
-                    if let Err(e) = save_report_to_db(&db_clone, id, context, envelope) {
+                    if let Err(e) = save_report_to_db(&db_clone, id, context, &envelope) {
                         error!("Failed to save report for client {}: {:?}", id, e);
                         return false;
                     }
@@ -511,7 +538,7 @@ async fn run_sim_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> 
 
             match client.generate_report(context, &inputs) {
                 Ok(Message::EncryptedClientReport { id, context, envelope }) => {
-                    if let Err(e) = save_report_to_db(&db_clone, id, context, envelope) {
+                    if let Err(e) = save_report_to_db(&db_clone, id, context, &envelope) {
                         error!("Failed to save report for client {}: {:?}", id, e);
                         return false;
                     }
@@ -546,7 +573,6 @@ async fn run_sim_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> 
 
 async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<Db>) -> Result<()> {
     info!("=== Report Submission ===");
-    let submission_start = Instant::now();
     let submitted_count = Arc::new(AtomicUsize::new(0));
 
     // Load reports from DB
@@ -558,58 +584,66 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
 
     let sim_generate = db.get(b"sim_generate")?.as_deref() == Some(b"1");
 
-    let mut reports = Vec::new();
-    if sim_generate {
-        // Load dropout count stored during sim-generate (or use config as fallback)
+    info!("Loading reports from DB...");
+    let load_start = Instant::now();
+
+    // Load reports as raw bytes (skip deserialize/serialize round-trip)
+    let batches: Vec<Vec<(u32, Vec<u8>)>> = if sim_generate {
+        // Load dropout count stored during sim-generate
         let dropouts = db.get(b"sim_dropouts")?
             .map(|v| usize::from_le_bytes(v.as_ref().try_into().unwrap_or([0; 8])))
             .unwrap_or(config.dropouts);
         let num_participating = config.num_clients - dropouts;
 
-        // Duplicate the first BATCH_REPORT_SIZE reports to fill num_participating
-        for i in 0..num_participating {
-            let src_id = (i % BATCH_REPORT_SIZE) as u32;
-            match load_report_from_db(&db, src_id, context) {
-                Ok(envelope) => reports.push((i as u32, context, envelope)),
-                Err(_) => {
-                    return Err(anyhow!(
-                        "sim_generate set but report for client {} (source id {}) not found. Run 'sim-generate' first.",
-                        i, src_id
-                    ));
-                }
-            }
-        }
-        info!(
-            "Loaded {} reports (sim_generate: {} unique duplicated to {} participating, {} dropouts)",
-            reports.len(), BATCH_REPORT_SIZE.min(num_participating), num_participating, dropouts
-        );
-    } else {
-        for i in 0..config.num_clients {
-            if let Ok(envelope) = load_report_from_db(&db, i as u32, context) {
-                reports.push((i as u32, context, envelope));
-            }
-        }
-        info!("Loaded {} reports from DB", reports.len());
-    }
+        // Load unique reports once
+        let unique_count = BATCH_REPORT_SIZE.min(num_participating);
+        let unique_reports: Vec<Vec<u8>> = (0..unique_count)
+            .map(|i| {
+                load_report_bytes_from_db(&db, i as u32, context)
+                    .map_err(|_| anyhow!("sim_generate set but report {} not found. Run 'sim-generate' first.", i))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-    if reports.is_empty() {
+        info!(
+            "Loaded {} unique reports, duplicating to {} participating ({} dropouts)",
+            unique_reports.len(), num_participating, dropouts
+        );
+
+        // Build batches by duplicating
+        (0..num_participating)
+            .collect::<Vec<_>>()
+            .chunks(BATCH_REPORT_SIZE)
+            .map(|chunk| {
+                chunk.iter().map(|&i| {
+                    let src_id = i % BATCH_REPORT_SIZE;
+                    (i as u32, unique_reports[src_id].clone())
+                }).collect()
+            })
+            .collect()
+    } else {
+        // Load all reports in parallel
+        let reports = load_all_reports_parallel(&db, context, config.num_clients);
+        info!("Loaded {} reports from DB", reports.len());
+
+        if reports.is_empty() {
+            return Err(anyhow!("No reports found in DB. Run 'generate' first."));
+        }
+
+        // Already have (id, bytes), just chunk into batches
+        reports
+            .chunks(BATCH_REPORT_SIZE)
+            .map(|chunk| chunk.to_vec())
+            .collect()
+    };
+
+    let num_reports: usize = batches.iter().map(|b| b.len()).sum();
+    if num_reports == 0 {
         return Err(anyhow!("No reports found in DB. Run 'generate' or 'sim-generate' first."));
     }
 
-    let num_reports = reports.len();
-
-    // Collect all reports into packed batches (pre-serialized for efficiency)
+    info!("Loaded {} reports in {:?}", num_reports, load_start.elapsed());
+    let submission_start = Instant::now();
     let aggregator_addr = config.aggregator_addr.clone();
-    let mut batches: Vec<Vec<(u32, Vec<u8>)>> = Vec::new();
-    for chunk in reports.chunks(BATCH_REPORT_SIZE) {
-        let batch: Vec<_> = chunk
-            .iter()
-            .map(|(id, _ctx, env)| {
-                (*id, bincode::serialize(env).unwrap())
-            })
-            .collect();
-        batches.push(batch);
-    }
 
     // Register context config before submitting reports
     let (binary, bitlength) = match &config.prover {
@@ -671,10 +705,10 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
         let num_batches = group.len();
 
         join_set.spawn(async move {
-            let mut socket = match TcpStream::connect(&aggregator_addr).await {
+            let mut socket = match connect_with_retry(&aggregator_addr, 10).await {
                 Ok(s) => s,
                 Err(e) => {
-                    error!("Failed to connect: {e}");
+                    error!("Failed to connect after retries: {e}");
                     return;
                 }
             };
