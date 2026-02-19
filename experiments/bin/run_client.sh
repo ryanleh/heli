@@ -11,12 +11,13 @@ DEC_IP="$2"
 shift 2
 
 CONFIGS=(
-  configs/simplified-1.json
-  configs/simplified-32.json
-  configs/simplified-128.json
+  ../configs/simplified-1.json
+  ../configs/simplified-32.json
+  ../configs/simplified-128.json
 )
 
 export RUST_LOG=info
+#export RUSTFLAGS="-C target-cpu=native"
 
 # Update the configs file
 for f in "${CONFIGS[@]}"; do
