@@ -233,7 +233,9 @@ impl Aggregator {
                     (None, b) => b,
                 };
                 chunks_processed += 1;
-                info!("Processed chunk {chunks_processed}/{num_chunks}");
+                if chunks_processed % 10 == 0 {
+                    info!("Processed chunks {chunks_processed}/{num_chunks}");
+                }
             }
 
             info!(
