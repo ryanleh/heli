@@ -75,20 +75,28 @@ async fn stream_aggregate(
     let num_batches = batches.len();
 
     let mut socket = TcpStream::connect(aggregator_addr).await?;
-    write_message(&mut socket, &Message::AggregateStreamStart {
-        context,
-        num_batches,
-        binary,
-        bitlength,
-        simulated: false,
-        sim_dropouts: vec![],
-    }).await?;
+    write_message(
+        &mut socket,
+        &Message::AggregateStreamStart {
+            context,
+            num_batches,
+            binary,
+            bitlength,
+            simulated: false,
+            sim_dropouts: vec![],
+        },
+    )
+    .await?;
 
     for batch in batches {
-        write_message(&mut socket, &Message::BatchEncryptedClientReports {
-            context,
-            reports: batch,
-        }).await?;
+        write_message(
+            &mut socket,
+            &Message::BatchEncryptedClientReports {
+                context,
+                reports: batch,
+            },
+        )
+        .await?;
     }
 
     match read_message(&mut socket).await? {
@@ -278,13 +286,8 @@ async fn test_end_to_end_impl(
             }
         }
 
-        let result = stream_aggregate(
-            &config.aggregator_addr,
-            round,
-            reports,
-            binary,
-            bitlength,
-        ).await?;
+        let result =
+            stream_aggregate(&config.aggregator_addr, round, reports, binary, bitlength).await?;
 
         assert_eq!(
             result, expected_sums,
@@ -411,15 +414,12 @@ async fn test_end_to_end_simulated_setup() -> Result<()> {
         }
     }
 
-    let result = stream_aggregate(
-        &config.aggregator_addr,
-        0,
-        reports,
-        true,
-        None,
-    ).await?;
+    let result = stream_aggregate(&config.aggregator_addr, 0, reports, true, None).await?;
 
-    assert_eq!(result, expected_sums, "Simulated setup e2e: results don't match");
+    assert_eq!(
+        result, expected_sums,
+        "Simulated setup e2e: results don't match"
+    );
 
     decryptor_handle.abort();
     aggregator_handle.abort();

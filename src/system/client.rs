@@ -33,11 +33,14 @@ impl Client {
         let mut socket = TcpStream::connect(decryptor_addr).await?;
 
         // Send encrypted registration request
-        let registration = Message::RegisterRequest { attestation: ATTESTATION.to_string() };
+        let registration = Message::RegisterRequest {
+            attestation: ATTESTATION.to_string(),
+        };
         let pk_clone = decryptor_pk.clone();
         let (envelope, mut sender_ctx) = tokio::task::spawn_blocking(move || {
             hpke_encrypt(&pk_clone.pk, &bincode::serialize(&registration)?, b"", b"")
-        }).await??;
+        })
+        .await??;
         write_message(&mut socket, &Message::HpkeRequest { envelope }).await?;
 
         // Receive and respond to challenge
@@ -47,10 +50,19 @@ impl Client {
 
         let encrypted_response = tokio::task::spawn_blocking(move || {
             let sig = sign_challenge(&challenge);
-            let response = Message::RegisterResponse { signature: sig.as_ref().to_vec() };
+            let response = Message::RegisterResponse {
+                signature: sig.as_ref().to_vec(),
+            };
             hpke_encrypt_with_context(&mut sender_ctx, &bincode::serialize(&response)?, b"")
-        }).await??;
-        write_message(&mut socket, &Message::HpkeMessage { message: encrypted_response }).await?;
+        })
+        .await??;
+        write_message(
+            &mut socket,
+            &Message::HpkeMessage {
+                message: encrypted_response,
+            },
+        )
+        .await?;
 
         // Get registration result
         let Message::RegisterSuccess { id, eval_key } = read_message(&mut socket).await? else {
@@ -80,7 +92,12 @@ impl Client {
     }
 
     /// Create a simulated client from a hardcoded PRF (no registration required).
-    pub fn new_simulated(id: u32, aggregator_addr: &str, aggregator_pk: &ServerKeys, prover: ProverType) -> Self {
+    pub fn new_simulated(
+        id: u32,
+        aggregator_addr: &str,
+        aggregator_pk: &ServerKeys,
+        prover: ProverType,
+    ) -> Self {
         let prf = ScalarPRF::new(&SIMULATE_PRF_KEY);
         let g_comm = Proof::get_g_comm();
         Self {
@@ -111,12 +128,24 @@ impl Client {
     pub fn generate_report(&self, context: u32, input: &[u64]) -> Result<Message> {
         let input_scalars: Vec<Scalar> = input.iter().map(|&x| Scalar::from(x)).collect();
         let ciphertext = AggOnlyEnc::encrypt(&self.eval_key, context, &input_scalars);
-        let proof = Proof::prove(&self.prover_key, &self.eval_key, context, &input_scalars, &ciphertext, &mut OsRng)?;
+        let proof = Proof::prove(
+            &self.prover_key,
+            &self.eval_key,
+            context,
+            &input_scalars,
+            &ciphertext,
+            &mut OsRng,
+        )?;
 
         let report = Message::ClientReport { ciphertext, proof };
-        let (envelope, _) = hpke_encrypt(&self.aggregator_pk, &bincode::serialize(&report)?, b"", b"")?;
+        let (envelope, _) =
+            hpke_encrypt(&self.aggregator_pk, &bincode::serialize(&report)?, b"", b"")?;
 
-        Ok(Message::EncryptedClientReport { id: self.id, context, envelope })
+        Ok(Message::EncryptedClientReport {
+            id: self.id,
+            context,
+            envelope,
+        })
     }
 
     pub fn aggregator_addr(&self) -> &str {

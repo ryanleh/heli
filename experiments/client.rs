@@ -16,7 +16,10 @@ use sled::{Db, IVec};
 use std::{
     collections::HashSet,
     path::PathBuf,
-    sync::{Arc, atomic::{AtomicUsize, Ordering}},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 use tokio::{net::TcpStream, sync::Semaphore, task::JoinSet};
@@ -89,7 +92,9 @@ fn load_client_from_db(
     aggregator_keys: &heli::crypto::hpke::ServerKeys,
     prover_type: heli::system::ProverType,
 ) -> Result<Client> {
-    let data = db.get(format!("client_{id}").as_bytes())?.ok_or_else(|| anyhow!("Client {id} not in DB"))?;
+    let data = db
+        .get(format!("client_{id}").as_bytes())?
+        .ok_or_else(|| anyhow!("Client {id} not in DB"))?;
     let stored: StoredClient = bincode::deserialize(&data)?;
     Ok(Client {
         aggregator_addr: aggregator_addr.to_string(),
@@ -101,12 +106,17 @@ fn load_client_from_db(
 }
 
 fn save_report_to_db(db: &Db, id: u32, context: u32, envelope: &HpkeEnvelope) -> Result<()> {
-    db.insert(format!("report_{id}_{context}").as_bytes(), bincode::serialize(envelope)?)?;
+    db.insert(
+        format!("report_{id}_{context}").as_bytes(),
+        bincode::serialize(envelope)?,
+    )?;
     Ok(())
 }
 
 fn load_report_bytes_from_db(db: &Db, id: u32, context: u32) -> Result<Vec<u8>> {
-    let data = db.get(format!("report_{id}_{context}").as_bytes())?.ok_or_else(|| anyhow!("Report not found"))?;
+    let data = db
+        .get(format!("report_{id}_{context}").as_bytes())?
+        .ok_or_else(|| anyhow!("Report not found"))?;
     Ok(data.to_vec())
 }
 
@@ -297,7 +307,9 @@ async fn run_sim_setup(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
                 };
                 let key = format!("client_{}", i);
                 let value = bincode::serialize(&stored).expect("serialize client");
-                db_clone.insert(key.as_bytes(), IVec::from(value)).expect("insert client");
+                db_clone
+                    .insert(key.as_bytes(), IVec::from(value))
+                    .expect("insert client");
 
                 let prev = created_count.fetch_add(1, Ordering::SeqCst);
                 let current = prev + 1;
@@ -310,14 +322,16 @@ async fn run_sim_setup(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
         })
         .await?;
 
-        info!("Created {} simulated clients (parallel, single flush)", num_to_create);
+        info!(
+            "Created {} simulated clients (parallel, single flush)",
+            num_to_create
+        );
     }
 
     let setup_time = setup_start.elapsed();
     info!(
         "Sim-setup complete: {} clients in {:?}",
-        config.num_clients,
-        setup_time
+        config.num_clients, setup_time
     );
 
     Ok(())
@@ -452,14 +466,28 @@ async fn run_sim_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> 
 
     let mut clients = Vec::new();
     for i in 0..n {
-        match load_client_from_db(&db, i as u32, &config.aggregator_addr, &aggregator_keys, prover_type) {
+        match load_client_from_db(
+            &db,
+            i as u32,
+            &config.aggregator_addr,
+            &aggregator_keys,
+            prover_type,
+        ) {
             Ok(client) => clients.push(client),
-            Err(_) => return Err(anyhow!("Client {} not found in DB. Run 'setup' or 'sim-setup' first.", i)),
+            Err(_) => {
+                return Err(anyhow!(
+                    "Client {} not found in DB. Run 'setup' or 'sim-setup' first.",
+                    i
+                ));
+            }
         }
     }
 
     let num_participating = config.num_clients - config.dropouts;
-    info!("Sim-generate: generating {} reports ({} clients, {} dropouts)", n, config.num_clients, config.dropouts);
+    info!(
+        "Sim-generate: generating {} reports ({} clients, {} dropouts)",
+        n, config.num_clients, config.dropouts
+    );
 
     let bitwidth = match &config.prover {
         ProverConfig::Binary => 1,
@@ -485,7 +513,11 @@ async fn run_sim_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> 
             let inputs: Vec<u64> = (0..length).map(|_| rng.gen_range(0..max_value)).collect();
 
             match client.generate_report(context, &inputs) {
-                Ok(Message::EncryptedClientReport { id, context, envelope }) => {
+                Ok(Message::EncryptedClientReport {
+                    id,
+                    context,
+                    envelope,
+                }) => {
                     if let Err(e) = save_report_to_db(&db_clone, id, context, &envelope) {
                         error!("Failed to save report for client {}: {:?}", id, e);
                         return false;
@@ -496,8 +528,17 @@ async fn run_sim_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> 
                     }
                     true
                 }
-                Ok(_) => { error!("Unexpected message type"); false }
-                Err(e) => { error!("Failed to generate report for client {}: {:?}", client.id, e); false }
+                Ok(_) => {
+                    error!("Unexpected message type");
+                    false
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to generate report for client {}: {:?}",
+                        client.id, e
+                    );
+                    false
+                }
             }
         }));
     }
@@ -512,7 +553,10 @@ async fn run_sim_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> 
     let generated = generated_count.load(Ordering::SeqCst);
     info!(
         "Sim-generate complete: {} reports in {:?} (aggregate will send {} reports, duplicated from {} unique)",
-        generated, generation_time, num_participating, BATCH_REPORT_SIZE.min(n)
+        generated,
+        generation_time,
+        num_participating,
+        BATCH_REPORT_SIZE.min(n)
     );
 
     Ok(())
@@ -537,11 +581,13 @@ async fn run_aggregate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
     };
 
     let (num_reports, sim_dropouts) = if sim_generate {
-        let dropouts = db.get(b"sim_dropouts")?
+        let dropouts = db
+            .get(b"sim_dropouts")?
             .map(|v| usize::from_le_bytes(v.as_ref().try_into().unwrap_or([0; 8])))
             .unwrap_or(config.dropouts);
         let num_participating = config.num_clients - dropouts;
-        let sim_dropouts: Vec<u32> = (num_participating as u32..config.num_clients as u32).collect();
+        let sim_dropouts: Vec<u32> =
+            (num_participating as u32..config.num_clients as u32).collect();
         (num_participating, sim_dropouts)
     } else {
         (config.num_clients, vec![])
@@ -567,7 +613,11 @@ async fn run_aggregate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
                 .map(|i| load_report_bytes_from_db(&loader_db, i as u32, context))
                 .collect::<Result<Vec<_>>>()?;
 
-            info!("Loaded {} unique reports, duplicating to {}", unique_reports.len(), num_reports);
+            info!(
+                "Loaded {} unique reports, duplicating to {}",
+                unique_reports.len(),
+                num_reports
+            );
 
             for chunk_start in (0..num_reports).step_by(BATCH_REPORT_SIZE) {
                 let chunk_end = (chunk_start + BATCH_REPORT_SIZE).min(num_reports);
@@ -593,10 +643,20 @@ async fn run_aggregate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
                         Err(_) => continue,
                     };
                     let parts: Vec<&str> = key_str.split('_').collect();
-                    if parts.len() != 3 { continue; }
-                    let id: u32 = match parts[1].parse() { Ok(id) => id, Err(_) => continue };
-                    let ctx: u32 = match parts[2].parse() { Ok(c) => c, Err(_) => continue };
-                    if ctx != context { continue; }
+                    if parts.len() != 3 {
+                        continue;
+                    }
+                    let id: u32 = match parts[1].parse() {
+                        Ok(id) => id,
+                        Err(_) => continue,
+                    };
+                    let ctx: u32 = match parts[2].parse() {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    if ctx != context {
+                        continue;
+                    }
 
                     batch.push((id, data.to_vec()));
 
@@ -624,33 +684,47 @@ async fn run_aggregate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
 
     let submission_start = Instant::now();
 
-    write_message(&mut socket, &Message::AggregateStreamStart {
-        context,
-        num_batches,
-        binary,
-        bitlength: bitlength_opt,
-        simulated: sim_generate,
-        sim_dropouts,
-    }).await?;
+    write_message(
+        &mut socket,
+        &Message::AggregateStreamStart {
+            context,
+            num_batches,
+            binary,
+            bitlength: bitlength_opt,
+            simulated: sim_generate,
+            sim_dropouts,
+        },
+    )
+    .await?;
 
     // Stream batches as they're loaded
     let mut batches_sent = 0usize;
     let mut reports_sent = 0usize;
     while let Some(batch) = batch_rx.recv().await {
         reports_sent += batch.len();
-        write_message(&mut socket, &Message::BatchEncryptedClientReports {
-            context,
-            reports: batch,
-        }).await?;
+        write_message(
+            &mut socket,
+            &Message::BatchEncryptedClientReports {
+                context,
+                reports: batch,
+            },
+        )
+        .await?;
         batches_sent += 1;
         if batches_sent % 100 == 0 {
-            info!("Sent {}/{} batches ({} reports)", batches_sent, num_batches, reports_sent);
+            info!(
+                "Sent {}/{} batches ({} reports)",
+                batches_sent, num_batches, reports_sent
+            );
         }
     }
 
     // Ensure loader completed successfully
     let total_loaded = loader_handle.await??;
-    info!("Loader finished: {} reports loaded, {} batches sent", total_loaded, batches_sent);
+    info!(
+        "Loader finished: {} reports loaded, {} batches sent",
+        total_loaded, batches_sent
+    );
 
     info!("All batches sent, waiting for aggregation result...");
 

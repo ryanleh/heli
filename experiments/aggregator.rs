@@ -45,9 +45,7 @@ async fn main() -> Result<()> {
     }
 
     info!("Opening database at {}", config.db_path);
-    let db = sled::Config::default()
-        .path(&config.db_path)
-        .open()?;
+    let db = sled::Config::default().path(&config.db_path).open()?;
 
     info!("Database opened, {} total keys", db.len());
 

@@ -4,7 +4,7 @@ use crate::{
         G, Scalar,
         app_attest::{verify_app_attest, verify_sig},
         hpke::*,
-        prf::{ScalarPRF, KHPRF},
+        prf::{KHPRF, ScalarPRF},
     },
     proofs::Proof,
     system::messages::{Message, *},
@@ -109,7 +109,9 @@ impl Decryptor {
             let n = num_clients;
             let state_clone = state.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::key_aggregation_task(state_clone, &mut ek_recv, sk_send, n).await {
+                if let Err(e) =
+                    Self::key_aggregation_task(state_clone, &mut ek_recv, sk_send, n).await
+                {
                     error!("Key aggregation failed: {e:?}");
                 }
             });
@@ -124,7 +126,10 @@ impl Decryptor {
             }
         });
 
-        Self { addr: addr.to_string(), state }
+        Self {
+            addr: addr.to_string(),
+            state,
+        }
     }
 
     async fn key_aggregation_task(
@@ -143,7 +148,10 @@ impl Decryptor {
                 state.db.insert(b"secret_key", bincode::serialize(&sk)?)?;
                 state.db.flush()?;
                 info!("Saved secret key to database (simulated setup)");
-                state.secret_key.set(sk.clone()).map_err(|_| anyhow!("Secret key already set"))?;
+                state
+                    .secret_key
+                    .set(sk.clone())
+                    .map_err(|_| anyhow!("Secret key already set"))?;
                 state.setup_send.send(SetupToAggregator::Simulate).ok();
                 sk.prf_key
             }
@@ -152,16 +160,24 @@ impl Decryptor {
             }
         };
 
-        sk_send.send(prf_key).map_err(|_| anyhow!("Failed to send secret key"))?;
+        sk_send
+            .send(prf_key)
+            .map_err(|_| anyhow!("Failed to send secret key"))?;
         Ok(())
     }
 
     async fn compute_simulated_secret_key(num_clients: usize) -> Result<SecretKey> {
         tokio::task::spawn_blocking(move || {
             let keygen_prf = ScalarPRF::new(&SIMULATE_PRF_KEY);
-            let prf_key = (0..num_clients).fold(Scalar::ZERO, |acc, i| acc + keygen_prf.evaluate(i as u64));
-            SecretKey { prf_key, keygen_prf }
-        }).await.map_err(|e| anyhow!("{e}"))
+            let prf_key =
+                (0..num_clients).fold(Scalar::ZERO, |acc, i| acc + keygen_prf.evaluate(i as u64));
+            SecretKey {
+                prf_key,
+                keygen_prf,
+            }
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))
     }
 
     async fn aggregate_real_keys(
@@ -177,7 +193,11 @@ impl Decryptor {
         let mut received = 1;
 
         while received < num_clients {
-            let ClientKey::Key(idx, ek) = ek_recv.recv().await.ok_or_else(|| anyhow!("Channel closed"))? else {
+            let ClientKey::Key(idx, ek) = ek_recv
+                .recv()
+                .await
+                .ok_or_else(|| anyhow!("Channel closed"))?
+            else {
                 return Err(anyhow!("Unexpected simulate message during registration"));
             };
 
@@ -186,7 +206,12 @@ impl Decryptor {
             received += 1;
 
             if key_comms.len() >= KEY_COMMITMENT_BATCH_SIZE || received == num_clients {
-                state.setup_send.send(SetupToAggregator::KeyCommsBatch(std::mem::take(&mut key_comms))).ok();
+                state
+                    .setup_send
+                    .send(SetupToAggregator::KeyCommsBatch(std::mem::take(
+                        &mut key_comms,
+                    )))
+                    .ok();
             }
         }
 
@@ -220,7 +245,10 @@ impl Decryptor {
         }
     }
 
-    async fn handle_simulate_setup(socket: &mut TcpStream, state: Arc<DecryptorState>) -> Result<()> {
+    async fn handle_simulate_setup(
+        socket: &mut TcpStream,
+        state: Arc<DecryptorState>,
+    ) -> Result<()> {
         if state.secret_key.initialized() {
             return Err(anyhow!("Setup already complete"));
         }
@@ -246,7 +274,8 @@ impl Decryptor {
             };
             let (msg, ctx) = hpke_decrypt(&hpke_sk, &envelope, b"", b"")?;
             Ok::<_, anyhow::Error>((ctx, bincode::deserialize::<Message>(&msg)?))
-        }).await??;
+        })
+        .await??;
 
         // Verify attestation
         tokio::task::spawn_blocking(move || {
@@ -254,7 +283,8 @@ impl Decryptor {
                 return Err(anyhow!("Expected RegisterRequest"));
             };
             verify_app_attest(&attestation)
-        }).await??;
+        })
+        .await??;
 
         // Challenge-response
         let mut challenge = [0u8; 32];
@@ -273,7 +303,8 @@ impl Decryptor {
                 return Err(anyhow!("Expected RegisterResponse"));
             };
             verify_sig(&challenge, &signature)
-        }).await??;
+        })
+        .await??;
 
         // Assign client ID
         let client_id = state.next_client_index.fetch_add(1, Ordering::SeqCst);
@@ -284,15 +315,27 @@ impl Decryptor {
         // Compute and send evaluation key
         let ek = state.keygen_prf.read().await.evaluate(client_id as u64);
         state.ek_send.send(ClientKey::Key(client_id as u32, ek))?;
-        write_message(socket, &Message::RegisterSuccess { id: client_id as u32, eval_key: EvalKey(ek) }).await?;
+        write_message(
+            socket,
+            &Message::RegisterSuccess {
+                id: client_id as u32,
+                eval_key: EvalKey(ek),
+            },
+        )
+        .await?;
 
         // Finalize setup after last client
         if client_id == state.num_clients - 1 {
             let prf_key = state.sk_recv.lock().await.take().unwrap().await?;
             let keygen_prf = state.keygen_prf.read().await.clone();
-            let secret_key = SecretKey { prf_key, keygen_prf };
+            let secret_key = SecretKey {
+                prf_key,
+                keygen_prf,
+            };
 
-            state.db.insert(b"secret_key", bincode::serialize(&secret_key)?)?;
+            state
+                .db
+                .insert(b"secret_key", bincode::serialize(&secret_key)?)?;
             state.db.flush()?;
             info!("Saved secret key to database");
 
@@ -352,7 +395,11 @@ impl Decryptor {
         }
 
         if let Some(start) = state.setup_start.get() {
-            info!("Setup complete: {} clients in {:?}", state.num_clients, start.elapsed());
+            info!(
+                "Setup complete: {} clients in {:?}",
+                state.num_clients,
+                start.elapsed()
+            );
         }
         info!("Sent {}B, Recv {}B", bytes_sent(), bytes_recv());
         reset_byte_counters();
@@ -361,7 +408,15 @@ impl Decryptor {
 
     async fn handle_mask_requests(socket: &mut TcpStream, state: &DecryptorState) -> Result<()> {
         loop {
-            let Message::DecryptMaskRequest { context, num_clients, dropout_count, dropouts_packed, invert, length } = read_message(socket).await? else {
+            let Message::DecryptMaskRequest {
+                context,
+                num_clients,
+                dropout_count,
+                dropouts_packed,
+                invert,
+                length,
+            } = read_message(socket).await?
+            else {
                 error!("Unexpected message type");
                 continue;
             };
@@ -373,44 +428,67 @@ impl Decryptor {
                 let mut ctx = state.current_ctx.write().await;
                 match *ctx {
                     None => *ctx = Some(context),
-                    Some(c) if c != context => return Err(anyhow!("Context mismatch: expected {c}, got {context}")),
+                    Some(c) if c != context => {
+                        return Err(anyhow!("Context mismatch: expected {c}, got {context}"));
+                    }
                     _ => {}
                 }
             }
 
             // Check threshold
-            let online = if invert { dropout_count } else { num_clients - dropout_count };
+            let online = if invert {
+                dropout_count
+            } else {
+                num_clients - dropout_count
+            };
             if online < state.threshold {
                 return Err(anyhow!("Threshold not met: {online} < {}", state.threshold));
             }
 
             // Get secret key
-            let sk = state.secret_key.get().ok_or_else(|| anyhow!("Setup incomplete"))?.clone();
+            let sk = state
+                .secret_key
+                .get()
+                .ok_or_else(|| anyhow!("Setup incomplete"))?
+                .clone();
 
             // Compute mask with detailed timing (inlined from AggOnlyEnc::decrypt_mask)
             // Uses fused unpack+evaluate to avoid allocating Vec<usize> for dropouts
-            let (mask, dropout_key_time, mask_compute_time) = tokio::task::spawn_blocking(move || {
-                // Phase 1: Compute dropout-adjusted key (fused unpack + batch evaluate)
-                let dropout_key_start = Instant::now();
-                let key = match dropout_count {
-                    0 => sk.prf_key,
-                    _ => match invert {
-                        false => sk.prf_key - sk.keygen_prf.batch_evaluate_packed(&dropouts_packed, dropout_count, num_clients),
-                        true => sk.keygen_prf.batch_evaluate_packed(&dropouts_packed, dropout_count, num_clients),
-                    },
-                };
-                let dropout_key_time = dropout_key_start.elapsed();
+            let (mask, dropout_key_time, mask_compute_time) =
+                tokio::task::spawn_blocking(move || {
+                    // Phase 1: Compute dropout-adjusted key (fused unpack + batch evaluate)
+                    let dropout_key_start = Instant::now();
+                    let key = match dropout_count {
+                        0 => sk.prf_key,
+                        _ => match invert {
+                            false => {
+                                sk.prf_key
+                                    - sk.keygen_prf.batch_evaluate_packed(
+                                        &dropouts_packed,
+                                        dropout_count,
+                                        num_clients,
+                                    )
+                            }
+                            true => sk.keygen_prf.batch_evaluate_packed(
+                                &dropouts_packed,
+                                dropout_count,
+                                num_clients,
+                            ),
+                        },
+                    };
+                    let dropout_key_time = dropout_key_start.elapsed();
 
-                // Phase 2: Compute the actual mask (parallel KHPRF evaluations)
-                let mask_start = Instant::now();
-                let mask: Vec<G> = (0..length)
-                    .into_par_iter()
-                    .map(|i| KHPRF::evaluate_context(&key, context, i))
-                    .collect();
-                let mask_compute_time = mask_start.elapsed();
+                    // Phase 2: Compute the actual mask (parallel KHPRF evaluations)
+                    let mask_start = Instant::now();
+                    let mask: Vec<G> = (0..length)
+                        .into_par_iter()
+                        .map(|i| KHPRF::evaluate_context(&key, context, i))
+                        .collect();
+                    let mask_compute_time = mask_start.elapsed();
 
-                (mask, dropout_key_time, mask_compute_time)
-            }).await?;
+                    (mask, dropout_key_time, mask_compute_time)
+                })
+                .await?;
 
             write_message(socket, &Message::DecryptMaskResponse { mask }).await?;
 
@@ -422,7 +500,9 @@ impl Decryptor {
                  Dropout key (fused unpack+eval): {:?}\n\t\
                  Mask computation: {:?}\n\t\
                  Total: {:?}",
-                dropout_key_time, mask_compute_time, wall_start.elapsed()
+                dropout_key_time,
+                mask_compute_time,
+                wall_start.elapsed()
             );
             info!("Sent {}B, Recv {}B", bytes_sent(), bytes_recv());
             reset_byte_counters();

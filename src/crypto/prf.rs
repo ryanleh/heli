@@ -86,9 +86,13 @@ impl ScalarPRF {
         if count == 0 {
             return Scalar::ZERO;
         }
-        let bits_per_index = if num_clients <= 1 { 1 } else { (usize::BITS - (num_clients - 1).leading_zeros()) as usize };
+        let bits_per_index = if num_clients <= 1 {
+            1
+        } else {
+            (usize::BITS - (num_clients - 1).leading_zeros()) as usize
+        };
         let mut accum = [0u64; 5];
-        
+
         for i in 0..count {
             // Unpack single index
             let bit_offset = i * bits_per_index;

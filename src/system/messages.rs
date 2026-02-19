@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// Hardcoded PRF key for simulated setup (no attestation). 
+/// Hardcoded PRF key for simulated setup (no attestation).
 pub const SIMULATE_PRF_KEY: [u8; 32] = [
     0x73, 0x69, 0x6d, 0x75, 0x6c, 0x61, 0x74, 0x65, 0x5f, 0x68, 0x65, 0x6c, 0x69, 0x5f, 0x65, 0x32,
     0x65, 0x5f, 0x74, 0x65, 0x73, 0x74, 0x5f, 0x6b, 0x65, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -217,7 +217,11 @@ pub fn take_byte_counters() -> (u64, u64) {
 
 /// Returns the number of bits needed to represent indices for num_clients (min 1).
 fn bits_for_num_clients(num_clients: usize) -> usize {
-    if num_clients <= 1 { 1 } else { (usize::BITS - (num_clients - 1).leading_zeros()) as usize }
+    if num_clients <= 1 {
+        1
+    } else {
+        (usize::BITS - (num_clients - 1).leading_zeros()) as usize
+    }
 }
 
 /// Pack a list of indices into a bitpacked byte vector.
