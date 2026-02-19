@@ -9,5 +9,7 @@
     },
     "aggregator_addr": "0.0.0.0:9000",
     "decryptor_addr": "0.0.0.0:9001",
-    "db_path": "experiment.db"
+    "db_path": "experiment.db",
+    "max_pending_batches": 1024,
+    "reports_per_chunk": 102400
 }
