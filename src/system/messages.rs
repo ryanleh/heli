@@ -110,6 +110,18 @@ pub enum Message {
         result: Vec<u64>,
     },
 
+    /// Combined submit+aggregate: client sends this to start a streaming aggregation.
+    /// Followed by exactly `num_batches` BatchEncryptedClientReports messages.
+    /// Server responds with AggregationResponse when complete.
+    AggregateStreamStart {
+        context: u32,
+        num_batches: usize,
+        binary: bool,
+        bitlength: Option<usize>,
+        simulated: bool,
+        sim_dropouts: Vec<u32>,
+    },
+
     Error(String),
     Success(),
 }

@@ -16,10 +16,6 @@ struct Args {
     /// Path to the experiment config JSON file
     config: PathBuf,
 
-    /// Clear stored reports before starting
-    #[arg(long)]
-    clear_reports: bool,
-
     /// Fully clear database
     #[arg(long)]
     clear_db: bool,
@@ -41,7 +37,6 @@ async fn main() -> Result<()> {
     let config = ExperimentConfig::from_file(&args.config)?;
     info!("Loaded config: {:?}", config);
 
-    // Clear DB if requested
     if args.clear_db {
         info!("Clearing database at {}", config.db_path);
         if std::path::Path::new(&config.db_path).exists() {
@@ -49,37 +44,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Open the database
     info!("Opening database at {}", config.db_path);
-    let db = Config::default()
+    let db = sled::Config::default()
         .path(&config.db_path)
-        .mode(Mode::HighThroughput)
-        .flush_every_ms(Some(2000)) // TODO: Tune
         .open()?;
 
     info!("Database opened, {} total keys", db.len());
 
-    // Clear reports if requested
-    if args.clear_reports {
-        info!("Clearing reports from database");
-        let mut count = 0usize;
-        let mut batch = sled::Batch::default();
-        for key_result in db.scan_prefix(b"r/").keys() {
-            if let Ok(key) = key_result {
-                batch.remove(key);
-                count += 1;
-                if count % 100_000 == 0 {
-                    info!("Queued {} keys for deletion...", count);
-                }
-            }
-        }
-        info!("Applying batch delete of {} keys...", count);
-        db.apply_batch(batch)?;
-        db.flush()?;
-        info!("Cleared {} report keys", count);
-    }
-
-    // Load HPKE keys
     let hpke_keys = aggregator_keys();
 
     let aggregator = Aggregator::new(
@@ -89,7 +60,7 @@ async fn main() -> Result<()> {
         config.prover.to_prover_type(),
         db,
         hpke_keys,
-        config.agg_chunk_size,
+        config.max_pending_batches,
     );
 
     info!("Starting aggregator on {}", config.aggregator_addr);

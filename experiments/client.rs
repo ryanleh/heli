@@ -32,7 +32,7 @@ struct Args {
     /// Path to the experiment config JSON file
     config: PathBuf,
 
-    /// Run mode: setup, sim-setup, generate, sim-generate (one batch only), submit, or aggregate
+    /// Run mode: setup, sim-setup, generate, sim-generate, or aggregate
     #[arg(long, default_value = "setup")]
     mode: String,
 
@@ -49,7 +49,6 @@ struct Args {
     clear_reports: bool,
 }
 
-// Struct for persisting clients to disk
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct StoredClient {
     id: u32,
@@ -63,29 +62,6 @@ fn init_tracing() {
         .add_directive("heli=info".parse().unwrap());
 
     tracing_subscriber::fmt().with_env_filter(filter).init();
-}
-
-async fn send_batch_reports(socket: &mut TcpStream, context: u32, reports: Vec<(u32, Vec<u8>)>) -> Result<()> {
-    if reports.is_empty() {
-        return Ok(());
-    }
-    write_message(socket, &Message::BatchEncryptedClientReports { context, reports }).await?;
-    Ok(())
-}
-
-async fn connect_with_retry(addr: &str, max_retries: usize) -> Result<TcpStream> {
-    let mut delay = std::time::Duration::from_millis(10);
-    for attempt in 0..max_retries {
-        match TcpStream::connect(addr).await {
-            Ok(stream) => return Ok(stream),
-            Err(_) if attempt + 1 < max_retries => {
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(std::time::Duration::from_secs(1));
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    unreachable!()
 }
 
 fn encode_context(length: usize, bitwidth: usize) -> u32 {
@@ -134,7 +110,6 @@ fn load_report_bytes_from_db(db: &Db, id: u32, context: u32) -> Result<Vec<u8>> 
     Ok(data.to_vec())
 }
 
-
 fn clear_reports_from_db(db: &Db) -> Result<()> {
     for key in db.scan_prefix(b"report_").keys() {
         db.remove(key?)?;
@@ -147,10 +122,8 @@ async fn run_setup(config: &ExperimentConfig, max_concurrency: usize, db: Arc<Db
     let decryptor_keys = Arc::new(decryptor_keys());
     let aggregator_keys = Arc::new(aggregator_keys());
 
-    // Semaphore to limit concurrent connections
     let semaphore = Arc::new(Semaphore::new(max_concurrency));
 
-    // Phase 1: Registration
     info!("=== Phase 1: Client Registration ===");
     info!("Registering {} clients...", config.num_clients);
 
@@ -158,7 +131,6 @@ async fn run_setup(config: &ExperimentConfig, max_concurrency: usize, db: Arc<Db
     let registered_count = Arc::new(AtomicUsize::new(0));
     let loaded_count = Arc::new(AtomicUsize::new(0));
 
-    // Try to load clients from DB first
     let mut clients = Vec::new();
     let mut clients_to_register = Vec::new();
 
@@ -194,7 +166,6 @@ async fn run_setup(config: &ExperimentConfig, max_concurrency: usize, db: Arc<Db
         info!("Loaded all {} clients from DB", clients.len());
     }
 
-    // Register missing clients concurrently
     let mut join_set = JoinSet::new();
     let num_to_register = clients_to_register.len();
     for i in clients_to_register {
@@ -219,7 +190,6 @@ async fn run_setup(config: &ExperimentConfig, max_concurrency: usize, db: Arc<Db
 
             match result {
                 Ok(client) => {
-                    // Save to DB
                     if let Err(e) = save_client_to_db(&db, &client) {
                         warn!("Failed to save client {} to DB: {:?}", client.id, e);
                     }
@@ -241,7 +211,7 @@ async fn run_setup(config: &ExperimentConfig, max_concurrency: usize, db: Arc<Db
     while let Some(result) = join_set.join_next().await {
         match result {
             Ok(Some(client)) => clients.push(client),
-            Ok(None) => {} // Registration failed, already logged
+            Ok(None) => {}
             Err(e) => error!("Task panicked: {:?}", e),
         }
     }
@@ -268,8 +238,6 @@ async fn run_setup(config: &ExperimentConfig, max_concurrency: usize, db: Arc<Db
     Ok(())
 }
 
-/// Simulated setup: one RPC to decryptor (SimulateSetup), then create all clients locally from hardcoded PRF key.
-/// No attestation; use for fast e2e with large N.
 async fn run_sim_setup(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
     let aggregator_keys = Arc::new(aggregator_keys());
     let prover_type = config.prover.to_prover_type();
@@ -356,14 +324,12 @@ async fn run_sim_setup(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
 }
 
 async fn run_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
-    // Clear sim_generate so submit uses full report list
     let _ = db.remove(b"sim_generate");
     db.flush()?;
 
     let aggregator_keys = Arc::new(aggregator_keys());
     let prover_type = config.prover.to_prover_type();
 
-    // Load clients from DB
     let mut clients = Vec::new();
     for i in 0..config.num_clients {
         match load_client_from_db(
@@ -385,7 +351,6 @@ async fn run_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
 
     info!("Loaded {} clients from DB", clients.len());
 
-    // Randomly select clients to drop out
     let dropout_set: HashSet<u32> = if config.dropouts > 0 {
         let mut rng = rand::thread_rng();
         let mut client_ids: Vec<u32> = clients.iter().map(|c| c.id).collect();
@@ -395,7 +360,6 @@ async fn run_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
         HashSet::new()
     };
 
-    // Filter to participating clients
     let clients: Vec<Arc<Client>> = clients
         .into_iter()
         .filter(|c| !dropout_set.contains(&c.id))
@@ -408,14 +372,13 @@ async fn run_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
         dropout_set.len()
     );
 
-    // Generate context
     let bitwidth = match &config.prover {
         ProverConfig::Binary => 1,
         ProverConfig::Range { bitlength } => *bitlength,
     };
     let max_value = 1 << bitwidth;
     let context = encode_context(config.length, bitwidth);
-    let num_participating = clients.len() as usize;
+    let num_participating = clients.len();
 
     info!("=== Report Generation ===");
     let generation_start = Instant::now();
@@ -431,7 +394,6 @@ async fn run_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
 
         let num_participating_clone = num_participating;
         join_set.spawn(tokio::task::spawn_blocking(move || {
-            // Generate random input data
             let mut rng = StdRng::from_entropy();
             let inputs: Vec<u64> = (0..length).map(|_| rng.gen_range(0..max_value)).collect();
 
@@ -467,7 +429,6 @@ async fn run_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
         }));
     }
 
-    // Wait for all generations to complete
     while join_set.join_next().await.is_some() {}
 
     db.flush()?;
@@ -484,8 +445,6 @@ async fn run_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
     Ok(())
 }
 
-/// Generate reports for only the first BATCH_REPORT_SIZE clients; set flag so submit duplicates them.
-/// Respects config.dropouts - will only send (num_clients - dropouts) reports during submit.
 async fn run_sim_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
     let aggregator_keys = Arc::new(aggregator_keys());
     let prover_type = config.prover.to_prover_type();
@@ -545,7 +504,6 @@ async fn run_sim_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> 
 
     while join_set.join_next().await.is_some() {}
 
-    // Store sim_generate flag and dropout count so submit knows how many reports to send
     db.insert(b"sim_generate", b"1")?;
     db.insert(b"sim_dropouts", &config.dropouts.to_le_bytes())?;
     db.flush()?;
@@ -553,17 +511,17 @@ async fn run_sim_generate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> 
     let generation_time = generation_start.elapsed();
     let generated = generated_count.load(Ordering::SeqCst);
     info!(
-        "Sim-generate complete: {} reports in {:?} (submit will send {} reports, duplicated from {} unique)",
+        "Sim-generate complete: {} reports in {:?} (aggregate will send {} reports, duplicated from {} unique)",
         generated, generation_time, num_participating, BATCH_REPORT_SIZE.min(n)
     );
 
     Ok(())
 }
 
-async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<Db>) -> Result<()> {
-    info!("=== Report Submission ===");
-    let submitted_count = Arc::new(AtomicUsize::new(0));
-    let loaded_count = Arc::new(AtomicUsize::new(0));
+/// Combined submit+aggregate: streams reports to the aggregator over a single connection
+/// and waits for the in-memory aggregation result.
+async fn run_aggregate(config: &ExperimentConfig, db: Arc<Db>) -> Result<()> {
+    info!("=== Aggregate (submit + process) ===");
 
     let bitwidth = match &config.prover {
         ProverConfig::Binary => 1,
@@ -573,286 +531,164 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
 
     let sim_generate = db.get(b"sim_generate")?.as_deref() == Some(b"1");
     let aggregator_addr = config.aggregator_addr.clone();
+    let (binary, bitlength_opt) = match &config.prover {
+        ProverConfig::Binary => (true, None),
+        ProverConfig::Range { bitlength } => (false, Some(*bitlength)),
+    };
 
-    // Calculate total reports
-    let (num_reports, num_participating) = if sim_generate {
+    let (num_reports, sim_dropouts) = if sim_generate {
         let dropouts = db.get(b"sim_dropouts")?
             .map(|v| usize::from_le_bytes(v.as_ref().try_into().unwrap_or([0; 8])))
             .unwrap_or(config.dropouts);
         let num_participating = config.num_clients - dropouts;
-        (num_participating, num_participating)
+        let sim_dropouts: Vec<u32> = (num_participating as u32..config.num_clients as u32).collect();
+        (num_participating, sim_dropouts)
     } else {
-        (config.num_clients, config.num_clients)
+        (config.num_clients, vec![])
     };
-
-    // Register context config before submitting reports
-    let (binary, bitlength) = match &config.prover {
-        ProverConfig::Binary => (true, None),
-        ProverConfig::Range { bitlength } => (false, Some(*bitlength)),
-    };
-    let sim_dropouts: Vec<u32> = if sim_generate {
-        (num_participating as u32..config.num_clients as u32).collect()
-    } else {
-        vec![]
-    };
-    {
-        let mut socket = TcpStream::connect(&aggregator_addr).await?;
-        write_message(
-            &mut socket,
-            &Message::SetContextConfig {
-                context,
-                binary,
-                bitlength,
-                simulated: sim_generate,
-                sim_dropouts,
-            },
-        )
-        .await?;
-        let response = read_message(&mut socket).await?;
-        if !matches!(response, Message::Success {}) {
-            return Err(anyhow::anyhow!(
-                "Aggregator did not accept SetContextConfig: {:?}",
-                response
-            ));
-        }
-    }
 
     let num_batches = (num_reports + BATCH_REPORT_SIZE - 1) / BATCH_REPORT_SIZE;
     info!(
-        "Sending {} batches (batch size: {}) over {} connections",
-        num_batches,
-        BATCH_REPORT_SIZE,
-        max_concurrency
+        "Streaming {} reports in {} batches (batch size: {}, simulated: {})",
+        num_reports, num_batches, BATCH_REPORT_SIZE, sim_generate
     );
 
-    // Channel for producer-consumer: loader -> senders
-    // Buffer enough batches to keep senders busy while loading continues
-    const BATCH_BUFFER_SIZE: usize = 64;
-    let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<(u32, Vec<u8>)>>(BATCH_BUFFER_SIZE);
-    let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
+    // Pipeline: loader produces batches from client DB, main loop sends over network
+    const LOADER_BUFFER: usize = 8;
+    let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<Vec<(u32, Vec<u8>)>>(LOADER_BUFFER);
 
-    let submission_start = Instant::now();
-
-    // Spawn loader task
     let loader_db = db.clone();
-    let loader_loaded_count = loaded_count.clone();
-    let loader_handle = tokio::task::spawn_blocking(move || -> Result<()> {
+    let loader_handle = tokio::task::spawn_blocking(move || -> Result<usize> {
+        let mut total_loaded = 0usize;
+
         if sim_generate {
-            // Load unique reports once
-            let unique_count = BATCH_REPORT_SIZE.min(num_participating);
+            let unique_count = BATCH_REPORT_SIZE.min(num_reports);
             let unique_reports: Vec<Vec<u8>> = (0..unique_count)
                 .map(|i| load_report_bytes_from_db(&loader_db, i as u32, context))
                 .collect::<Result<Vec<_>>>()?;
 
-            info!("Loaded {} unique reports, duplicating to {} participating", unique_reports.len(), num_participating);
+            info!("Loaded {} unique reports, duplicating to {}", unique_reports.len(), num_reports);
 
-            // Generate batches by duplicating
-            for chunk_start in (0..num_participating).step_by(BATCH_REPORT_SIZE) {
-                let chunk_end = (chunk_start + BATCH_REPORT_SIZE).min(num_participating);
+            for chunk_start in (0..num_reports).step_by(BATCH_REPORT_SIZE) {
+                let chunk_end = (chunk_start + BATCH_REPORT_SIZE).min(num_reports);
                 let batch: Vec<(u32, Vec<u8>)> = (chunk_start..chunk_end)
                     .map(|i| {
                         let src_id = i % BATCH_REPORT_SIZE;
                         (i as u32, unique_reports[src_id].clone())
                     })
                     .collect();
-                let batch_len = batch.len();
+                total_loaded += batch.len();
                 if batch_tx.blocking_send(batch).is_err() {
-                    break; // Receivers dropped
+                    break;
                 }
-                loader_loaded_count.fetch_add(batch_len, Ordering::SeqCst);
             }
         } else {
-            // Stream from DB using scan_prefix
-            let prefix = format!("report_");
+            let prefix = "report_";
             let mut batch = Vec::with_capacity(BATCH_REPORT_SIZE);
 
             for item in loader_db.scan_prefix(prefix.as_bytes()) {
                 if let Ok((key, data)) = item {
-                    // Parse key format: "report_{id}_{context}"
                     let key_str = match std::str::from_utf8(&key) {
                         Ok(s) => s,
                         Err(_) => continue,
                     };
                     let parts: Vec<&str> = key_str.split('_').collect();
-                    if parts.len() != 3 {
-                        continue;
-                    }
-                    let id: u32 = match parts[1].parse() {
-                        Ok(id) => id,
-                        Err(_) => continue,
-                    };
-                    let ctx: u32 = match parts[2].parse() {
-                        Ok(c) => c,
-                        Err(_) => continue,
-                    };
-                    if ctx != context {
-                        continue;
-                    }
+                    if parts.len() != 3 { continue; }
+                    let id: u32 = match parts[1].parse() { Ok(id) => id, Err(_) => continue };
+                    let ctx: u32 = match parts[2].parse() { Ok(c) => c, Err(_) => continue };
+                    if ctx != context { continue; }
 
                     batch.push((id, data.to_vec()));
 
                     if batch.len() >= BATCH_REPORT_SIZE {
-                        let batch_len = batch.len();
+                        total_loaded += batch.len();
                         if batch_tx.blocking_send(std::mem::take(&mut batch)).is_err() {
                             break;
                         }
-                        loader_loaded_count.fetch_add(batch_len, Ordering::SeqCst);
                         batch = Vec::with_capacity(BATCH_REPORT_SIZE);
                     }
                 }
             }
 
-            // Send remaining
             if !batch.is_empty() {
-                let batch_len = batch.len();
+                total_loaded += batch.len();
                 let _ = batch_tx.blocking_send(batch);
-                loader_loaded_count.fetch_add(batch_len, Ordering::SeqCst);
             }
         }
-        Ok(())
+        Ok(total_loaded)
     });
 
-    // Spawn sender tasks that pull from channel
-    let num_connections = max_concurrency;
-    let mut join_set = JoinSet::new();
-    
-    for _ in 0..num_connections {
-        let aggregator_addr = aggregator_addr.clone();
-        let submitted_count = submitted_count.clone();
-        let batch_rx = batch_rx.clone();
+    // Open single connection
+    let mut socket = TcpStream::connect(&aggregator_addr).await?;
+    socket.set_nodelay(true)?;
 
-        join_set.spawn(async move {
-            let mut socket = match connect_with_retry(&aggregator_addr, 10).await {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Failed to connect after retries: {e}");
-                    return;
-                }
-            };
-            socket.set_nodelay(true).ok();
+    let submission_start = Instant::now();
 
-            // Stream mode
-            if let Err(e) = write_message(
-                &mut socket,
-                &Message::BatchStreamStart { num_batches }
-            ).await {
-                error!("Failed to send BatchStreamStart: {e}");
-                return;
-            }
+    write_message(&mut socket, &Message::AggregateStreamStart {
+        context,
+        num_batches,
+        binary,
+        bitlength: bitlength_opt,
+        simulated: sim_generate,
+        sim_dropouts,
+    }).await?;
 
-            loop {
-                let batch = {
-                    let mut rx = batch_rx.lock().await;
-                    rx.recv().await
-                };
-
-                match batch {
-                    Some(batch) => {
-                        let batch_size = batch.len();
-                        if let Err(e) = send_batch_reports(&mut socket, context, batch).await {
-                            error!("Failed to send batch: {e}");
-                            return;
-                        }
-                        let prev = submitted_count.fetch_add(batch_size, Ordering::SeqCst);
-                        let current = prev + batch_size;
-                        if current % 102_400 == 0 {
-                            info!("Submitted {}/{} reports", current, num_reports);
-                        }
-                    }
-                    None => break, // Channel closed, loader done
-                }
-            }
-        });
+    // Stream batches as they're loaded
+    let mut batches_sent = 0usize;
+    let mut reports_sent = 0usize;
+    while let Some(batch) = batch_rx.recv().await {
+        reports_sent += batch.len();
+        write_message(&mut socket, &Message::BatchEncryptedClientReports {
+            context,
+            reports: batch,
+        }).await?;
+        batches_sent += 1;
+        if batches_sent % 100 == 0 {
+            info!("Sent {}/{} batches ({} reports)", batches_sent, num_batches, reports_sent);
+        }
     }
 
-    // Wait for loader to finish
-    loader_handle.await??;
+    // Ensure loader completed successfully
+    let total_loaded = loader_handle.await??;
+    info!("Loader finished: {} reports loaded, {} batches sent", total_loaded, batches_sent);
 
-    // Wait for all senders to finish
-    while join_set.join_next().await.is_some() {}
+    info!("All batches sent, waiting for aggregation result...");
 
-    let submission_time = submission_start.elapsed();
-    let submitted = submitted_count.load(Ordering::SeqCst);
+    let response = read_message(&mut socket).await?;
+    let total_time = submission_start.elapsed();
+
+    match response {
+        Message::AggregationResponse { result } => {
+            info!("Aggregation result: {:?}", result);
+        }
+        Message::Error(e) => {
+            return Err(anyhow!("Aggregation failed: {}", e));
+        }
+        _ => {
+            return Err(anyhow!("Unexpected response from aggregator"));
+        }
+    }
+
+    info!(
+        "Aggregate complete: {} reports in {:?} ({:.2} reports/sec)",
+        reports_sent,
+        total_time,
+        reports_sent as f64 / total_time.as_secs_f64()
+    );
+
     let bytes_sent_total = bytes_sent();
     let bytes_recv_total = bytes_recv();
+    info!("Sent {}B, Recv {}B", bytes_sent_total, bytes_recv_total);
 
-    if submitted != num_reports {
-        return Err(anyhow::anyhow!(
-            "Submitted {}/{} reports. Some batches failed to reach the aggregator. \
-             Ensure the aggregator is running and config aggregator_addr ({}) is correct.",
-            submitted,
-            num_reports,
-            aggregator_addr
-        ));
-    }
-
-    info!(
-        "Report submission complete: {} reports in {:?} ({:.2} reports/sec)",
-        submitted,
-        submission_time,
-        submitted as f64 / submission_time.as_secs_f64()
-    );
-    info!(
-        "Sent {:?}B ({:.2}B per-report)",
-        bytes_sent_total,
-        (bytes_sent_total as f64 / num_reports as f64),
-    );
-    info!(
-        "Recv {:?}B ({:.2}B per-report)",
-        bytes_recv_total,
-        (bytes_recv_total as f64 / num_reports as f64),
-    );
-
-    // Calculate throughput in Gbit/s
     let total_bytes = bytes_sent_total + bytes_recv_total;
-    let total_bits = total_bytes as f64 * 8.0;
-    let time_secs = submission_time.as_secs_f64();
-    let throughput_gbps = if time_secs > 0.0 {
-        total_bits / time_secs / 1_000_000_000.0
+    let throughput_gbps = if total_time.as_secs_f64() > 0.0 {
+        (total_bytes as f64 * 8.0) / total_time.as_secs_f64() / 1_000_000_000.0
     } else {
         0.0
     };
-
-    info!(
-        "Throughput: {:.2} Gbit/s (sent: {:.2} Gbit/s, recv: {:.2} Gbit/s)",
-        throughput_gbps,
-        (bytes_sent_total as f64 * 8.0) / time_secs / 1_000_000_000.0,
-        (bytes_recv_total as f64 * 8.0) / time_secs / 1_000_000_000.0,
-    );
+    info!("Throughput: {:.2} Gbit/s", throughput_gbps);
 
     reset_byte_counters();
-
-    Ok(())
-}
-
-async fn run_aggregate(config: &ExperimentConfig) -> Result<()> {
-    info!("=== Aggregation ===");
-
-    // Get bitwidth from config
-    let bitwidth = match &config.prover {
-        ProverConfig::Binary => 1,
-        ProverConfig::Range { bitlength } => *bitlength,
-    };
-
-    // Encode context with length and bitwidth
-    let context = encode_context(config.length, bitwidth);
-
-    // Connect to aggregator and request aggregation
-    let mut socket = TcpStream::connect(&config.aggregator_addr).await?;
-    write_message(&mut socket, &Message::AggregationRequest { context }).await?;
-
-    let response = read_message(&mut socket).await?;
-    match response {
-        Message::AggregationResponse { result } => {
-            info!("Aggregation successful: {:?}", result);
-        }
-        Message::Error(e) => {
-            return Err(anyhow::anyhow!("Aggregation failed: {}", e));
-        }
-        _ => {
-            return Err(anyhow::anyhow!("Unexpected response from aggregator"));
-        }
-    }
 
     Ok(())
 }
@@ -875,7 +711,6 @@ async fn main() -> Result<()> {
         sled::Config::default().path(CLIENT_DB_PATH).open()?
     });
 
-    // Clear reports if requested
     if args.clear_reports {
         clear_reports_from_db(&db)?;
         info!("Cleared all reports from database");
@@ -886,10 +721,9 @@ async fn main() -> Result<()> {
         "sim-setup" => run_sim_setup(&config, db).await,
         "generate" => run_generate(&config, db).await,
         "sim-generate" => run_sim_generate(&config, db).await,
-        "submit" => run_submit(&config, args.max_concurrency, db).await,
-        "aggregate" => run_aggregate(&config).await,
+        "aggregate" => run_aggregate(&config, db).await,
         _ => Err(anyhow::anyhow!(
-            "Invalid mode: {}. Must be 'setup', 'sim-setup', 'generate', 'sim-generate', 'submit', or 'aggregate'",
+            "Invalid mode: {}. Must be 'setup', 'sim-setup', 'generate', 'sim-generate', or 'aggregate'",
             args.mode
         )),
     }

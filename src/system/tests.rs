@@ -15,6 +15,8 @@ use std::time::Duration;
 use tokio::{net::TcpStream, time::sleep};
 use tracing_subscriber::EnvFilter;
 
+const TEST_BATCH_SIZE: usize = 64;
+
 struct TestConfig {
     num_clients: usize,
     threshold: usize,
@@ -49,7 +51,6 @@ impl TestConfig {
 }
 
 fn init_tracing() {
-    // Sled logging is a bit verbose so disable it
     let filter = EnvFilter::from_default_env().add_directive("sled=off".parse().unwrap());
 
     let _ = tracing_subscriber::fmt()
@@ -59,6 +60,44 @@ fn init_tracing() {
         .try_init();
 }
 
+/// Stream reports to the aggregator using AggregateStreamStart and return the result.
+async fn stream_aggregate(
+    aggregator_addr: &str,
+    context: u32,
+    reports: Vec<(u32, Vec<u8>)>,
+    binary: bool,
+    bitlength: Option<usize>,
+) -> Result<Vec<u64>> {
+    let batches: Vec<Vec<(u32, Vec<u8>)>> = reports
+        .chunks(TEST_BATCH_SIZE)
+        .map(|c| c.to_vec())
+        .collect();
+    let num_batches = batches.len();
+
+    let mut socket = TcpStream::connect(aggregator_addr).await?;
+    write_message(&mut socket, &Message::AggregateStreamStart {
+        context,
+        num_batches,
+        binary,
+        bitlength,
+        simulated: false,
+        sim_dropouts: vec![],
+    }).await?;
+
+    for batch in batches {
+        write_message(&mut socket, &Message::BatchEncryptedClientReports {
+            context,
+            reports: batch,
+        }).await?;
+    }
+
+    match read_message(&mut socket).await? {
+        Message::AggregationResponse { result } => Ok(result),
+        Message::Error(e) => Err(anyhow!("Aggregation failed: {e}")),
+        _ => Err(anyhow!("Unexpected response")),
+    }
+}
+
 #[tokio::test]
 async fn test_decryptor_setup() -> Result<()> {
     init_tracing();
@@ -66,11 +105,9 @@ async fn test_decryptor_setup() -> Result<()> {
     let config = TestConfig::binary(5, 1);
     let db = sled::Config::default().temporary(true).open()?;
 
-    // Generate HPKE keypairs
     let decryptor_keys = ServerKeys::generate();
     let aggregator_keys = ServerKeys::generate();
 
-    // Start the aggregator
     let aggregator = Aggregator::new(
         &config.aggregator_addr,
         config.num_clients,
@@ -78,7 +115,7 @@ async fn test_decryptor_setup() -> Result<()> {
         config.prover,
         db,
         aggregator_keys.clone(),
-        100_000, // agg_chunk_size
+        4,
     );
     let aggregator_handle = tokio::spawn(async move {
         if let Err(e) = aggregator.run().await {
@@ -86,10 +123,8 @@ async fn test_decryptor_setup() -> Result<()> {
         }
     });
 
-    // Give the server time to start up
     sleep(Duration::from_millis(100)).await;
 
-    // Start the decryptor
     let decryptor_db = sled::Config::default().temporary(true).open()?;
     let decryptor = Decryptor::new(
         &config.decryptor_addr,
@@ -106,10 +141,8 @@ async fn test_decryptor_setup() -> Result<()> {
         }
     });
 
-    // Give the server time to start up
     sleep(Duration::from_millis(100)).await;
 
-    // Register all clients and collect their evaluation keys
     let mut expected_key = Scalar::ZERO;
     for _ in 0..config.num_clients {
         let client = Client::register(
@@ -123,10 +156,8 @@ async fn test_decryptor_setup() -> Result<()> {
         expected_key += *client.eval_key;
     }
 
-    // Give the decryptor time to process the last registration and set up the secret key
     sleep(Duration::from_millis(500)).await;
 
-    // Try to register one more client - should fail
     let result = Client::register(
         &config.decryptor_addr,
         &config.aggregator_addr,
@@ -140,18 +171,15 @@ async fn test_decryptor_setup() -> Result<()> {
         "Should not be able to register after max clients"
     );
 
-    // Check that the sum of client keys matches the decryptor's secret key
     let secret_key = decryptor_state.secret_key.get().unwrap();
     assert_eq!(secret_key.prf_key, expected_key);
 
-    // Clean up
     decryptor_handle.abort();
     aggregator_handle.abort();
 
     Ok(())
 }
 
-// End-to-end test
 async fn test_end_to_end_impl(
     config: TestConfig,
     num_rounds: u32,
@@ -159,11 +187,9 @@ async fn test_end_to_end_impl(
 ) -> Result<()> {
     let db = sled::Config::default().temporary(true).open()?;
 
-    // Generate HPKE keypairs
     let decryptor_keys = ServerKeys::generate();
     let aggregator_keys = ServerKeys::generate();
 
-    // Start the aggregator
     let aggregator = Aggregator::new(
         &config.aggregator_addr,
         config.num_clients,
@@ -171,7 +197,7 @@ async fn test_end_to_end_impl(
         config.prover,
         db,
         aggregator_keys.clone(),
-        100_000, // agg_chunk_size
+        4,
     );
     let aggregator_handle = tokio::spawn(async move {
         if let Err(e) = aggregator.run().await {
@@ -179,10 +205,8 @@ async fn test_end_to_end_impl(
         }
     });
 
-    // Give the aggregator time to start
     sleep(Duration::from_millis(100)).await;
 
-    // Start the decryptor
     let decryptor_db = sled::Config::default().temporary(true).open()?;
     let decryptor = Decryptor::new(
         &config.decryptor_addr,
@@ -198,10 +222,8 @@ async fn test_end_to_end_impl(
         }
     });
 
-    // Give the decryptor time to start and connect to aggregator
     sleep(Duration::from_millis(100)).await;
 
-    // Register all clients
     let mut clients = Vec::new();
     for _ in 0..config.num_clients {
         let client = Client::register(
@@ -215,22 +237,22 @@ async fn test_end_to_end_impl(
         clients.push(client);
     }
 
-    // Wait for key commitments to propagate to aggregator
     sleep(Duration::from_millis(100)).await;
 
-    // Generate random inputs based on prover type
     let mut rng = OsRng;
     let max_val = match config.prover {
         ProverType::Binary => 2,
         ProverType::Range(bitlength) => 1u64 << bitlength,
     };
+    let (binary, bitlength) = match config.prover {
+        ProverType::Binary => (true, None),
+        ProverType::Range(bl) => (false, Some(bl)),
+    };
 
-    // Run multiple rounds
     for round in 0..num_rounds {
         let mut expected_sums = vec![0u64; config.length];
         let mut client_inputs: Vec<Vec<u64>> = Vec::new();
 
-        // Generate inputs for all clients
         for _ in 0..config.num_clients {
             let inputs: Vec<u64> = (0..config.length)
                 .map(|_| rng.gen_range(0..max_val))
@@ -238,7 +260,6 @@ async fn test_end_to_end_impl(
             client_inputs.push(inputs);
         }
 
-        // Determine which clients will submit (all except dropouts)
         let num_submitting = config.num_clients - num_dropouts;
         for i in 0..num_submitting {
             for (j, &val) in client_inputs[i].iter().enumerate() {
@@ -246,43 +267,22 @@ async fn test_end_to_end_impl(
             }
         }
 
-        // Register context config before reports
-        let (binary, bitlength) = match config.prover {
-            ProverType::Binary => (true, None),
-            ProverType::Range(bl) => (false, Some(bl)),
-        };
-        let mut reg_socket = TcpStream::connect(&config.aggregator_addr).await?;
-        write_message(
-            &mut reg_socket,
-            &Message::SetContextConfig {
-                context: round,
-                binary,
-                bitlength,
-                simulated: false,
-                sim_dropouts: vec![],
-            },
-        )
-        .await?;
-        let reg_resp = read_message(&mut reg_socket).await?;
-        if !matches!(reg_resp, Message::Success {}) {
-            return Err(anyhow!("SetContextConfig failed: {:?}", reg_resp));
-        }
-
-        // Clients submit reports for this round
+        // Generate reports and serialize envelopes into batched format
+        let mut reports: Vec<(u32, Vec<u8>)> = Vec::new();
         for i in 0..num_submitting {
-            clients[i].report(round, &client_inputs[i]).await?;
+            let report = clients[i].generate_report(round, &client_inputs[i])?;
+            if let Message::EncryptedClientReport { id, envelope, .. } = report {
+                reports.push((id, bincode::serialize(&envelope)?));
+            }
         }
 
-        // Request aggregation
-        let mut socket = TcpStream::connect(&config.aggregator_addr).await?;
-        write_message(&mut socket, &Message::AggregationRequest { context: round }).await?;
-        let response = read_message(&mut socket).await?;
-
-        let result = match response {
-            Message::AggregationResponse { result } => result,
-            Message::Error(e) => return Err(anyhow!("Round {} aggregation failed: {}", round, e)),
-            _ => return Err(anyhow!("Unexpected response")),
-        };
+        let result = stream_aggregate(
+            &config.aggregator_addr,
+            round,
+            reports,
+            binary,
+            bitlength,
+        ).await?;
 
         assert_eq!(
             result, expected_sums,
@@ -291,7 +291,6 @@ async fn test_end_to_end_impl(
         );
     }
 
-    // Clean up
     decryptor_handle.abort();
     aggregator_handle.abort();
 
@@ -310,14 +309,12 @@ async fn test_end_to_end_range() -> Result<()> {
     test_end_to_end_impl(TestConfig::range(8, 4, 8), 1, 0).await
 }
 
-/// Test multiple rounds of aggregation
 #[tokio::test]
 async fn test_multiple_rounds() -> Result<()> {
     init_tracing();
     test_end_to_end_impl(TestConfig::binary(6, 2), 3, 0).await
 }
 
-/// Test with many clients to ensure multi-chunk batch verification
 #[tokio::test]
 async fn test_multi_chunk_verification() -> Result<()> {
     init_tracing();
@@ -334,8 +331,6 @@ async fn test_with_dropouts() -> Result<()> {
     test_end_to_end_impl(config, 1, num_dropouts).await
 }
 
-/// End-to-end test using simulated setup: no attestation, hardcoded PRF key.
-/// Client triggers SimulateSetup once; decryptor and aggregator compute keys locally.
 #[tokio::test]
 async fn test_end_to_end_simulated_setup() -> Result<()> {
     init_tracing();
@@ -353,7 +348,7 @@ async fn test_end_to_end_simulated_setup() -> Result<()> {
         config.prover,
         db,
         aggregator_keys.clone(),
-        100_000, // agg_chunk_size
+        4,
     );
     let aggregator_handle = tokio::spawn(async move {
         if let Err(e) = aggregator.run().await {
@@ -380,13 +375,9 @@ async fn test_end_to_end_simulated_setup() -> Result<()> {
 
     sleep(Duration::from_millis(100)).await;
 
-    // Simulated setup: one RPC to decryptor, decryptor and aggregator do local setup
     Client::trigger_sim_setup(&config.decryptor_addr).await?;
-
-    // Wait for decryptor→aggregator SimulateSetup to complete
     sleep(Duration::from_millis(200)).await;
 
-    // Create clients from hardcoded key (no registration)
     let clients: Vec<Client> = (0..config.num_clients)
         .map(|id| {
             Client::new_simulated(
@@ -398,7 +389,6 @@ async fn test_end_to_end_simulated_setup() -> Result<()> {
         })
         .collect();
 
-    // One round: submit reports and aggregate
     let mut rng = OsRng;
     let mut expected_sums = vec![0u64; config.length];
     let mut client_inputs: Vec<Vec<u64>> = Vec::new();
@@ -410,40 +400,21 @@ async fn test_end_to_end_simulated_setup() -> Result<()> {
         client_inputs.push(inputs);
     }
 
-    let (binary, bitlength) = match config.prover {
-        ProverType::Binary => (true, None),
-        ProverType::Range(bl) => (false, Some(bl)),
-    };
-    let mut reg_socket = TcpStream::connect(&config.aggregator_addr).await?;
-    write_message(
-        &mut reg_socket,
-        &Message::SetContextConfig {
-            context: 0,
-            binary,
-            bitlength,
-            simulated: false,
-            sim_dropouts: vec![],
-        },
-    )
-    .await?;
-    let reg_resp = read_message(&mut reg_socket).await?;
-    if !matches!(reg_resp, Message::Success {}) {
-        return Err(anyhow!("SetContextConfig failed: {:?}", reg_resp));
-    }
-
+    let mut reports: Vec<(u32, Vec<u8>)> = Vec::new();
     for (i, client) in clients.iter().enumerate() {
-        client.report(0, &client_inputs[i]).await?;
+        let report = client.generate_report(0, &client_inputs[i])?;
+        if let Message::EncryptedClientReport { id, envelope, .. } = report {
+            reports.push((id, bincode::serialize(&envelope)?));
+        }
     }
 
-    let mut socket = TcpStream::connect(&config.aggregator_addr).await?;
-    write_message(&mut socket, &Message::AggregationRequest { context: 0 }).await?;
-    let response = read_message(&mut socket).await?;
-
-    let result = match response {
-        Message::AggregationResponse { result } => result,
-        Message::Error(e) => return Err(anyhow!("Aggregation failed: {}", e)),
-        _ => return Err(anyhow!("Unexpected response")),
-    };
+    let result = stream_aggregate(
+        &config.aggregator_addr,
+        0,
+        reports,
+        true,
+        None,
+    ).await?;
 
     assert_eq!(result, expected_sums, "Simulated setup e2e: results don't match");
 

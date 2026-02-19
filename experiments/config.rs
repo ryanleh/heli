@@ -29,13 +29,13 @@ pub struct ExperimentConfig {
     /// Path to the sled database
     pub db_path: String,
 
-    /// Number of reports to load before starting verification (default: 100000)
-    #[serde(default = "default_agg_chunk_size")]
-    pub agg_chunk_size: usize,
+    /// Max in-flight batches on the aggregator before backpressure kicks in (default: 4)
+    #[serde(default = "default_max_pending_batches")]
+    pub max_pending_batches: usize,
 }
 
-fn default_agg_chunk_size() -> usize {
-    100_000
+fn default_max_pending_batches() -> usize {
+    4
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -87,7 +87,3 @@ path = "experiments/decryptor.rs"
 [[bin]]
 name = "exp_client"
 path = "experiments/client.rs"
-
-[[bin]]
-name = "sled_test"
-path = "benches/bin/sled_test.rs"
