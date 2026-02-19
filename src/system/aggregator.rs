@@ -7,10 +7,7 @@ use crate::{
         prf::ScalarPRF,
     },
     proofs::{Proof, VerifierKey},
-    system::{
-        ProverType,
-        messages::{pack_indices, *},
-    },
+    system::{ProverType, messages::*},
 };
 
 use anyhow::{Result, anyhow};
@@ -28,6 +25,10 @@ use tokio::{
 use tracing::{debug, error, info};
 
 const VERIFY_BATCH_SIZE: usize = 128;
+
+/// When true, dropout indices are sent to the decryptor as 3-byte packed ClientIndex values.
+/// When false, they are sent as plain u32s (more bandwidth, but faster serialization).
+const PACK_DROPOUTS: bool = false;
 
 pub struct Aggregator {
     addr: String,
@@ -541,13 +542,15 @@ impl Aggregator {
             .request_send
             .get()
             .ok_or_else(|| anyhow!("Decryptor not connected"))?;
-        let dropouts_packed = pack_indices(dropouts, state.num_clients);
+        let dropouts = if PACK_DROPOUTS {
+            DropoutList::Packed(dropouts.iter().map(|&i| crate::ClientIndex::from(i)).collect())
+        } else {
+            DropoutList::Plain(dropouts.iter().map(|&i| i as u32).collect())
+        };
         sender
             .send(Message::DecryptMaskRequest {
                 context,
-                num_clients: state.num_clients,
-                dropout_count: dropouts.len(),
-                dropouts_packed,
+                dropouts,
                 invert: false,
                 length,
             })

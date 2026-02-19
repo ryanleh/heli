@@ -410,9 +410,7 @@ impl Decryptor {
         loop {
             let Message::DecryptMaskRequest {
                 context,
-                num_clients,
-                dropout_count,
-                dropouts_packed,
+                dropouts,
                 invert,
                 length,
             } = read_message(socket).await?
@@ -422,6 +420,7 @@ impl Decryptor {
             };
 
             let wall_start = Instant::now();
+            let dropout_count = dropouts.len();
 
             // Validate context
             {
@@ -439,7 +438,7 @@ impl Decryptor {
             let online = if invert {
                 dropout_count
             } else {
-                num_clients - dropout_count
+                state.num_clients - dropout_count
             };
             if online < state.threshold {
                 return Err(anyhow!("Threshold not met: {online} < {}", state.threshold));
@@ -452,33 +451,19 @@ impl Decryptor {
                 .ok_or_else(|| anyhow!("Setup incomplete"))?
                 .clone();
 
-            // Compute mask with detailed timing (inlined from AggOnlyEnc::decrypt_mask)
-            // Uses fused unpack+evaluate to avoid allocating Vec<usize> for dropouts
             let (mask, dropout_key_time, mask_compute_time) =
                 tokio::task::spawn_blocking(move || {
-                    // Phase 1: Compute dropout-adjusted key (fused unpack + batch evaluate)
                     let dropout_key_start = Instant::now();
+                    let dropout_sum = match &dropouts {
+                        DropoutList::Packed(indices) => sk.keygen_prf.batch_evaluate_client_indices(indices),
+                        DropoutList::Plain(indices) => sk.keygen_prf.batch_evaluate_u32(indices),
+                    };
                     let key = match dropout_count {
                         0 => sk.prf_key,
-                        _ => match invert {
-                            false => {
-                                sk.prf_key
-                                    - sk.keygen_prf.batch_evaluate_packed(
-                                        &dropouts_packed,
-                                        dropout_count,
-                                        num_clients,
-                                    )
-                            }
-                            true => sk.keygen_prf.batch_evaluate_packed(
-                                &dropouts_packed,
-                                dropout_count,
-                                num_clients,
-                            ),
-                        },
+                        _ => if invert { dropout_sum } else { sk.prf_key - dropout_sum },
                     };
                     let dropout_key_time = dropout_key_start.elapsed();
 
-                    // Phase 2: Compute the actual mask (parallel KHPRF evaluations)
                     let mask_start = Instant::now();
                     let mask: Vec<G> = (0..length)
                         .into_par_iter()
@@ -497,7 +482,7 @@ impl Decryptor {
 
             info!(
                 "Decrypt mask for context {context}: {online} online clients\n\t\
-                 Dropout key (fused unpack+eval): {:?}\n\t\
+                 Dropout key: {:?}\n\t\
                  Mask computation: {:?}\n\t\
                  Total: {:?}",
                 dropout_key_time,

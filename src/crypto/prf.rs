@@ -80,31 +80,25 @@ impl ScalarPRF {
         Self::finalize_accum(accum)
     }
 
-    /// Computes the sum of PRF evaluations for bitpacked indices (fused unpack + evaluate).
-    /// This avoids allocating a Vec<usize> for the unpacked indices.
-    pub fn batch_evaluate_packed(&self, packed: &[u8], count: usize, num_clients: usize) -> Scalar {
-        if count == 0 {
+    /// Computes the sum of PRF evaluations over a slice of 3-byte ClientIndex values.
+    pub fn batch_evaluate_client_indices(&self, indices: &[crate::ClientIndex]) -> Scalar {
+        if indices.is_empty() {
             return Scalar::ZERO;
         }
-        let bits_per_index = if num_clients <= 1 {
-            1
-        } else {
-            (usize::BITS - (num_clients - 1).leading_zeros()) as usize
-        };
         let mut accum = [0u64; 5];
+        for idx in indices {
+            self.accumulate_eval(&mut accum, u64::from(*idx));
+        }
+        Self::finalize_accum(accum)
+    }
 
-        for i in 0..count {
-            // Unpack single index
-            let bit_offset = i * bits_per_index;
-            let mut idx = 0u64;
-            for b in 0..bits_per_index {
-                let global_bit = bit_offset + b;
-                if (packed[global_bit / 8] >> (global_bit % 8)) & 1 == 1 {
-                    idx |= 1 << b;
-                }
-            }
-            // Immediately evaluate and accumulate
-            self.accumulate_eval(&mut accum, idx);
+    pub fn batch_evaluate_u32(&self, indices: &[u32]) -> Scalar {
+        if indices.is_empty() {
+            return Scalar::ZERO;
+        }
+        let mut accum = [0u64; 5];
+        for &idx in indices {
+            self.accumulate_eval(&mut accum, idx as u64);
         }
         Self::finalize_accum(accum)
     }
