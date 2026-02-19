@@ -28,7 +28,7 @@ const VERIFY_BATCH_SIZE: usize = 128;
 
 /// When true, dropout indices are sent to the decryptor as 3-byte packed ClientIndex values.
 /// When false, they are sent as plain u32s (more bandwidth, but faster serialization).
-const PACK_DROPOUTS: bool = false;
+const PACK_DROPOUTS: bool = true;
 
 pub struct Aggregator {
     addr: String,
