@@ -116,6 +116,7 @@ async fn test_decryptor_setup() -> Result<()> {
         db,
         aggregator_keys.clone(),
         4,
+        64,
     );
     let aggregator_handle = tokio::spawn(async move {
         if let Err(e) = aggregator.run().await {
@@ -198,6 +199,7 @@ async fn test_end_to_end_impl(
         db,
         aggregator_keys.clone(),
         4,
+        64,
     );
     let aggregator_handle = tokio::spawn(async move {
         if let Err(e) = aggregator.run().await {
@@ -349,6 +351,7 @@ async fn test_end_to_end_simulated_setup() -> Result<()> {
         db,
         aggregator_keys.clone(),
         4,
+        64,
     );
     let aggregator_handle = tokio::spawn(async move {
         if let Err(e) = aggregator.run().await {

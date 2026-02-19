@@ -61,6 +61,7 @@ async fn main() -> Result<()> {
         db,
         hpke_keys,
         config.max_pending_batches,
+        config.reports_per_chunk,
     );
 
     info!("Starting aggregator on {}", config.aggregator_addr);

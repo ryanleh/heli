@@ -45,6 +45,7 @@ pub struct AggregatorState {
     request_send: OnceCell<mpsc::Sender<Message>>,
     mask_recv: Mutex<Option<mpsc::Receiver<Message>>>,
     max_pending_batches: usize,
+    reports_per_chunk: usize,
 }
 
 impl Aggregator {
@@ -56,6 +57,7 @@ impl Aggregator {
         db: Db,
         hpke_keys: ServerKeys,
         max_pending_batches: usize,
+        reports_per_chunk: usize,
     ) -> Self {
         let state = Arc::new(AggregatorState {
             num_clients,
@@ -66,6 +68,7 @@ impl Aggregator {
             request_send: OnceCell::new(),
             mask_recv: Mutex::new(None),
             max_pending_batches,
+            reports_per_chunk,
         });
 
         Self { addr: addr.to_string(), state }
@@ -204,25 +207,35 @@ impl Aggregator {
             (all_online, aggregate)
         });
 
-        // Reader loop: read batches from network, pipe to processor via bounded channel
+        // Reader loop: read batches from network, combine into larger chunks,
+        // then pipe to processor via bounded channel (backpressure when full).
         let recv_start = Instant::now();
         let mut total_reports = 0usize;
+        let mut chunk = Vec::with_capacity(state.reports_per_chunk);
         for _ in 0..num_batches {
             let message = read_message(socket).await?;
             if let Message::BatchEncryptedClientReports { reports, .. } = message {
                 total_reports += reports.len();
-                let reports = if simulated {
-                    reports.into_iter()
-                        .map(|(id, data)| (id % BATCH_REPORT_SIZE as u32, data))
-                        .collect()
+                if simulated {
+                    chunk.extend(
+                        reports.into_iter()
+                            .map(|(id, data)| (id % BATCH_REPORT_SIZE as u32, data)),
+                    );
                 } else {
-                    reports
-                };
-                batch_tx.send(reports).await
-                    .map_err(|_| anyhow!("Processor thread died"))?;
+                    chunk.extend(reports);
+                }
+                if chunk.len() >= state.reports_per_chunk {
+                    batch_tx.send(std::mem::replace(&mut chunk, Vec::with_capacity(state.reports_per_chunk)))
+                        .await
+                        .map_err(|_| anyhow!("Processor thread died"))?;
+                }
             } else {
                 return Err(anyhow!("Expected BatchEncryptedClientReports"));
             }
+        }
+        if !chunk.is_empty() {
+            batch_tx.send(chunk).await
+                .map_err(|_| anyhow!("Processor thread died"))?;
         }
         drop(batch_tx);
         info!(
