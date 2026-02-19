@@ -33,11 +33,26 @@ for f in "${CONFIGS[@]}"; do
 done
 
 # Run setup once
+echo "============================================================"
+echo "Running setup"
+echo "------------------------------------------------------------"
+
 cargo run --release --bin exp_client -- "${CONFIGS[0]}" --mode sim-setup --clear-db
 sleep 2
 
 # Run the rest of the workflow for each config
 for f in "${CONFIGS[@]}"; do
+  echo -e "\n\n"
+  echo "============================================================"
+  echo "Running config: ${f}"
+  echo "------------------------------------------------------------"
+  echo "---------------------"
+  echo "Generating queries:"
+  echo -e "---------------------\n"
   cargo run --release --bin exp_client -- "${f}" --mode sim-generate
+
+  echo "---------------------"
+  echo "Aggregation:"
+  echo "---------------------"
   cargo run --release --bin exp_client -- "${f}" --mode aggregate
 done
