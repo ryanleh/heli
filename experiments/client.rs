@@ -731,8 +731,11 @@ async fn run_submit(config: &ExperimentConfig, max_concurrency: usize, db: Arc<D
             };
             socket.set_nodelay(true).ok();
 
-            // Stream mode - don't specify num_batches upfront
-            if let Err(e) = write_message(&mut socket, &Message::BatchStreamStart { num_batches: 0 }).await {
+            // Stream mode
+            if let Err(e) = write_message(
+                &mut socket,
+                &Message::BatchStreamStart { num_batches }
+            ).await {
                 error!("Failed to send BatchStreamStart: {e}");
                 return;
             }

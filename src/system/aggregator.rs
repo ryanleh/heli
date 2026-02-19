@@ -63,6 +63,8 @@ pub struct AggregatorState {
     num_reported: AtomicUsize,
     // Channel for funneling all report writes through a single thread (std channel for use with std::thread)
     report_write_tx: std::sync::mpsc::Sender<(u32, Vec<(u32, Vec<u8>)>)>,
+    /// Number of batches sent to writer but not yet flushed. Aggregation fails while > 0.
+    pending_write_batches: Arc<AtomicUsize>,
     // Number of reports to load before starting verification
     agg_chunk_size: usize,
 }
@@ -78,11 +80,13 @@ impl Aggregator {
         agg_chunk_size: usize,
     ) -> Self {
         let (report_write_tx, report_write_rx) = std::sync::mpsc::channel();
+        let pending_write_batches = Arc::new(AtomicUsize::new(0));
 
         // Spawn dedicated writer thread
         let writer_db = db.clone();
+        let writer_pending = Arc::clone(&pending_write_batches);
         std::thread::spawn(move || {
-            Self::report_writer_thread(writer_db, report_write_rx);
+            Self::report_writer_thread(writer_db, report_write_rx, writer_pending);
         });
 
         let state = Arc::new(AggregatorState {
@@ -96,13 +100,18 @@ impl Aggregator {
             reporting_start: RwLock::new(None),
             num_reported: AtomicUsize::new(0),
             report_write_tx,
+            pending_write_batches,
             agg_chunk_size,
         });
 
         Self { addr: addr.to_string(), state }
     }
 
-    fn report_writer_thread(db: Db, rx: std::sync::mpsc::Receiver<(u32, Vec<(u32, Vec<u8>)>)>) {
+    fn report_writer_thread(
+        db: Db,
+        rx: std::sync::mpsc::Receiver<(u32, Vec<(u32, Vec<u8>)>)>,
+        pending_batches: Arc<AtomicUsize>,
+    ) {
         let mut key = [0u8; 19];
         key[0] = b'r';
         key[1] = b'/';
@@ -117,6 +126,12 @@ impl Aggregator {
                 batch.insert(&key[..], envelope_bytes);
             }
             db.apply_batch(batch).ok();
+
+            let remaining = pending_batches.fetch_sub(1, Ordering::SeqCst);
+            info!("Writer thread: remaining {}", remaining);
+            if remaining == 0 {
+                info!("All report batches flushed; aggregation requests are now allowed.");
+            }
         }
     }
 
@@ -169,10 +184,15 @@ impl Aggregator {
         let mut total_reports = 0usize;
         let mut context_set = false;
         let mut batches_received = 0usize;
+       
+        // Let the writer thread know how many batches to expect
+        state.pending_write_batches.fetch_add(num_batches, Ordering::SeqCst);
+        println!("NUM BATCHES {}", num_batches);
 
         // If num_batches is 0, stream until connection closes; otherwise read exactly num_batches
         loop {
             if num_batches > 0 && batches_received >= num_batches {
+                info!("HERE, printed {}", batches_received);
                 break;
             }
 
@@ -263,6 +283,16 @@ impl Aggregator {
     async fn handle_aggregation_request(socket: &mut TcpStream, state: Arc<AggregatorState>, context: u32) {
         let start = Instant::now();
         info!("Aggregation request for context {context}");
+
+        if state.pending_write_batches.load(Ordering::SeqCst) != 0 {
+            send_error_message(
+                socket,
+                "Report writer still flushing; aggregation not allowed yet.",
+            )
+            .await
+            .ok();
+            return;
+        }
 
         let is_simulated = state.db.get(format!("sim/{context:08x}").as_bytes()).ok().flatten().is_some();
 
@@ -692,9 +722,11 @@ impl Aggregator {
                 };
 
                 chunks_processed += 1;
-                if chunks_processed % 10 == 0 {
-                    info!("Processed {} chunks ({} reports so far)", chunks_processed, all_online.len());
-                }
+                info!(
+                    "Aggregator has finished {} chunks so far ({} reports)",
+                    chunks_processed,
+                    all_online.len()
+                );
             }
 
             // Wait for loader to finish and get timing
