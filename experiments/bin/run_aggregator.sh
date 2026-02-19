@@ -8,7 +8,7 @@ CONFIGS=(
 )
 
 export RUST_LOG=info
-#export RUSTFLAGS="-C target-cpu=native"
+export RUSTFLAGS="-C target-cpu=native"
 
 # Run the aggregator
 cargo run --release --bin exp_aggregator -- "${CONFIGS[0]}" --clear-db

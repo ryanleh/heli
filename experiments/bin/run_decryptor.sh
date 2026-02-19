@@ -15,7 +15,7 @@ CONFIGS=(
 )
 
 export RUST_LOG=info
-#export RUSTFLAGS="-C target-cpu=native"
+export RUSTFLAGS="-C target-cpu=native"
 
 # Update the configs file
 for f in "${CONFIGS[@]}"; do
