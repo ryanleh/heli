@@ -51,7 +51,12 @@ async fn main() -> Result<()> {
 
     // Open the database
     info!("Opening database at {}", config.db_path);
-    let db = sled::open(&config.db_path)?;
+    let db = Config::default()
+        .path(&config.db_path)
+        .mode(Mode::HighThroughput)
+        .flush_every_ms(Some(2000)) // TODO: Tune
+        .open()?;
+
     info!("Database opened, {} total keys", db.len());
 
     // Clear reports if requested
