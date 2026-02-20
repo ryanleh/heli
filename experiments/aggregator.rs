@@ -16,10 +16,6 @@ struct Args {
     /// Path to the experiment config JSON file
     config: PathBuf,
 
-    /// Clear stored reports before starting
-    #[arg(long)]
-    clear_reports: bool,
-
     /// Fully clear database
     #[arg(long)]
     clear_db: bool,
@@ -41,7 +37,6 @@ async fn main() -> Result<()> {
     let config = ExperimentConfig::from_file(&args.config)?;
     info!("Loaded config: {:?}", config);
 
-    // Clear DB if requested
     if args.clear_db {
         info!("Clearing database at {}", config.db_path);
         if std::path::Path::new(&config.db_path).exists() {
@@ -49,27 +44,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Open the database
-    let db = sled::open(&config.db_path)?;
+    info!("Opening database at {}", config.db_path);
+    let db = sled::Config::default().path(&config.db_path).open()?;
 
-    // Clear reports if requested
-    if args.clear_reports {
-        info!("Clearing reports from database");
-        let keys: Vec<Vec<u8>> = db
-            .scan_prefix(b"r/")
-            .keys()
-            .map(|res| res.map(|k| k.to_vec()))
-            .collect::<Result<_, _>>()?;
+    info!("Database opened, {} total keys", db.len());
 
-        let num_keys = keys.len();
-        for key in keys {
-            db.remove(key)?;
-        }
-        db.flush()?;
-        info!("Cleared {} report keys", num_keys);
-    }
-
-    // Load HPKE keys
     let hpke_keys = aggregator_keys();
 
     let aggregator = Aggregator::new(
@@ -79,6 +58,8 @@ async fn main() -> Result<()> {
         config.prover.to_prover_type(),
         db,
         hpke_keys,
+        config.max_pending_batches,
+        config.reports_per_chunk,
     );
 
     info!("Starting aggregator on {}", config.aggregator_addr);

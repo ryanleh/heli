@@ -1,8 +1,10 @@
 use crate::{
+    BATCH_REPORT_SIZE,
     agg_only_enc::{AggOnlyEnc, Ciphertext},
     crypto::{
         G,
         hpke::{ServerKeys, hpke_decrypt},
+        prf::ScalarPRF,
     },
     proofs::{Proof, VerifierKey},
     system::{ProverType, messages::*},
@@ -14,20 +16,19 @@ use rand::rngs::OsRng;
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 use rayon::prelude::*;
-use sled::{Db, IVec};
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
-use std::time::Duration;
+use sled::Db;
+use std::{collections::HashSet, sync::Arc, time::Instant};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Mutex, OnceCell, RwLock, mpsc},
 };
 use tracing::{debug, error, info};
 
-// Batch size for proof verification
-const BATCH_SIZE: usize = 128;
+const VERIFY_BATCH_SIZE: usize = 128;
+
+/// When true, dropout indices are sent to the decryptor as 3-byte packed ClientIndex values.
+/// When false, they are sent as plain u32s (more bandwidth, but faster serialization).
+const PACK_DROPOUTS: bool = true;
 
 pub struct Aggregator {
     addr: String,
@@ -36,29 +37,15 @@ pub struct Aggregator {
 
 pub struct AggregatorState {
     num_clients: usize,
+    #[allow(dead_code)]
     threshold: usize,
-    prover: ProverType,
     db: Db,
     hpke_keys: ServerKeys,
     current_ctx: RwLock<Option<u32>>,
-
-    // Channels for communicating decryption masks and aggregation results
     request_send: OnceCell<mpsc::Sender<Message>>,
     mask_recv: Mutex<Option<mpsc::Receiver<Message>>>,
-
-    // Benchmarking state (only works for single round)
-    reporting_start: OnceCell<std::time::Instant>,
-    num_reported: AtomicUsize,
-}
-
-// Low-level timing information for aggregation
-#[derive(Debug, Clone)]
-struct OpTiming {
-    load: Duration,
-    decrypt: Duration,
-    decode: Duration,
-    verify: Duration,
-    aggregate: Duration,
+    max_pending_batches: usize,
+    reports_per_chunk: usize,
 }
 
 impl Aggregator {
@@ -66,21 +53,22 @@ impl Aggregator {
         addr: &str,
         num_clients: usize,
         threshold: usize,
-        prover: ProverType,
+        _prover: ProverType,
         db: Db,
         hpke_keys: ServerKeys,
+        max_pending_batches: usize,
+        reports_per_chunk: usize,
     ) -> Self {
         let state = Arc::new(AggregatorState {
             num_clients,
             threshold,
-            prover,
             db,
             hpke_keys,
             current_ctx: RwLock::new(None),
             request_send: OnceCell::new(),
             mask_recv: Mutex::new(None),
-            reporting_start: OnceCell::new(),
-            num_reported: AtomicUsize::new(0),
+            max_pending_batches,
+            reports_per_chunk,
         });
 
         Self {
@@ -90,20 +78,13 @@ impl Aggregator {
     }
 
     pub async fn run(&self) -> Result<()> {
-        debug!("Starting aggregator on {}", self.addr);
         let listener = TcpListener::bind(&self.addr).await?;
         info!("Aggregator listening on {}", self.addr);
 
         loop {
-            match listener.accept().await {
-                Ok((socket, addr)) => {
-                    debug!("New connection from {}", addr);
-                    tokio::spawn(Self::handle_connection(socket, self.state.clone()));
-                }
-                Err(e) => {
-                    error!("Failed to accept connection: {}", e);
-                }
-            }
+            let (socket, addr) = listener.accept().await?;
+            debug!("Connection from {}", addr);
+            tokio::spawn(Self::handle_connection(socket, self.state.clone()));
         }
     }
 
@@ -111,571 +92,551 @@ impl Aggregator {
         let message = match read_message(&mut socket).await {
             Ok(msg) => msg,
             Err(e) => {
-                let _ = send_error_message(&mut socket, &format!("Failed to read message: {}", e))
-                    .await;
+                send_error_message(&mut socket, &format!("Failed to read: {e}"))
+                    .await
+                    .ok();
                 return;
             }
         };
 
-        // Handle the request
-        //
-        // TODO: Better error handling + formatting
         match message {
             Message::DecryptorInit {} => {
-                // Channel for asking for + receiving decryption masks
-                let (request_send, request_recv) = mpsc::channel(10);
-                let (mask_send, mask_recv) = mpsc::channel(10);
-                state.request_send.set(request_send).unwrap();
-                *state.mask_recv.lock().await = Some(mask_recv);
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        Self::handle_decryptor_connection(socket, state, request_recv, mask_send)
-                            .await
-                    {
-                        error!("Error communicating with decryptor: {e:?}");
-                    }
-                });
+                Self::handle_decryptor_init(socket, state).await;
             }
-            Message::EncryptedClientReport {
-                id,
+            Message::AggregateStreamStart {
                 context,
-                envelope,
-            } => match Self::store_client_report(state, id, context, envelope).await {
-                Ok(()) => {
-                    write_message(&mut socket, &Message::Success {}).await.ok();
-                }
-                Err(e) => {
-                    send_error_message(&mut socket, &format!("Saving report failed: {}", e))
-                        .await
-                        .ok();
-                }
-            },
-            Message::BatchEncryptedClientReports { reports } => {
-                match Self::store_batch_client_reports(state, reports).await {
-                    Ok(()) => {
-                        write_message(&mut socket, &Message::Success {}).await.ok();
-                    }
-                    Err(e) => {
-                        send_error_message(
-                            &mut socket,
-                            &format!("Saving batch reports failed: {}", e),
-                        )
-                        .await
-                        .ok();
-                    }
-                }
-            }
-            Message::AggregationRequest { context } => {
-                match Self::aggregate(state, context).await {
-                    Ok(result) => {
-                        write_message(&mut socket, &Message::AggregationResponse { result })
-                            .await
-                            .ok();
-                    }
-                    Err(e) => {
-                        send_error_message(&mut socket, &format!("Aggregation failed: {}", e))
-                            .await
-                            .ok();
-                    }
-                }
+                num_batches,
+                binary,
+                bitlength,
+                simulated,
+                sim_dropouts,
+            } => {
+                Self::handle_aggregate_stream(
+                    &mut socket,
+                    state,
+                    context,
+                    num_batches,
+                    binary,
+                    bitlength,
+                    simulated,
+                    sim_dropouts,
+                )
+                .await;
             }
             _ => {
-                send_error_message(&mut socket, &format!("Invalid request"))
+                send_error_message(&mut socket, "Invalid request")
                     .await
                     .ok();
             }
-        };
+        }
     }
 
-    /// Helper function for handling the connection with the decryptor
+    // --- Aggregate stream: combined submit + aggregate, fully in-memory ---
+
+    async fn handle_aggregate_stream(
+        socket: &mut TcpStream,
+        state: Arc<AggregatorState>,
+        context: u32,
+        num_batches: usize,
+        binary: bool,
+        bitlength: Option<usize>,
+        simulated: bool,
+        sim_dropouts: Vec<u32>,
+    ) {
+        // Ensure no other aggregation is in progress
+        {
+            let mut current = state.current_ctx.write().await;
+            if current.is_some() {
+                send_error_message(socket, "Another aggregation is already in progress")
+                    .await
+                    .ok();
+                return;
+            }
+            *current = Some(context);
+        }
+
+        info!(
+            "Aggregate stream for context {context}: {num_batches} batches, simulated={simulated}"
+        );
+
+        let result = Self::run_aggregate_stream(
+            socket,
+            &state,
+            context,
+            num_batches,
+            binary,
+            bitlength,
+            simulated,
+            sim_dropouts,
+        )
+        .await;
+
+        match result {
+            Ok(data) => {
+                write_message(socket, &Message::AggregationResponse { result: data })
+                    .await
+                    .ok();
+            }
+            Err(e) => {
+                error!("Aggregate stream failed: {e}");
+                send_error_message(socket, &format!("Aggregation failed: {e}"))
+                    .await
+                    .ok();
+            }
+        }
+
+        info!("Sent {}B, Recv {}B", bytes_sent(), bytes_recv());
+        reset_byte_counters();
+
+        *state.current_ctx.write().await = None;
+    }
+
+    async fn run_aggregate_stream(
+        socket: &mut TcpStream,
+        state: &AggregatorState,
+        context: u32,
+        num_batches: usize,
+        binary: bool,
+        bitlength: Option<usize>,
+        simulated: bool,
+        sim_dropouts: Vec<u32>,
+    ) -> Result<Vec<u64>> {
+        let vk = Self::build_vk(state, binary, bitlength)?;
+        let hpke_sk = state.hpke_keys.sk.clone();
+
+        // Bounded channel: once full, the reader blocks, applying backpressure to the network
+        let (batch_tx, mut batch_rx) =
+            mpsc::channel::<Vec<(u32, Vec<u8>)>>(state.max_pending_batches);
+
+        // Processor thread: pulls batches from the channel, decrypts/verifies/aggregates
+        let proc_context = context;
+        let proc_reports_per_chunk = state.reports_per_chunk as f64;
+        let processor_handle = std::thread::spawn(move || {
+            let mut all_online = Vec::new();
+            let mut aggregate: Option<Ciphertext> = None;
+            let mut total_decrypt = std::time::Duration::ZERO;
+            let mut total_verify = std::time::Duration::ZERO;
+            let mut total_agg = std::time::Duration::ZERO;
+            let mut chunks_processed = 0usize;
+            let num_chunks =
+                (((BATCH_REPORT_SIZE * num_batches) as f64) / proc_reports_per_chunk).ceil();
+
+            while let Some(reports) = batch_rx.blocking_recv() {
+                let (online, agg, dt, vt, at) = process_chunk(&hpke_sk, &vk, proc_context, reports);
+                total_decrypt += dt;
+                total_verify += vt;
+                total_agg += at;
+                all_online.extend(online);
+                aggregate = match (aggregate, agg) {
+                    (Some(a), Some(b)) => Some(a + b),
+                    (Some(a), None) => Some(a),
+                    (None, b) => b,
+                };
+                chunks_processed += 1;
+                if chunks_processed % 10 == 0 {
+                    info!("Processed chunks {chunks_processed}/{num_chunks}");
+                }
+            }
+
+            info!(
+                "Timing breakdown:\n\tHPKE Decrypt: {:?}\n\tVerify: {:?}\n\tAggregate: {:?}",
+                total_decrypt, total_verify, total_agg
+            );
+            (all_online, aggregate)
+        });
+
+        // Reader loop: read batches from network, combine into larger chunks,
+        // then pipe to processor via bounded channel (backpressure when full).
+        let recv_start = Instant::now();
+        let mut total_reports = 0usize;
+        let mut chunk = Vec::with_capacity(state.reports_per_chunk);
+        for _ in 0..num_batches {
+            let message = read_message(socket).await?;
+            if let Message::BatchEncryptedClientReports { reports, .. } = message {
+                total_reports += reports.len();
+                if simulated {
+                    chunk.extend(
+                        reports
+                            .into_iter()
+                            .map(|(id, data)| (id % BATCH_REPORT_SIZE as u32, data)),
+                    );
+                } else {
+                    chunk.extend(reports);
+                }
+                if chunk.len() >= state.reports_per_chunk {
+                    batch_tx
+                        .send(std::mem::replace(
+                            &mut chunk,
+                            Vec::with_capacity(state.reports_per_chunk),
+                        ))
+                        .await
+                        .map_err(|_| anyhow!("Processor thread died"))?;
+                }
+            } else {
+                return Err(anyhow!("Expected BatchEncryptedClientReports"));
+            }
+        }
+        if !chunk.is_empty() {
+            batch_tx
+                .send(chunk)
+                .await
+                .map_err(|_| anyhow!("Processor thread died"))?;
+        }
+        drop(batch_tx);
+        info!(
+            "Received {} reports in {} batches ({:?})",
+            total_reports,
+            num_batches,
+            recv_start.elapsed()
+        );
+
+        // Wait for processor to finish
+        let (online_clients, aggregate) = processor_handle
+            .join()
+            .map_err(|_| anyhow!("Processor thread panicked"))?;
+        let aggregate = aggregate.ok_or_else(|| anyhow!("No valid reports"))?;
+
+        let online_count = online_clients.len();
+        info!("Aggregation: {online_count} online clients (simulated: {simulated})");
+
+        // Request decryption mask
+        let decrypt_start = Instant::now();
+        let dropouts: Vec<usize> = if simulated {
+            sim_dropouts.into_iter().map(|x| x as usize).collect()
+        } else {
+            let online_set: HashSet<_> = online_clients.iter().copied().collect();
+            (0..state.num_clients)
+                .filter(|i| !online_set.contains(&(*i as u32)))
+                .collect()
+        };
+
+        let mask =
+            Self::request_decryption_mask(state, context, &dropouts, aggregate.len()).await?;
+        let mask = match mask {
+            Message::DecryptMaskResponse { mask } => mask,
+            Message::Error(e) => return Err(anyhow!("Decryptor error: {e}")),
+            _ => return Err(anyhow!("Unexpected decryptor response")),
+        };
+
+        // Decrypt aggregate
+        let max_dlog = if binary {
+            online_count
+        } else {
+            online_count * (1 << bitlength.unwrap_or(8))
+        } as u64;
+
+        let result = AggOnlyEnc::decrypt(&aggregate, &mask, max_dlog);
+        info!(
+            "\n\tDecrypt time: {:?}\n\tWall-clock time: {:?}",
+            decrypt_start.elapsed(),
+            recv_start.elapsed()
+        );
+
+        match result {
+            Ok(r) => Ok(r),
+            Err(_) if simulated => {
+                info!("Simulated round - returning dummy result");
+                let length = (context & 0xFFFF) as usize;
+                Ok(vec![0u64; length.min(128)])
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    // --- Verifier key ---
+
+    fn build_vk(
+        state: &AggregatorState,
+        binary: bool,
+        bitlength: Option<usize>,
+    ) -> Result<VerifierKey> {
+        let g_comm = Proof::get_g_comm();
+        let data = state
+            .db
+            .get(b"kc")?
+            .ok_or_else(|| anyhow!("No key commitments in DB"))?;
+        let key_commitments = Self::deserialize_key_commitments(&data)?;
+
+        Ok(if binary {
+            VerifierKey::Binary {
+                g_comm,
+                key_commitments,
+            }
+        } else {
+            VerifierKey::Range {
+                g_comm,
+                key_commitments,
+                bitlength: bitlength
+                    .ok_or_else(|| anyhow!("bitlength required for range proof"))?,
+            }
+        })
+    }
+
+    fn deserialize_key_commitments(data: &[u8]) -> Result<Vec<G>> {
+        // Format: num_clients (u64) + [chunk_len (u64) + chunk_data]*
+        let num_clients = u64::from_le_bytes(data[0..8].try_into()?) as usize;
+        let mut offset = 8;
+        let mut chunks_data = Vec::new();
+
+        while offset < data.len() {
+            let chunk_len = u64::from_le_bytes(data[offset..offset + 8].try_into()?) as usize;
+            offset += 8;
+            chunks_data.push(&data[offset..offset + chunk_len]);
+            offset += chunk_len;
+        }
+
+        let chunks: Vec<Vec<G>> = chunks_data
+            .into_par_iter()
+            .map(|chunk_data| bincode::deserialize(chunk_data).unwrap())
+            .collect();
+
+        let mut result = Vec::with_capacity(num_clients);
+        for chunk in chunks {
+            result.extend(chunk);
+        }
+
+        Ok(result)
+    }
+
+    // --- Decryptor connection ---
+
+    async fn handle_decryptor_init(socket: TcpStream, state: Arc<AggregatorState>) {
+        let (request_send, request_recv) = mpsc::channel(10);
+        let (mask_send, mask_recv) = mpsc::channel(10);
+        state.request_send.set(request_send).ok();
+        *state.mask_recv.lock().await = Some(mask_recv);
+
+        tokio::spawn(async move {
+            if let Err(e) =
+                Self::handle_decryptor_connection(socket, state, request_recv, mask_send).await
+            {
+                error!("Decryptor connection error: {e:?}");
+            }
+        });
+    }
+
     async fn handle_decryptor_connection(
         mut socket: TcpStream,
         state: Arc<AggregatorState>,
         mut request_recv: mpsc::Receiver<Message>,
         mask_send: mpsc::Sender<Message>,
     ) -> Result<()> {
-        // Check if key commitments already exist in DB
-        let has_key_comms = state.db.contains_key(b"kc")?;
-
-        if has_key_comms {
-            // Setup already complete, notify decryptor and skip to mask requests
+        if state.db.contains_key(b"kc")? {
             info!("Key commitments already exist, skipping setup");
             write_message(&mut socket, &Message::SetupAlreadyComplete {}).await?;
         } else {
-            // Normal setup: receive key commitments from decryptor
-            write_message(&mut socket, &Message::Success {}).await?;
-
-            let mut setup_start: Option<std::time::Instant> = None;
-            let mut received_commitments = 0;
-            let mut key_commitments = vec![G::generator(); state.num_clients];
-
-            // Receive commitments for each client
-            while received_commitments < state.num_clients {
-                let message = match read_message(&mut socket).await {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        return Err(anyhow!("Decryptor connection closed: {}", e));
-                    }
-                };
-
-                // Start timing on first message
-                if setup_start.is_none() {
-                    setup_start = Some(std::time::Instant::now());
-                }
-
-                let key_comms_batch = match message {
-                    Message::KeyCommsBatch { key_comms } => key_comms,
-                    _ => {
-                        let _ =
-                            send_error_message(&mut socket, &format!("Invalid message type")).await;
-                        return Err(anyhow!("Invalid message type from decryptor"));
-                    }
-                };
-
-                // Add key comms to vector
-                received_commitments += key_comms_batch.len();
-                for (idx, key_comm) in key_comms_batch.into_iter() {
-                    key_commitments[idx as usize] = key_comm;
-                }
-
-                // Send success response
-                if let Err(e) = write_message(&mut socket, &Message::Success {}).await {
-                    return Err(anyhow!("Failed to send response to decryptor: {}", e));
-                }
-            }
-
-            // Write key commitments to the database
-            let num_clients = state.num_clients;
-            let state_clone = state.clone();
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                state_clone
-                    .db
-                    .insert(b"kc", bincode::serialize(&key_commitments)?)?;
-                state_clone.db.flush()?;
-                Ok(())
-            })
-            .await??;
-
-            if let Some(start) = setup_start {
-                let setup_elapsed = start.elapsed();
-                info!(
-                    "Setup complete: received {} key commitments in {:?}",
-                    num_clients, setup_elapsed
-                );
-                info!("Sent {:?}B", bytes_sent());
-                info!("Recv {:?}B", bytes_recv());
-                reset_byte_counters();
-            }
+            Self::receive_key_commitments(&mut socket, &state).await?;
         }
 
-        // Process requests for decryption masks
         while let Some(request) = request_recv.recv().await {
             write_message(&mut socket, &request).await?;
             let response = read_message(&mut socket).await?;
-            if let Err(e) = mask_send.send(response).await {
-                error!("Error sending mask internally: {e:?}");
-            }
+            mask_send.send(response).await.ok();
         }
-
         Ok(())
     }
 
-    // Store client report in the local database
-    async fn store_client_report(
-        state: Arc<AggregatorState>,
-        id: u32,
-        context: u32,
-        envelope: crate::crypto::hpke::HpkeEnvelope,
+    async fn receive_key_commitments(
+        socket: &mut TcpStream,
+        state: &AggregatorState,
     ) -> Result<()> {
-        // Set current_ctx on first submission
-        {
-            let mut current_ctx = state.current_ctx.write().await;
-            if current_ctx.is_none() {
-                *current_ctx = Some(context);
-            } else if *current_ctx != Some(context) {
-                return Err(anyhow!(
-                    "Context mismatch: expected {:?}, got {}",
-                    current_ctx,
-                    context
-                ));
+        write_message(socket, &Message::Success {}).await?;
+
+        let setup_start = Instant::now();
+        let mut key_commitments = vec![G::generator(); state.num_clients];
+
+        let first_message = read_message(socket).await?;
+        match first_message {
+            Message::SimulateSetup {} => {
+                let num_clients = state.num_clients;
+                let g_comm = Proof::get_g_comm();
+                key_commitments = tokio::task::spawn_blocking(move || {
+                    let prf = ScalarPRF::new(&SIMULATE_PRF_KEY);
+                    (0..num_clients)
+                        .into_par_iter()
+                        .map(|i| g_comm * prf.evaluate(i as u64))
+                        .collect()
+                })
+                .await?;
+                info!(
+                    "Simulated setup: computed {num_clients} key commitments in {:?}",
+                    setup_start.elapsed()
+                );
+                write_message(socket, &Message::Success {}).await?;
             }
-        }
+            Message::KeyCommsBatch { key_comms } => {
+                let mut received = Self::apply_key_comms(&mut key_commitments, key_comms);
+                write_message(socket, &Message::Success {}).await?;
 
-        if !state.reporting_start.initialized() {
-            state.reporting_start.set(std::time::Instant::now())?;
-        }
-
-        // Store the HPKE envelope directly in the database
-        let state_clone = state.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let key = format!("r/{context:08x}/{id:08x}");
-            let blob = bincode::serialize(&envelope)?;
-            state_clone.db.insert(key.as_bytes(), IVec::from(blob))?;
-            state_clone.db.flush()?;
-            Ok(())
-        })
-        .await??;
-
-        // If we've received enough client reports for aggregation, report stats
-        let num = state.num_reported.fetch_add(1, Ordering::SeqCst);
-        if num == state.threshold - 1 {
-            let elapsed = state.reporting_start.get().unwrap().elapsed();
-            info!(
-                "Received enough reports for aggregation ({}) in {elapsed:?}",
-                num + 1
-            );
-            info!("Sent {:?}B", bytes_sent());
-            info!("Recv {:?}B", bytes_recv());
-            reset_byte_counters();
-        }
-
-        Ok(())
-    }
-
-    // Store a batch of clients reports in the local database
-    async fn store_batch_client_reports(
-        state: Arc<AggregatorState>,
-        reports: Vec<(u32, u32, crate::crypto::hpke::HpkeEnvelope)>,
-    ) -> Result<()> {
-        if reports.is_empty() {
-            return Ok(());
-        }
-
-        // Set current_ctx on first submission (use first report's context)
-        let first_context = reports[0].1;
-        {
-            let mut current_ctx = state.current_ctx.write().await;
-            if current_ctx.is_none() {
-                *current_ctx = Some(first_context);
-            }
-        }
-
-        // Verify all reports have the same context
-        {
-            let current_ctx = state.current_ctx.read().await;
-            let expected_ctx = current_ctx.ok_or(anyhow!("No context set"))?;
-            for (_, context, _) in &reports {
-                if *context != expected_ctx {
-                    return Err(anyhow!(
-                        "Context mismatch: expected {}, got {}",
-                        expected_ctx,
-                        context
-                    ));
+                while received < state.num_clients {
+                    let batch = match read_message(socket).await? {
+                        Message::KeyCommsBatch { key_comms } => key_comms,
+                        _ => return Err(anyhow!("Expected KeyCommsBatch")),
+                    };
+                    received += Self::apply_key_comms(&mut key_commitments, batch);
+                    write_message(socket, &Message::Success {}).await?;
                 }
             }
+            _ => return Err(anyhow!("Expected SimulateSetup or KeyCommsBatch")),
         }
 
-        if !state.reporting_start.initialized() {
-            state.reporting_start.set(std::time::Instant::now())?;
-        }
-
-        // Store all HPKE envelopes in the database in a single batch operation
-        let state_clone = state.clone();
-        let batch_size = reports.len();
+        let db = state.db.clone();
+        let num_clients = state.num_clients;
         tokio::task::spawn_blocking(move || -> Result<()> {
-            for (id, context, envelope) in reports {
-                let key = format!("r/{context:08x}/{id:08x}");
-                let blob = bincode::serialize(&envelope)?;
-                state_clone.db.insert(key.as_bytes(), IVec::from(blob))?;
+            let serialize_start = Instant::now();
+
+            const CHUNK_SIZE: usize = 100_000;
+            let serialized_chunks: Vec<Vec<u8>> = key_commitments
+                .par_chunks(CHUNK_SIZE)
+                .map(|chunk| bincode::serialize(chunk).unwrap())
+                .collect();
+
+            let total_len: usize = serialized_chunks.iter().map(|c| c.len()).sum();
+            let mut serialized = Vec::with_capacity(total_len + 8 + serialized_chunks.len() * 8);
+            serialized.extend_from_slice(&(num_clients as u64).to_le_bytes());
+            for chunk in serialized_chunks {
+                serialized.extend_from_slice(&(chunk.len() as u64).to_le_bytes());
+                serialized.extend(chunk);
             }
-            state_clone.db.flush()?;
+
+            info!(
+                "Serialized {} key commitments in {:?}",
+                num_clients,
+                serialize_start.elapsed()
+            );
+
+            let write_start = Instant::now();
+            db.insert(b"kc", serialized)?;
+            db.flush()?;
+            info!("Wrote key commitments to DB in {:?}", write_start.elapsed());
+
             Ok(())
         })
         .await??;
 
-        // If we've received enough client reports for aggregation, report stats
-        let num = state.num_reported.fetch_add(batch_size, Ordering::SeqCst);
-        if num + batch_size >= state.threshold && num < state.threshold {
-            let elapsed = state.reporting_start.get().unwrap().elapsed();
-            info!(
-                "Received enough reports for aggregation ({}) in {elapsed:?}",
-                num
-            );
-        }
-
+        info!(
+            "Setup complete: {} key commitments in {:?}",
+            state.num_clients,
+            setup_start.elapsed()
+        );
+        info!("Sent {}B, Recv {}B", bytes_sent(), bytes_recv());
+        reset_byte_counters();
         Ok(())
     }
 
-    // Deserialize the verification key from local database
-    fn get_vk(state: Arc<AggregatorState>) -> Result<VerifierKey> {
-        let g_comm = Proof::get_g_comm();
-        let key_commitments: Vec<G> = bincode::deserialize(
-            &state
-                .db
-                .get(b"kc")?
-                .ok_or(anyhow!("Couldn't fetch key commitments"))?,
-        )?;
-
-        let vk = match state.prover {
-            ProverType::Binary => VerifierKey::Binary {
-                g_comm,
-                key_commitments,
-            },
-            ProverType::Range(bitlength) => VerifierKey::Range {
-                g_comm,
-                key_commitments,
-                bitlength,
-            },
-        };
-        Ok(vk)
+    fn apply_key_comms(commitments: &mut [G], batch: Vec<(u32, G)>) -> usize {
+        let count = batch.len();
+        for (idx, kc) in batch {
+            commitments[idx as usize] = kc;
+        }
+        count
     }
 
-    async fn aggregate(state: Arc<AggregatorState>, context: u32) -> Result<Vec<u64>> {
-        // Check that context matches current_ctx
-        let current_ctx = state.current_ctx.read().await;
-        match *current_ctx {
-            Some(expected_ctx) if expected_ctx == context => {
-                // Context matches, proceed
-            }
-            Some(expected_ctx) => {
-                return Err(anyhow!(
-                    "Invalid context: expected {}, got {}",
-                    expected_ctx,
-                    context
-                ));
-            }
-            None => {
-                return Err(anyhow!(
-                    "No context set yet - need client submissions first"
-                ));
-            }
-        }
-        drop(current_ctx);
+    // --- Decryption mask request ---
 
-        // Record wall-clock aggregation time
-        let wall_clock_start = std::time::Instant::now();
-
-        // Initialize the verification key
-        let vk = Self::get_vk(state.clone())?;
-
-        // Create channel for communicating timing stats
-        let (timing_send, mut timing_recv) = mpsc::unbounded_channel();
-
-        // Partition clients into chunks for parallel processing
-        let num_clients = state.num_clients;
-        let client_ranges: Vec<_> = (0..num_clients)
-            .collect::<Vec<_>>()
-            .chunks(BATCH_SIZE)
-            .map(|chunk| (chunk[0], chunk[chunk.len() - 1]))
-            .collect();
-
-        // Process chunks in parallel (decrypt / decode + verify + aggregate in one pass)
-        let state_clone = state.clone();
-        let hpke_sk = state.hpke_keys.sk.clone();
-        let client_ranges_clone = client_ranges.clone();
-        let timing_send_clone = timing_send.clone();
-
-        let (online_clients, aggregate) =
-            tokio::task::spawn_blocking(move || -> Result<(Vec<u32>, Option<Ciphertext>)> {
-                let results: Vec<_> = client_ranges_clone
-                    .into_par_iter()
-                    .map(|(start, end)| -> Result<Option<(Vec<u32>, Ciphertext)>> {
-                        let vk = vk.clone();
-                        let mut chunk_clients = Vec::with_capacity(BATCH_SIZE);
-                        let mut chunk_proofs = Vec::with_capacity(BATCH_SIZE);
-                        let mut chunk_ciphertexts = Vec::with_capacity(BATCH_SIZE);
-
-                        // Process each client in the chunk
-                        let mut load_time = Duration::ZERO;
-                        let mut decode_time = Duration::ZERO;
-                        let mut decrypt_time = Duration::ZERO;
-                        for id in start..=end {
-                            // Read from DB
-                            let load_start = std::time::Instant::now();
-                            let key = format!("r/{context:08x}/{id:08x}");
-                            let value = match state_clone.db.get(key.as_bytes())? {
-                                Some(v) => v,
-                                None => continue, // Skip missing clients
-                            };
-                            load_time += load_start.elapsed();
-
-                            // HPKE decrypt
-                            let decrypt_start = std::time::Instant::now();
-                            let envelope: crate::crypto::hpke::HpkeEnvelope =
-                                bincode::deserialize(&value)?;
-                            let (report_bytes, _) = hpke_decrypt(&hpke_sk, &envelope, b"", b"")?;
-                            decrypt_time += decrypt_start.elapsed();
-
-                            // Decode
-                            //
-                            // NOTE: This is a rather big overhead at the moment for some reason
-                            let decode_start = std::time::Instant::now();
-                            let report: Message = bincode::deserialize(&report_bytes)?;
-                            let (proof, ciphertext) = match report {
-                                Message::ClientReport {
-                                    proof, ciphertext, ..
-                                } => (proof, ciphertext),
-                                _ => return Err(anyhow!("Invalid message type in envelope")),
-                            };
-                            decode_time += decode_start.elapsed();
-
-                            // Add to chunk for batch verification
-                            chunk_clients.push(id as u32);
-                            chunk_proofs.push(proof);
-                            chunk_ciphertexts.push(ciphertext);
-                        }
-
-                        // If all the clients in this chunk dropped out, skip
-                        if chunk_clients.is_empty() {
-                            return Ok(None);
-                        }
-
-                        // Batch verify
-                        let verify_start = std::time::Instant::now();
-
-                        // Seed a new (fast) RNG we can send across threads
-                        let mut seed = [0u8; 32];
-                        OsRng.fill_bytes(&mut seed);
-                        let mut rng = ChaCha20Rng::from_seed(seed);
-
-                        Proof::batch_verify(
-                            &vk,
-                            &chunk_ciphertexts,
-                            context,
-                            &chunk_proofs,
-                            &chunk_clients,
-                            &mut rng,
-                        )?;
-                        let verify_time = verify_start.elapsed();
-
-                        // Aggregate
-                        let aggregate_start = std::time::Instant::now();
-                        let chunk_aggregate = chunk_ciphertexts
-                            .into_iter()
-                            .reduce(|a, b| a + b)
-                            .ok_or(anyhow!("Empty chunk after filtering"))?;
-                        let aggregate_time = aggregate_start.elapsed();
-
-                        // Register timing info
-                        let timing = OpTiming {
-                            load: load_time,
-                            decode: decode_time,
-                            decrypt: decrypt_time,
-                            verify: verify_time,
-                            aggregate: aggregate_time,
-                        };
-                        let _ = timing_send_clone.send(timing);
-
-                        Ok(Some((chunk_clients, chunk_aggregate)))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                // Combine results from all chunks
-                let (online_clients, aggregate_opt) = results.into_iter().filter_map(|x| x).fold(
-                    (Vec::new(), None),
-                    |(mut clients, agg), (chunk_clients, chunk_agg)| {
-                        clients.extend(chunk_clients);
-                        let agg = match (agg, Some(chunk_agg)) {
-                            (Some(a), Some(c)) => Some(a + c),
-                            (None, Some(c)) => Some(c),
-                            _ => unreachable!(),
-                        };
-                        (clients, agg)
-                    },
-                );
-
-                Ok((online_clients, aggregate_opt))
-            })
-            .await??;
-
-        let aggregate = aggregate.ok_or(anyhow!("No valid reports"))?;
-
-        // Request decryption mask from the decryptor
-        let decrypt_start = std::time::Instant::now();
-        let request_send = state
+    async fn request_decryption_mask(
+        state: &AggregatorState,
+        context: u32,
+        dropouts: &[usize],
+        length: usize,
+    ) -> Result<Message> {
+        let sender = state
             .request_send
             .get()
-            .ok_or(anyhow!("Decryptor not connected"))?;
-
-        // Compute dropouts (clients not in online_clients)
-        //
-        // TODO: Support large dropouts properly
-        let online_set: std::collections::HashSet<_> = online_clients.iter().copied().collect();
-        let dropouts: Vec<usize> = (0..state.num_clients)
-            .filter(|id| !online_set.contains(&(*id as u32)))
-            .collect();
-        let request = Message::DecryptMaskRequest {
-            context,
-            dropouts,
-            invert: false,
-            length: aggregate.len(),
+            .ok_or_else(|| anyhow!("Decryptor not connected"))?;
+        let dropouts = if PACK_DROPOUTS {
+            DropoutList::Packed(dropouts.iter().map(|&i| crate::ClientIndex::from(i)).collect())
+        } else {
+            DropoutList::Plain(dropouts.iter().map(|&i| i as u32).collect())
         };
-        request_send
-            .send(request)
+        sender
+            .send(Message::DecryptMaskRequest {
+                context,
+                dropouts,
+                invert: false,
+                length,
+            })
             .await
             .map_err(|_| anyhow!("Failed to send decrypt request"))?;
 
-        // Receive the decryption mask
-        let mut mask_recv_guard = state.mask_recv.lock().await;
-        let mask_recv = mask_recv_guard
+        let mut guard = state.mask_recv.lock().await;
+        let recv = guard
             .as_mut()
-            .ok_or(anyhow!("Decryptor not connected"))?;
-        let response = mask_recv
-            .recv()
+            .ok_or_else(|| anyhow!("Decryptor not connected"))?;
+        recv.recv()
             .await
-            .ok_or(anyhow!("Decryptor connection closed"))?;
-
-        let mask = match response {
-            Message::DecryptMaskResponse { mask } => mask,
-            Message::Error(e) => return Err(anyhow!("Decryptor error: {}", e)),
-            _ => return Err(anyhow!("Unexpected response from decryptor")),
-        };
-
-        // Decrypt the aggregate
-        let max_dlog = match state.prover {
-            ProverType::Binary => online_clients.len(),
-            ProverType::Range(bitlength) => online_clients.len() * (1 << bitlength),
-        } as u64;
-        let result = AggOnlyEnc::decrypt(&aggregate, &mask, max_dlog)?;
-
-        let decrypt_elapsed = decrypt_start.elapsed();
-        let wall_clock_elapsed = wall_clock_start.elapsed();
-
-        // Read all timing values from the channel and compute totals
-        let mut total_load_time = Duration::ZERO;
-        let mut total_decode_time = Duration::ZERO;
-        let mut total_decrypt_time = Duration::ZERO;
-        let mut total_verify_time = Duration::ZERO;
-        let mut total_aggregate_time = Duration::ZERO;
-
-        drop(timing_send);
-        while let Some(timing) = timing_recv.recv().await {
-            total_load_time += timing.load;
-            total_decode_time += timing.decode;
-            total_decrypt_time += timing.decrypt;
-            total_verify_time += timing.verify;
-            total_aggregate_time += timing.aggregate;
-        }
-
-        // Log timing breakdown
-        info!(
-            "Aggregation complete for context {}: {} online clients",
-            context,
-            online_clients.len()
-        );
-        info!(
-            "\n\tLoad time {:?}\n\tDecode time: {:?}\n\tHPKE-decryption time {:?}\n\tVerify time: {:?}\n\tAggregate time: {:?}",
-            total_load_time,
-            total_decode_time,
-            total_decrypt_time,
-            total_verify_time,
-            total_aggregate_time
-        );
-        info!(
-            "\n\tDecrypt time: {:?}\n\tWall-clock time: {:?}",
-            decrypt_elapsed, wall_clock_elapsed
-        );
-        info!("Sent {:?}B", bytes_sent());
-        info!("Recv {:?}B", bytes_recv());
-        reset_byte_counters();
-
-        // Reset for next round so new reports can use a new context
-        {
-            let mut current_ctx = state.current_ctx.write().await;
-            *current_ctx = None;
-        }
-        state.num_reported.store(0, Ordering::SeqCst);
-
-        Ok(result)
+            .ok_or_else(|| anyhow!("Decryptor disconnected"))
     }
+}
+
+// --- Chunk processing (decrypt, verify, aggregate) ---
+
+fn process_chunk(
+    hpke_sk: &<hpke::kem::X25519HkdfSha256 as hpke::Kem>::PrivateKey,
+    vk: &VerifierKey,
+    context: u32,
+    reports: Vec<(u32, Vec<u8>)>,
+) -> (
+    Vec<u32>,
+    Option<Ciphertext>,
+    std::time::Duration,
+    std::time::Duration,
+    std::time::Duration,
+) {
+    let decrypt_start = Instant::now();
+    let decrypted: Vec<_> = reports
+        .into_par_iter()
+        .filter_map(|(id, data)| {
+            let envelope: crate::crypto::hpke::HpkeEnvelope = bincode::deserialize(&data).ok()?;
+            let (report_bytes, _) = hpke_decrypt(hpke_sk, &envelope, b"", b"").ok()?;
+            let Message::ClientReport { proof, ciphertext } =
+                bincode::deserialize(&report_bytes).ok()?
+            else {
+                return None;
+            };
+            Some((id, proof, ciphertext))
+        })
+        .collect();
+    let decrypt_time = decrypt_start.elapsed();
+
+    let verify_start = Instant::now();
+    let verify_chunks: Vec<_> = decrypted.chunks(VERIFY_BATCH_SIZE).collect();
+    let verified: Vec<_> = verify_chunks
+        .into_par_iter()
+        .filter_map(|chunk| {
+            let ids: Vec<u32> = chunk.iter().map(|(id, _, _)| *id).collect();
+            let proofs: Vec<_> = chunk.iter().map(|(_, p, _)| p.clone()).collect();
+            let cts: Vec<_> = chunk.iter().map(|(_, _, c)| c.clone()).collect();
+
+            let mut seed = [0u8; 32];
+            OsRng.fill_bytes(&mut seed);
+            Proof::batch_verify(
+                vk,
+                &cts,
+                context,
+                &proofs,
+                &ids,
+                &mut ChaCha20Rng::from_seed(seed),
+            )
+            .ok()
+            .map(|_| (ids, cts))
+        })
+        .collect();
+    let verify_time = verify_start.elapsed();
+
+    let agg_start = Instant::now();
+    let mut online = Vec::new();
+    let mut agg: Option<Ciphertext> = None;
+    for (ids, cts) in verified {
+        online.extend(ids);
+        let chunk_agg = cts.into_iter().reduce(|a, b| a + b);
+        agg = match (agg, chunk_agg) {
+            (Some(a), Some(b)) => Some(a + b),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        };
+    }
+    let agg_time = agg_start.elapsed();
+
+    (online, agg, decrypt_time, verify_time, agg_time)
 }

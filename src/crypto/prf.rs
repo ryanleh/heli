@@ -75,19 +75,47 @@ impl ScalarPRF {
         }
         let mut accum = [0u64; 5];
         for idx in indices.into_iter() {
-            // Compute the PRF eval
-            let aes_blocks = self.evaluate_aes(*idx as u64);
-            let limbs = [
-                u64::from_le_bytes(aes_blocks[0][0..8].try_into().unwrap()),
-                u64::from_le_bytes(aes_blocks[0][8..16].try_into().unwrap()),
-                u64::from_le_bytes(aes_blocks[1][0..8].try_into().unwrap()),
-                u64::from_le_bytes(aes_blocks[1][8..16].try_into().unwrap()),
-            ];
-
-            // Add to accumulator
-            Self::add_u256(&mut accum, limbs);
+            self.accumulate_eval(&mut accum, *idx as u64);
         }
+        Self::finalize_accum(accum)
+    }
 
+    /// Computes the sum of PRF evaluations over a slice of 3-byte ClientIndex values.
+    pub fn batch_evaluate_client_indices(&self, indices: &[crate::ClientIndex]) -> Scalar {
+        if indices.is_empty() {
+            return Scalar::ZERO;
+        }
+        let mut accum = [0u64; 5];
+        for idx in indices {
+            self.accumulate_eval(&mut accum, u64::from(*idx));
+        }
+        Self::finalize_accum(accum)
+    }
+
+    pub fn batch_evaluate_u32(&self, indices: &[u32]) -> Scalar {
+        if indices.is_empty() {
+            return Scalar::ZERO;
+        }
+        let mut accum = [0u64; 5];
+        for &idx in indices {
+            self.accumulate_eval(&mut accum, idx as u64);
+        }
+        Self::finalize_accum(accum)
+    }
+
+    #[inline]
+    fn accumulate_eval(&self, accum: &mut [u64; 5], idx: u64) {
+        let aes_blocks = self.evaluate_aes(idx);
+        let limbs = [
+            u64::from_le_bytes(aes_blocks[0][0..8].try_into().unwrap()),
+            u64::from_le_bytes(aes_blocks[0][8..16].try_into().unwrap()),
+            u64::from_le_bytes(aes_blocks[1][0..8].try_into().unwrap()),
+            u64::from_le_bytes(aes_blocks[1][8..16].try_into().unwrap()),
+        ];
+        Self::add_u256(accum, limbs);
+    }
+
+    fn finalize_accum(accum: [u64; 5]) -> Scalar {
         // Reduce accumulator to group element. The API only supports 256-bit
         // and 512-bit inputs, so we map to 512-bits.
         let mut accum_bytes = [0u8; 64];

@@ -28,6 +28,22 @@ pub struct ExperimentConfig {
 
     /// Path to the sled database
     pub db_path: String,
+
+    /// Max in-flight chunks on the aggregator before backpressure kicks in (default: 4)
+    #[serde(default = "default_max_pending_batches")]
+    pub max_pending_batches: usize,
+
+    /// Number of reports to accumulate into a single processing chunk (default: 10000)
+    #[serde(default = "default_reports_per_chunk")]
+    pub reports_per_chunk: usize,
+}
+
+fn default_max_pending_batches() -> usize {
+    4
+}
+
+fn default_reports_per_chunk() -> usize {
+    10_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

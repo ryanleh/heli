@@ -9,6 +9,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// Hardcoded PRF key for simulated setup (no attestation).
+pub const SIMULATE_PRF_KEY: [u8; 32] = [
+    0x73, 0x69, 0x6d, 0x75, 0x6c, 0x61, 0x74, 0x65, 0x5f, 0x68, 0x65, 0x6c, 0x69, 0x5f, 0x65, 0x32,
+    0x65, 0x5f, 0x74, 0x65, 0x73, 0x74, 0x5f, 0x6b, 0x65, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
 // Global byte counters for network traffic
 static BYTES_SENT: AtomicU64 = AtomicU64::new(0);
 static BYTES_RECV: AtomicU64 = AtomicU64::new(0);
@@ -38,6 +44,7 @@ pub enum Message {
         id: u32,
         eval_key: EvalKey,
     },
+    SimulateSetup {},
 
     ClientReport {
         ciphertext: Ciphertext,
@@ -51,20 +58,42 @@ pub enum Message {
         envelope: HpkeEnvelope,
     },
 
-    // Batch of HPKE-encrypted ClientReports (for efficient bulk upload)
+    /// Batch of HPKE-encrypted ClientReports for bulk upload.
+    /// Each entry is (id, serialized_envelope_bytes).
     BatchEncryptedClientReports {
-        reports: Vec<(u32, u32, HpkeEnvelope)>, // (id, context, envelope)
+        context: u32,
+        reports: Vec<(u32, Vec<u8>)>, // (id, serialized_envelope)
     },
 
+    /// Indicates how many BatchEncryptedClientReportsPacked will follow on this connection.
+    /// Server reads exactly this many batches then closes.
+    BatchStreamStart {
+        num_batches: usize,
+    },
+
+    /// Register context config before sending reports. Required once per context.
+    /// Sets proof type (binary or range with bitlength) and whether reports are simulated.
+    /// For simulated runs, includes the list of dropped-out client IDs.
+    SetContextConfig {
+        context: u32,
+        binary: bool,
+        bitlength: Option<usize>,
+        simulated: bool,
+        sim_dropouts: Vec<u32>,
+    },
+
+    // Decryptor sends this to initialize connection with aggregator
     DecryptorInit {},
+
     /// Sent by aggregator when setup is already complete (key commitments exist)
     SetupAlreadyComplete {},
+
     KeyCommsBatch {
         key_comms: Vec<(u32, G)>, // (idx, key_comm)
     },
     DecryptMaskRequest {
         context: u32,
-        dropouts: Vec<usize>,
+        dropouts: DropoutList,
         invert: bool,
         length: usize,
     },
@@ -79,8 +108,38 @@ pub enum Message {
         result: Vec<u64>,
     },
 
+    /// Combined submit+aggregate: client sends this to start a streaming aggregation.
+    /// Followed by exactly `num_batches` BatchEncryptedClientReports messages.
+    /// Server responds with AggregationResponse when complete.
+    AggregateStreamStart {
+        context: u32,
+        num_batches: usize,
+        binary: bool,
+        bitlength: Option<usize>,
+        simulated: bool,
+        sim_dropouts: Vec<u32>,
+    },
+
     Error(String),
     Success(),
+}
+
+/// How dropout indices are encoded in DecryptMaskRequest.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum DropoutList {
+    /// 3-byte packed indices (lower bandwidth)
+    Packed(Vec<crate::ClientIndex>),
+    /// Plain u32 indices (faster to serialize/deserialize)
+    Plain(Vec<u32>),
+}
+
+impl DropoutList {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Packed(v) => v.len(),
+            Self::Plain(v) => v.len(),
+        }
+    }
 }
 
 /// Reads a framed message from a TCP stream.
@@ -171,3 +230,4 @@ pub fn take_byte_counters() -> (u64, u64) {
     let recv = BYTES_RECV.swap(0, Ordering::Relaxed);
     (sent, recv)
 }
+

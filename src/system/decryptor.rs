@@ -1,35 +1,38 @@
 use crate::{
-    agg_only_enc::{AggOnlyEnc, EvalKey, SecretKey},
+    agg_only_enc::{EvalKey, SecretKey},
     crypto::{
         G, Scalar,
         app_attest::{verify_app_attest, verify_sig},
         hpke::*,
-        prf::ScalarPRF,
+        prf::{KHPRF, ScalarPRF},
     },
     proofs::Proof,
-    system::messages::*,
+    system::messages::{Message, *},
 };
+use rayon::prelude::*;
 
 use anyhow::{Result, anyhow};
 use rand_core::{OsRng, RngCore};
 use sled::Db;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Mutex, OnceCell, RwLock, mpsc, oneshot},
 };
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 pub struct Decryptor {
     addr: String,
     pub(crate) state: Arc<DecryptorState>,
 }
 
-/// Batch size for sending key commitments to the aggregator
-const BATCH_SIZE: usize = 1024;
+const KEY_COMMITMENT_BATCH_SIZE: usize = 1024;
 
 pub(crate) struct DecryptorState {
     num_clients: usize,
@@ -38,18 +41,24 @@ pub(crate) struct DecryptorState {
     pub(crate) secret_key: OnceCell<SecretKey>,
     current_ctx: RwLock<Option<u32>>,
     db: Db,
-
-    // State for one-time setup
-    keygen_prf: Arc<ScalarPRF>,
+    keygen_prf: RwLock<ScalarPRF>,
     next_client_index: AtomicUsize,
-    ek_send: mpsc::UnboundedSender<(u32, Scalar)>, // TODO: Test speed of bounded
+    ek_send: mpsc::UnboundedSender<ClientKey>,
+    setup_send: mpsc::UnboundedSender<SetupToAggregator>,
     sk_recv: Mutex<Option<oneshot::Receiver<Scalar>>>,
-
-    // Benchmarking stuff
-    setup_start: OnceCell<std::time::Instant>,
+    setup_start: OnceCell<Instant>,
 }
 
-// NOTE: Lots of small race conditions here
+enum ClientKey {
+    Simulate,
+    Key(u32, Scalar),
+}
+
+pub(crate) enum SetupToAggregator {
+    KeyCommsBatch(Vec<(u32, G)>),
+    Simulate,
+}
+
 impl Decryptor {
     pub fn new(
         addr: &str,
@@ -59,80 +68,26 @@ impl Decryptor {
         hpke_keypair: ServerKeys,
         db: Db,
     ) -> Self {
-        // Check if we have a saved secret key from a previous run
         let saved_secret_key: Option<SecretKey> = db
             .get(b"secret_key")
             .ok()
             .flatten()
             .and_then(|bytes| bincode::deserialize(&bytes).ok());
 
-        // Channel for communicating evaluation keys
         let (ek_send, mut ek_recv) = mpsc::unbounded_channel();
-
-        // Channel for communicating secret key after setup
         let (sk_send, sk_recv) = oneshot::channel();
-
-        // Channel for streaming key commitments to aggregator
         let (kc_send, kc_recv) = mpsc::unbounded_channel();
 
-        // Only spawn the key aggregation task if we don't have a saved key
-        if saved_secret_key.is_none() {
-            // Spawn task for aggregating evaluation keys and computing key commitments
-            tokio::spawn(async move {
-                let g_comm = Proof::get_g_comm();
-                let mut prf_key = Scalar::ZERO;
-                let mut key_comms: Vec<(u32, G)> = Vec::new();
-
-                // Receive all of the evaluation keys
-                let mut received_count = 0;
-                while received_count < num_clients {
-                    match ek_recv.recv().await {
-                        Some((client_idx, ek)) => {
-                            // Accumulate PRF key
-                            prf_key += ek;
-
-                            // Compute key commitment: g_comm * ek
-                            let key_comm = g_comm * ek;
-                            key_comms.push((client_idx, key_comm));
-                            received_count += 1;
-
-                            // If batch is full or this is the last key, send key_comms to the
-                            // aggregator
-                            if key_comms.len() >= BATCH_SIZE || received_count == num_clients {
-                                let to_send = std::mem::take(&mut key_comms);
-                                if let Err(e) = kc_send.send(to_send) {
-                                    error!("Error when sending key commitments: {}", e);
-                                }
-                            }
-                        }
-                        None => {
-                            error!("Evaluation key channel closed early");
-                            break;
-                        }
-                    }
-                }
-
-                // Return the final aggregate key
-                if let Err(e) = sk_send.send(prf_key) {
-                    error!("Failed to return secret key: {:?}", e);
-                }
-            });
-        }
-
-        // Initialize or load the keygen PRF
+        let secret_key_cell = OnceCell::new();
         let keygen_prf = if let Some(ref sk) = saved_secret_key {
+            info!("Loaded secret key from database");
+            secret_key_cell.set(sk.clone()).ok();
             sk.keygen_prf.clone()
         } else {
-            let mut keygen_prf_key = [0u8; 32];
-            OsRng.fill_bytes(&mut keygen_prf_key);
-            ScalarPRF::new(&keygen_prf_key)
+            let mut key = [0u8; 32];
+            OsRng.fill_bytes(&mut key);
+            ScalarPRF::new(&key)
         };
-
-        let secret_key_cell = OnceCell::new();
-        if let Some(sk) = saved_secret_key {
-            info!("Loaded secret key from database");
-            secret_key_cell.set(sk).ok();
-        }
 
         let state = Arc::new(DecryptorState {
             num_clients,
@@ -141,19 +96,33 @@ impl Decryptor {
             secret_key: secret_key_cell,
             current_ctx: RwLock::new(None),
             db,
-            keygen_prf: Arc::new(keygen_prf),
+            keygen_prf: RwLock::new(keygen_prf),
             next_client_index: AtomicUsize::new(0),
             ek_send,
+            setup_send: kc_send,
             sk_recv: Mutex::new(Some(sk_recv)),
             setup_start: OnceCell::new(),
         });
 
-        // Spawn task to communicate with the aggregator
-        let aggregator_addr = aggregator_addr.to_string();
+        // If no saved key, spawn task to aggregate evaluation keys
+        if saved_secret_key.is_none() {
+            let n = num_clients;
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    Self::key_aggregation_task(state_clone, &mut ek_recv, sk_send, n).await
+                {
+                    error!("Key aggregation failed: {e:?}");
+                }
+            });
+        }
+
+        // Spawn task to communicate with aggregator
+        let agg_addr = aggregator_addr.to_string();
         let state_clone = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = Self::aggregator_task(aggregator_addr, state_clone, kc_recv).await {
-                error!("Error communicating with aggregator: {e:?}");
+            if let Err(e) = Self::aggregator_task(agg_addr, state_clone, kc_recv).await {
+                error!("Aggregator connection error: {e:?}");
             }
         });
 
@@ -163,142 +132,207 @@ impl Decryptor {
         }
     }
 
+    async fn key_aggregation_task(
+        state: Arc<DecryptorState>,
+        ek_recv: &mut mpsc::UnboundedReceiver<ClientKey>,
+        sk_send: oneshot::Sender<Scalar>,
+        num_clients: usize,
+    ) -> Result<()> {
+        let Some(first) = ek_recv.recv().await else {
+            return Err(anyhow!("Channel closed before receiving any key"));
+        };
+
+        let prf_key = match first {
+            ClientKey::Simulate => {
+                let sk = Self::compute_simulated_secret_key(num_clients).await?;
+                state.db.insert(b"secret_key", bincode::serialize(&sk)?)?;
+                state.db.flush()?;
+                info!("Saved secret key to database (simulated setup)");
+                state
+                    .secret_key
+                    .set(sk.clone())
+                    .map_err(|_| anyhow!("Secret key already set"))?;
+                state.setup_send.send(SetupToAggregator::Simulate).ok();
+                sk.prf_key
+            }
+            ClientKey::Key(idx, ek) => {
+                Self::aggregate_real_keys(&state, ek_recv, idx, ek, num_clients).await?
+            }
+        };
+
+        sk_send
+            .send(prf_key)
+            .map_err(|_| anyhow!("Failed to send secret key"))?;
+        Ok(())
+    }
+
+    async fn compute_simulated_secret_key(num_clients: usize) -> Result<SecretKey> {
+        tokio::task::spawn_blocking(move || {
+            let keygen_prf = ScalarPRF::new(&SIMULATE_PRF_KEY);
+            let prf_key =
+                (0..num_clients).fold(Scalar::ZERO, |acc, i| acc + keygen_prf.evaluate(i as u64));
+            SecretKey {
+                prf_key,
+                keygen_prf,
+            }
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))
+    }
+
+    async fn aggregate_real_keys(
+        state: &DecryptorState,
+        ek_recv: &mut mpsc::UnboundedReceiver<ClientKey>,
+        first_idx: u32,
+        first_ek: Scalar,
+        num_clients: usize,
+    ) -> Result<Scalar> {
+        let g_comm = Proof::get_g_comm();
+        let mut prf_key = first_ek;
+        let mut key_comms = vec![(first_idx, g_comm * first_ek)];
+        let mut received = 1;
+
+        while received < num_clients {
+            let ClientKey::Key(idx, ek) = ek_recv
+                .recv()
+                .await
+                .ok_or_else(|| anyhow!("Channel closed"))?
+            else {
+                return Err(anyhow!("Unexpected simulate message during registration"));
+            };
+
+            prf_key += ek;
+            key_comms.push((idx, g_comm * ek));
+            received += 1;
+
+            if key_comms.len() >= KEY_COMMITMENT_BATCH_SIZE || received == num_clients {
+                state
+                    .setup_send
+                    .send(SetupToAggregator::KeyCommsBatch(std::mem::take(
+                        &mut key_comms,
+                    )))
+                    .ok();
+            }
+        }
+
+        Ok(prf_key)
+    }
+
     pub async fn run(&self) -> Result<()> {
-        debug!("Starting decryptor on {}", self.addr);
         let listener = TcpListener::bind(&self.addr).await?;
         info!("Decryptor listening on {}", self.addr);
 
         loop {
-            match listener.accept().await {
-                Ok((mut socket, _)) => {
-                    let state_clone = self.state.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            Self::handle_register_request(&mut socket, state_clone).await
-                        {
-                            let _ = send_error_message(&mut socket, &format!("{e:?}")).await;
-                        }
-                    });
+            let (mut socket, _) = listener.accept().await?;
+            let state = self.state.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = Self::handle_client(&mut socket, state).await {
+                    send_error_message(&mut socket, &e.to_string()).await.ok();
                 }
-                Err(e) => {
-                    error!("Failed to accept connection: {}", e);
-                }
-            }
+            });
         }
+    }
+
+    async fn handle_client(socket: &mut TcpStream, state: Arc<DecryptorState>) -> Result<()> {
+        let msg = read_message(socket).await?;
+        match msg {
+            Message::SimulateSetup {} => {
+                state.ek_send.send(ClientKey::Simulate)?;
+                Self::handle_simulate_setup(socket, state).await
+            }
+            _ => Self::handle_register_request(socket, state, msg).await,
+        }
+    }
+
+    async fn handle_simulate_setup(
+        socket: &mut TcpStream,
+        state: Arc<DecryptorState>,
+    ) -> Result<()> {
+        if state.secret_key.initialized() {
+            return Err(anyhow!("Setup already complete"));
+        }
+        state.setup_start.set(Instant::now()).ok();
+        write_message(socket, &Message::Success {}).await
     }
 
     async fn handle_register_request(
         socket: &mut TcpStream,
         state: Arc<DecryptorState>,
+        initial_msg: Message,
     ) -> Result<()> {
-        // Check if registration is already complete
         if state.secret_key.initialized() {
-            return Err(anyhow!(
-                "Registration is closed. Maximum number of clients reached."
-            ));
+            return Err(anyhow!("Registration closed"));
         }
+        state.setup_start.set(Instant::now()).ok();
 
-        // If this is the first client request start timing
-        if !state.setup_start.initialized() {
-            state.setup_start.set(std::time::Instant::now())?;
-        }
-
-        // Read initial message from client
-        let message = read_message(socket)
-            .await
-            .map_err(|e| anyhow!("Failed to read message: {e:?}"))?;
-
-        // HPKE unwrap
-        let state_clone = state.clone();
-        let (mut ctx, request) = tokio::task::spawn_blocking(move || match message {
-            Message::HpkeRequest { envelope } => {
-                let (msg_buf, ctx) =
-                    hpke_decrypt(&state_clone.hpke_keypair.sk, &envelope, b"", b"")?;
-                let request: Message = bincode::deserialize(&msg_buf)?;
-                Ok((ctx, request))
-            }
-            _ => Err(anyhow!("Invalid message type")),
+        // Decrypt and verify the initial HPKE request
+        let hpke_sk = state.hpke_keypair.sk.clone();
+        let (mut ctx, request) = tokio::task::spawn_blocking(move || {
+            let Message::HpkeRequest { envelope } = initial_msg else {
+                return Err(anyhow!("Expected HpkeRequest"));
+            };
+            let (msg, ctx) = hpke_decrypt(&hpke_sk, &envelope, b"", b"")?;
+            Ok::<_, anyhow::Error>((ctx, bincode::deserialize::<Message>(&msg)?))
         })
         .await??;
 
-        // Check attestation
-        tokio::task::spawn_blocking(move || match request {
-            Message::RegisterRequest { attestation } => verify_app_attest(&attestation),
-            _ => return Err(anyhow!("Invalid message type")),
+        // Verify attestation
+        tokio::task::spawn_blocking(move || {
+            let Message::RegisterRequest { attestation } = request else {
+                return Err(anyhow!("Expected RegisterRequest"));
+            };
+            verify_app_attest(&attestation)
         })
         .await??;
 
-        // Generate and send challenge back to client
+        // Challenge-response
         let mut challenge = [0u8; 32];
         OsRng.fill_bytes(&mut challenge);
         write_message(socket, &Message::RegisterChallenge { challenge }).await?;
 
-        // Receive response from client
-        let response = read_message(socket)
-            .await
-            .map_err(|e| anyhow!("Failed to read response: {e:?}"))?;
-
-        // Context unwrap
-        let response = match response {
-            Message::HpkeMessage { message } => {
-                let msg_buf = hpke_decrypt_with_context(&mut ctx, &message, b"")?;
-                let response: Message = bincode::deserialize(&msg_buf)?;
-                response
-            }
-            _ => return Err(anyhow!("Invalid message type")),
+        let response = read_message(socket).await?;
+        let Message::HpkeMessage { message } = response else {
+            return Err(anyhow!("Expected HpkeMessage"));
         };
+        let decrypted = hpke_decrypt_with_context(&mut ctx, &message, b"")?;
+        let response: Message = bincode::deserialize(&decrypted)?;
 
-        // Verify response
-        tokio::task::spawn_blocking(move || match response {
-            Message::RegisterResponse { signature } => verify_sig(&challenge, &signature),
-            _ => Err(anyhow!("Invalid message type")),
+        tokio::task::spawn_blocking(move || {
+            let Message::RegisterResponse { signature } = response else {
+                return Err(anyhow!("Expected RegisterResponse"));
+            };
+            verify_sig(&challenge, &signature)
         })
         .await??;
 
-        // If verification succeeded, give the client an index (0-indexed)
-        let client_index = state.next_client_index.fetch_add(1, Ordering::SeqCst);
-        if client_index >= state.num_clients {
-            return Err(anyhow!(
-                "Registration is closed. Maximum number of clients reached."
-            ));
+        // Assign client ID
+        let client_id = state.next_client_index.fetch_add(1, Ordering::SeqCst);
+        if client_id >= state.num_clients {
+            return Err(anyhow!("Registration closed"));
         }
 
-        // Compute their evaluation key and send it to the aggregating thread
-        let ek = state.keygen_prf.evaluate(client_index as u64);
+        // Compute and send evaluation key
+        let ek = state.keygen_prf.read().await.evaluate(client_id as u64);
+        state.ek_send.send(ClientKey::Key(client_id as u32, ek))?;
+        write_message(
+            socket,
+            &Message::RegisterSuccess {
+                id: client_id as u32,
+                eval_key: EvalKey(ek),
+            },
+        )
+        .await?;
 
-        // Send the key share to the aggregating thread
-        if let Err(e) = state.ek_send.send((client_index as u32, ek)) {
-            error!(
-                "Failed to send client {} eval key to aggregator thread: {}",
-                client_index, e
-            );
-            return Err(anyhow!("Internal error: failed to update secret key"));
-        }
-
-        // Inform client of the success
-        let success_msg = Message::RegisterSuccess {
-            id: client_index as u32,
-            eval_key: EvalKey(ek),
-        };
-        write_message(socket, &success_msg).await?;
-
-        // If this was the last client do some additional steps
-        if client_index == state.num_clients - 1 {
-            // Receive the final prf_key from the aggregating thread
-            let prf_key = {
-                let mut recv_guard = state.sk_recv.lock().await;
-                recv_guard.take().unwrap().await?
-            };
-
-            // Recreate the ScalarPRF from the stored key
-            let keygen_prf = state.keygen_prf.as_ref().clone();
-
+        // Finalize setup after last client
+        if client_id == state.num_clients - 1 {
+            let prf_key = state.sk_recv.lock().await.take().unwrap().await?;
+            let keygen_prf = state.keygen_prf.read().await.clone();
             let secret_key = SecretKey {
                 prf_key,
                 keygen_prf,
             };
 
-            // Save to database
             state
                 .db
                 .insert(b"secret_key", bincode::serialize(&secret_key)?)?;
@@ -317,118 +351,146 @@ impl Decryptor {
     async fn aggregator_task(
         aggregator_addr: String,
         state: Arc<DecryptorState>,
-        mut kc_recv: mpsc::UnboundedReceiver<Vec<(u32, G)>>,
+        mut setup_recv: mpsc::UnboundedReceiver<SetupToAggregator>,
     ) -> Result<()> {
-        let mut socket = TcpStream::connect(&aggregator_addr)
-            .await
-            .map_err(|e| anyhow!("Aggregator connection failed: {e:?}"))?;
-
-        // Send an initialization message so the aggregator knows its the decryptor
+        let mut socket = TcpStream::connect(&aggregator_addr).await?;
         write_message(&mut socket, &Message::DecryptorInit {}).await?;
 
-        // Read response - either SetupAlreadyComplete or Success (proceed with setup)
-        let response = read_message(&mut socket).await?;
-        match response {
+        match read_message(&mut socket).await? {
             Message::SetupAlreadyComplete {} => {
-                info!("Aggregator reports setup already complete, skipping key commitment phase");
-                // Drain the channel to prevent the sender from blocking
-                kc_recv.close();
-                while kc_recv.recv().await.is_some() {}
+                info!("Setup already complete, skipping key commitment phase");
+                setup_recv.close();
+                while setup_recv.recv().await.is_some() {}
             }
             Message::Success {} => {
-                while let Some(key_comms) = kc_recv.recv().await {
-                    if let Err(e) =
-                        make_request(&mut socket, &Message::KeyCommsBatch { key_comms }).await
-                    {
-                        error!("Failed to send key commitments to aggregator: {}", e);
-                    }
-                }
+                Self::send_key_commitments(&mut socket, &state, &mut setup_recv).await?;
+            }
+            Message::Error(e) => return Err(anyhow!("Aggregator error: {e}")),
+            _ => return Err(anyhow!("Unexpected aggregator response")),
+        }
 
-                let elapsed = state.setup_start.get().unwrap().elapsed();
-                info!(
-                    "Setup complete: {} clients registered in {:?}",
-                    state.num_clients, elapsed
-                );
-                info!("Sent {:?}B", bytes_sent());
-                info!("Recv {:?}B", bytes_recv());
-                reset_byte_counters();
-            }
-            Message::Error(e) => {
-                return Err(anyhow!("Aggregator returned error: {}", e));
-            }
-            _ => {
-                return Err(anyhow!("Unexpected response from aggregator"));
+        // Process decryption mask requests
+        Self::handle_mask_requests(&mut socket, &state).await
+    }
+
+    async fn send_key_commitments(
+        socket: &mut TcpStream,
+        state: &DecryptorState,
+        recv: &mut mpsc::UnboundedReceiver<SetupToAggregator>,
+    ) -> Result<()> {
+        let mut received = 0;
+        while received < state.num_clients {
+            match recv.recv().await {
+                Some(SetupToAggregator::KeyCommsBatch(kc)) => {
+                    received += kc.len();
+                    make_request(socket, &Message::KeyCommsBatch { key_comms: kc }).await?;
+                }
+                Some(SetupToAggregator::Simulate) => {
+                    make_request(socket, &Message::SimulateSetup {}).await?;
+                    info!("Simulated setup: aggregator notified");
+                    break;
+                }
+                None => break,
             }
         }
 
-        loop {
-            let message = match read_message(&mut socket).await {
-                Ok(msg) => msg,
-                Err(e) => {
-                    return Err(anyhow!("Failed to read message: {e:?}"));
-                }
-            };
+        if let Some(start) = state.setup_start.get() {
+            info!(
+                "Setup complete: {} clients in {:?}",
+                state.num_clients,
+                start.elapsed()
+            );
+        }
+        info!("Sent {}B, Recv {}B", bytes_sent(), bytes_recv());
+        reset_byte_counters();
+        Ok(())
+    }
 
-            if let Message::DecryptMaskRequest {
+    async fn handle_mask_requests(socket: &mut TcpStream, state: &DecryptorState) -> Result<()> {
+        loop {
+            let Message::DecryptMaskRequest {
                 context,
                 dropouts,
                 invert,
                 length,
-            } = message
-            {
-                let mask_start = std::time::Instant::now();
-
-                // Set current_ctx on first request
-                {
-                    let mut current_ctx = state.current_ctx.write().await;
-                    if current_ctx.is_none() {
-                        *current_ctx = Some(context);
-                    } else if *current_ctx != Some(context) {
-                        return Err(anyhow!(
-                            "Context mismatch: expected {:?}, got {}",
-                            current_ctx,
-                            context
-                        ));
-                    }
-                }
-
-                // Check that enough clients are online
-                let online_clients = match invert {
-                    true => dropouts.len(),
-                    false => state.num_clients - dropouts.len(),
-                };
-                if online_clients < state.threshold {
-                    return Err(anyhow!("Proceed() predicate failed"));
-                }
-
-                // Generate decryption mask
-                let secret_key = state
-                    .secret_key
-                    .get()
-                    .ok_or_else(|| anyhow!("Setup incomplete"))?;
-                let mask = AggOnlyEnc::decrypt_mask(secret_key, context, &dropouts, invert, length);
-
-                // Send mask to aggregator
-                write_message(&mut socket, &Message::DecryptMaskResponse { mask }).await?;
-
-                // Reset for next round so next DecryptMaskRequest can use a new context
-                {
-                    let mut current_ctx = state.current_ctx.write().await;
-                    *current_ctx = None;
-                }
-
-                let mask_elapsed = mask_start.elapsed();
-                info!(
-                    "Decrypt mask for context {}: {} online clients, {:?}",
-                    context, online_clients, mask_elapsed
-                );
-                info!("Sent {:?}B", bytes_sent());
-                info!("Recv {:?}B", bytes_recv());
-                reset_byte_counters();
-            } else {
-                error!("Invalid request");
+            } = read_message(socket).await?
+            else {
+                error!("Unexpected message type");
                 continue;
+            };
+
+            let wall_start = Instant::now();
+            let dropout_count = dropouts.len();
+
+            // Validate context
+            {
+                let mut ctx = state.current_ctx.write().await;
+                match *ctx {
+                    None => *ctx = Some(context),
+                    Some(c) if c != context => {
+                        return Err(anyhow!("Context mismatch: expected {c}, got {context}"));
+                    }
+                    _ => {}
+                }
             }
+
+            // Check threshold
+            let online = if invert {
+                dropout_count
+            } else {
+                state.num_clients - dropout_count
+            };
+            if online < state.threshold {
+                return Err(anyhow!("Threshold not met: {online} < {}", state.threshold));
+            }
+
+            // Get secret key
+            let sk = state
+                .secret_key
+                .get()
+                .ok_or_else(|| anyhow!("Setup incomplete"))?
+                .clone();
+
+            let (mask, dropout_key_time, mask_compute_time) =
+                tokio::task::spawn_blocking(move || {
+                    let dropout_key_start = Instant::now();
+                    let dropout_sum = match &dropouts {
+                        DropoutList::Packed(indices) => sk.keygen_prf.batch_evaluate_client_indices(indices),
+                        DropoutList::Plain(indices) => sk.keygen_prf.batch_evaluate_u32(indices),
+                    };
+                    let key = match dropout_count {
+                        0 => sk.prf_key,
+                        _ => if invert { dropout_sum } else { sk.prf_key - dropout_sum },
+                    };
+                    let dropout_key_time = dropout_key_start.elapsed();
+
+                    let mask_start = Instant::now();
+                    let mask: Vec<G> = (0..length)
+                        .into_par_iter()
+                        .map(|i| KHPRF::evaluate_context(&key, context, i))
+                        .collect();
+                    let mask_compute_time = mask_start.elapsed();
+
+                    (mask, dropout_key_time, mask_compute_time)
+                })
+                .await?;
+
+            write_message(socket, &Message::DecryptMaskResponse { mask }).await?;
+
+            // Reset for next round
+            *state.current_ctx.write().await = None;
+
+            info!(
+                "Decrypt mask for context {context}: {online} online clients\n\t\
+                 Dropout key: {:?}\n\t\
+                 Mask computation: {:?}\n\t\
+                 Total: {:?}",
+                dropout_key_time,
+                mask_compute_time,
+                wall_start.elapsed()
+            );
+            info!("Sent {}B, Recv {}B", bytes_sent(), bytes_recv());
+            reset_byte_counters();
         }
     }
 }
