@@ -9,9 +9,9 @@ fi
 AGG_IP="$1"
 
 CONFIGS=(
-  ../configs/simplified-1.json
-  ../configs/simplified-32.json
-  ../configs/simplified-128.json
+  ../configs/full-1.json
+  ../configs/full-32.json
+  ../configs/full-128.json
 )
 
 export RUST_LOG=info
