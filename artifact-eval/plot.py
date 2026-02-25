@@ -72,23 +72,6 @@ def run_all(out_dir, data_dir, use_bench_results=False):
         fig.savefig(path, bbox_inches="tight", format="pdf")
         plt.close(fig)
 
-    # Plot 1: Server CPU costs of boolean aggregation
-    fig1, ax = plt.subplots()
-    data = server_data.loc[(server_data["bitwidth"] == 1) & (server_data["length"] == 1)].sort_values(by="clients")
-    x = data["clients"].unique()
-    ax.plot(x, data["unwrap"] + data["prio_v"] + data["prio_a"], color=colors[0], marker="o")
-    ax.plot(x, data["unwrap"] + data["us_v"] + data["us_a"], color=colors[2], marker="o")
-    ax.plot(x, data["decode"], color=colors[3], marker="o")
-    ax.annotate("Prio", (x[3] * 2.5, 750), rotation=34, color=colors[0])
-    ax.annotate("Heli (Heavy)", (3000, 2800), rotation=35, color=colors[2])
-    ax.annotate("Heli (Light)", (3500, 0.11), color=colors[3])
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel("Number of clients")
-    ax.set_ylabel("Server CPU (core-ms)")
-    ax.grid(linestyle="--")
-    save("server_cpu.pdf", fig1)
-
     # Plot 2: Server-to-server communication
     fig2, ax = plt.subplots()
     data = server_data.loc[(server_data["bitwidth"] == 1) & (server_data["length"] == 1)].sort_values(by="clients")
@@ -111,7 +94,7 @@ def run_all(out_dir, data_dir, use_bench_results=False):
     ax.set_xlabel("Number of clients ($n$)")
     ax.set_ylabel("Server-to-Server Comm. (KB)")
     ax.grid(linestyle="--")
-    save("server_comm.pdf", fig2)
+    save("fig4_bot_left.pdf", fig2)
 
     # Plot 3: Server CPU as bitwidth grows
     fig3, ax = plt.subplots()
@@ -139,7 +122,7 @@ def run_all(out_dir, data_dir, use_bench_results=False):
     ax.set_xlabel("Measurement bitwidth ($b$)")
     ax.set_ylabel("Server CPU (core-s)")
     ax.grid(linestyle="--")
-    save("server_cpu_bitwidth.pdf", fig3)
+    save("fig5_bot_right.pdf", fig3)
 
     # Plot 4: Server CPU as length grows
     fig4, ax = plt.subplots()
@@ -166,7 +149,7 @@ def run_all(out_dir, data_dir, use_bench_results=False):
     ax.set_xlabel("Number of measurements ($\\ell$)")
     ax.set_ylabel("Server CPU (core-s)")
     ax.grid(linestyle="--")
-    save("server_cpu_length.pdf", fig4)
+    save("fig5_top_right.pdf", fig4)
 
     # Plot 5: Encoding size vs bitwidth
     fig5, ax = plt.subplots()
@@ -184,7 +167,7 @@ def run_all(out_dir, data_dir, use_bench_results=False):
     ax.set_xlabel("Measurement bitwidth ($b$)")
     ax.set_ylabel("Encoding size (KB)")
     ax.grid(linestyle="--")
-    save("encoding_size_bitwidth.pdf", fig5)
+    save("fig5_bot_left.pdf", fig5)
 
     # Plot 6: Encoding size vs length
     fig6, ax = plt.subplots()
@@ -202,7 +185,7 @@ def run_all(out_dir, data_dir, use_bench_results=False):
     ax.set_xlabel("Number of measurements ($\\ell$)")
     ax.set_ylabel("Encoding size (KB)")
     ax.grid(linestyle="--")
-    save("encoding_size_length.pdf", fig6)
+    save("fig5_top_left.pdf", fig6)
 
     # Plot 7: Encoding time vs bitwidth
     fig7, ax = plt.subplots()
@@ -218,7 +201,7 @@ def run_all(out_dir, data_dir, use_bench_results=False):
     ax.set_xlabel("Measurement bitwidth ($b$)")
     ax.set_ylabel("Client CPU (core-ms)")
     ax.grid(linestyle="--")
-    save("encoding_time_bitwidth.pdf", fig7)
+    save("fig5_bot_center.pdf", fig7)
 
     # Plot 8: Encoding time vs length
     fig8, ax = plt.subplots()
@@ -234,7 +217,7 @@ def run_all(out_dir, data_dir, use_bench_results=False):
     ax.set_xlabel("Number of measurements ($\\ell$)")
     ax.set_ylabel("Client CPU (core-ms)")
     ax.grid(linestyle="--")
-    save("encoding_time_length.pdf", fig8)
+    save("fig5_top_center.pdf", fig8)
 
     # Plot 9: Server CPU with 10% dropout
     fig9, ax = plt.subplots()
@@ -253,7 +236,7 @@ def run_all(out_dir, data_dir, use_bench_results=False):
     ax.set_xlabel("Number of clients ($n$)")
     ax.set_ylabel("Server CPU (core-ms)")
     ax.grid(linestyle="--")
-    save("server_cpu_dropout.pdf", fig9)
+    save("fig4_top_left.pdf", fig9)
 
     # Plot 10: Server CPU length (log)
     fig10, ax = plt.subplots()
@@ -276,7 +259,7 @@ def run_all(out_dir, data_dir, use_bench_results=False):
     ax.set_xlabel("Number of measurements ($\\ell$)")
     ax.set_ylabel("Server CPU (core-s)")
     ax.grid(linestyle="--")
-    save("server_cpu_length_log.pdf", fig10)
+    save("fig4_top_center.pdf", fig10)
 
     # Plot 11: Server CPU bitwidth (log)
     fig11, ax = plt.subplots()
@@ -299,7 +282,7 @@ def run_all(out_dir, data_dir, use_bench_results=False):
     ax.set_xlabel("Measurement bitwidth ($b$)")
     ax.set_ylabel("Server CPU (core-s)")
     ax.grid(linestyle="--")
-    save("server_cpu_bitwidth_log.pdf", fig11)
+    save("fig4_top_right.pdf", fig11)
 
     # Plot 12: Server comm length (log)
     fig12, ax = plt.subplots()
@@ -322,7 +305,7 @@ def run_all(out_dir, data_dir, use_bench_results=False):
     ax.set_xlabel("Number of measurements ($\\ell$)")
     ax.set_ylabel("Server-to-Server Comm. (KB)")
     ax.grid(linestyle="--")
-    save("server_comm_length_log.pdf", fig12)
+    save("fig4_bot_center.pdf", fig12)
 
     # Plot 13: Server comm bitwidth (log)
     fig13, ax = plt.subplots()
@@ -346,7 +329,7 @@ def run_all(out_dir, data_dir, use_bench_results=False):
     ax.set_xlabel("Measurement bitwidth ($b$)")
     ax.set_ylabel("Server-to-Server Comm. (KB)")
     ax.grid(linestyle="--")
-    save("server_comm_bitwidth_log.pdf", fig13)
+    save("fig4_bot_right.pdf", fig13)
 
     # Plot 15: Dropout crossover (server CPU)
     fig15, ax = plt.subplots()
