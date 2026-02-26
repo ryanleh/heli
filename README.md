@@ -20,13 +20,14 @@ This repository contains several modules that implement the different building b
 
 * [`benches`](benches): Benchmarks.
 
-* [`experiments`](src/experiments): End-to-end experiments.
+* [`experiments`](experiments): End-to-end experiments to recreate Table 2
+from the Heli paper.
 
-* [`artifact-eval`](src/artifact-eval): Scripts to recreate Figures 4, 5 from the Heli paper.
+* [`artifact-eval`](artifact-eval): Scripts to recreate Figures 4, 5 from the Heli paper.
 
 ## Build guide
 
-Ensure that you have a C++ compiler and Rust installed. 
+Ensure that you have a C++ compiler and Rust installed.
 
 On Ubuntu, you can install a C++ compiler via:
 ```bash
@@ -60,64 +61,50 @@ cargo install cargo-criterion
 download the necessary Python dependencies:
 ```bash
 cd artifact-eval/
-pip -r requirements.txt
+pip install -r requirements.txt
 ```
 and run the following script:
 ```bash
 python3 run_and_plot.py
 ```
-Plots will appear in the `artifact-eval/plots` directory
+Plots will appear in the `artifact-eval/plots` directory.
+
 
 ### End-to-end experiments
 
-To run end-to-end experiments, create a new config file in `experiments/config`
-that specifies your aggregation parameters and networking information to connect
-to the aggregator and decryptor. (There are a few examples of this already)
+The scripts in `experiments/bin/` run the aggregator, decryptor, and client with predefined configs. For these to work, ensure that the aggregator and decryptor accept TCP traffic on ports 9000 and 9001. 
 
-To start the aggregator:
-```bash
-RUST_LOG=info cargo run --release --bin exp_aggregator -- {YOUR CONFIG}
-```
+* `run_{aggregator,decryptor,client}.sh` runs aggregation over 10,000,000 million clients (with 10% offline) with bit vectors of length 1, 32, and 128. The experiments are specified in `experiments/configs/full-{1,32,128}.json`.
 
-To start the decryptor:
-```bash
-RUST_LOG=info cargo run --release --bin exp_decryptor -- {YOUR CONFIG}
-```
+* `run_{aggregator,decryptor,client}_sim.sh` runs aggregation over 100,000 clients (with 10% offline) with bit vectors of length 1, 32, and 128. The experiments are specified in `experiments/configs/simplified-{1,32,128}.json`.
 
-Aggregation is initialized by the client and follows four steps. 
+> **Note:** For faster benchmarking, these scripts simulate the one-time setup
+> and run aggregation over a small set of duplicated client reports; this does
+> not effect the servers' aggregation runtimes. To run the system without 
+> the simulated steps, replace the `sim-setup` and `sim-generate` modes
+> specified in the client scripts to `setup` and `generate`. (Note that this
+> requires the client machine to have 250 GB of disk space for writing reports)
 
-First, run the one-time setup:
-```bash
-RUST_LOG=info cargo run --release --bin exp_client -- {YOUR CONFIG} --mode setup
-```
-After running this, you should be able to run the following steps as many
-times as you want (even with different configurations) without restarting the
-aggregator/decryptor or re-running setup.
+> **Tip:** If your aggregator machine runs out of memory during aggregation, lower 
+> the `max_pending_batches` config option.
 
-To locally generate client reports, run:
-```bash
-RUST_LOG=info cargo run --release --bin exp_client -- {YOUR CONFIG} --mode generate
-```
 
-To submit the reports to the aggregator, run:
-```bash
-RUST_LOG=info cargo run --release --bin exp_client -- {YOUR CONFIG} --mode submit
-```
+#### Config file reference
 
-Finally, to request the aggregator to aggregate, run:
-```bash
-RUST_LOG=info cargo run --release --bin exp_client -- {YOUR CONFIG} --mode aggregate
-```
+Experiment configs are JSON files. See the predefined configs in `experiments/configs/` as examples of the correct format. The configuration options are specified below:
 
-> **NOTE:** All of the binaries have a `clear-db` flag that clear local state. This
-> is useful to recover from a buggy run.
-
-> **TIP:** The `exp_client` binary simulates many clients from a single machine. If 
-> you experience the following error "(errno 24) too many open files", try
-> raising the operating system's limit on file descriptors via:
-> ```bash
-> set ulimit -Sn 100000
-> ```
+| Field | Type | Description |
+|-------|------|-------------|
+| `num_clients` | number | Total number of clients to simulate. |
+| `threshold` | number | Minimum number of clients that must participate for aggregation to succeed. |
+| `dropouts` | number | Number of clients that drop out. |
+| `length` | number | Number of data slots per client (vector length). |
+| `prover` | object | Proof type: `{"type": "binary"}` or `{"type": "range", "bitlength": N}`. |
+| `aggregator_addr` | string | Host:port the aggregator listens on (e.g. `"0.0.0.0:9000"`). |
+| `decryptor_addr` | string | Host:port the decryptor listens on (e.g. `"0.0.0.0:9001"`). |
+| `db_path` | string | Directory path for a local sled DB. |
+| `max_pending_batches` | number (optional) | Max pending client report chunks on the aggregator. Default: `100`. |
+| `reports_per_chunk` | number (optional) | Number of reports the aggregator combines into one processing chunk. Default: `10000`. |
 
 ## License
 

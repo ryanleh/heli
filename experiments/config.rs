@@ -39,7 +39,7 @@ pub struct ExperimentConfig {
 }
 
 fn default_max_pending_batches() -> usize {
-    4
+    100
 }
 
 fn default_reports_per_chunk() -> usize {
